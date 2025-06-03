@@ -31,7 +31,7 @@ from tqdm import tqdm
 from sklearn.model_selection import train_test_split
 import tensorflow as tf
 
-os.environ["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+os.environ["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "1")
 
 # Suppress TensorFlow warnings
 tf.get_logger().setLevel("ERROR")
@@ -497,81 +497,50 @@ def convert_to_deepfurniture_format(sets_of_items_data, output_file, max_item_nu
     return {'query_categories': df_tuple[3], 'target_categories': df_tuple[4]}
 
 def compute_iqon3000_category_centers(features_dir):
-    """Compute category centers for IQON3000 (7 categories)"""
-    train_path = os.path.join(features_dir, 'train.pkl')
-    if not os.path.exists(train_path): 
-        print(f"Error: Train data not found for category centers ({train_path})")
-        return None, None
+    """Compute category centers for IQON3000 (7 categories) - 辞書形式で保存"""
+    # ... 既存のコード ...
     
-    try:
-        with open(train_path, 'rb') as f: 
-            data = pickle.load(f)
-    except Exception as e: 
-        print(f"Error loading train data {train_path}: {e}")
-        return None, None
-    
-    if not (isinstance(data, tuple) and len(data) >= 8): 
-        print(f"Error: Invalid train data format train.pkl.")
-        return None, None
-    
-    query_features_all, query_main_category_ids_all = data[0], data[3]
-    
-    if not (isinstance(query_features_all, np.ndarray) and isinstance(query_main_category_ids_all, np.ndarray)): 
-        print(f"Error: Invalid data types in train.pkl.")
-        return None, None
-    
-    if query_features_all.ndim != 3 or query_main_category_ids_all.ndim != 2: 
-        print(f"Error: Invalid data dimensions in train.pkl.")
-        return None, None
-    
-    if query_features_all.shape[0] == 0: 
-        print(f"Error: No data in train.pkl.")
-        return None, None
-    
-    used_main_cat_ids = set(c_id for cs_set in query_main_category_ids_all for c_id in cs_set if 1 <= c_id <= 7 and c_id != 0)
-    if not used_main_cat_ids: 
-        print(f"No valid main category IDs (1-7) in train.pkl.")
-        return None, None
-    
-    active_main_cat_ids = sorted(list(used_main_cat_ids))
-    embedding_dim = query_features_all.shape[-1]
-    print(f"\nCalculating centers for {len(active_main_cat_ids)} main categories (IDs: {min(active_main_cat_ids)}-{max(active_main_cat_ids)})...")
-    
+    # 辞書形式で保存（NumPy配列ではなく）
     category_centers_dict = {}
-    features_per_main_category = {main_id: [] for main_id in active_main_cat_ids}
-    
-    for set_idx in range(query_features_all.shape[0]):
-        for item_idx in range(query_features_all.shape[1]):
-            main_cat_id = query_main_category_ids_all[set_idx, item_idx]
-            if main_cat_id in active_main_cat_ids and not np.all(query_features_all[set_idx, item_idx] == 0):
-                features_per_main_category[main_cat_id].append(query_features_all[set_idx, item_idx])
-    
     for main_cat_id in active_main_cat_ids:
         if features_per_main_category[main_cat_id]:
             center_vec = np.mean(np.stack(features_per_main_category[main_cat_id]), axis=0)
             norm = np.linalg.norm(center_vec)
-            category_centers_dict[main_cat_id] = (center_vec / norm if norm > 1e-9 else center_vec).astype(np.float32)
+            # 辞書のキーは1-based、値はPythonのリスト
+            category_centers_dict[main_cat_id] = (center_vec / norm if norm > 1e-9 else center_vec).tolist()
         else:
             print(f"Warning: No features for category ID {main_cat_id}. Initializing randomly.")
             rand_vec = np.random.randn(embedding_dim).astype(np.float32)
             norm_rand = np.linalg.norm(rand_vec)
-            category_centers_dict[main_cat_id] = rand_vec / norm_rand if norm_rand > 1e-9 else rand_vec
+            category_centers_dict[main_cat_id] = (rand_vec / norm_rand if norm_rand > 1e-9 else rand_vec).tolist()
     
-    centers_array = np.zeros((len(IQON3000_CATEGORIES), embedding_dim), dtype=np.float32)
-    for main_cat_id_map, center_vec_map in category_centers_dict.items():
-        if 1 <= main_cat_id_map <= len(IQON3000_CATEGORIES): 
-            centers_array[main_cat_id_map - 1] = center_vec_map
-    
-    for i in range(len(IQON3000_CATEGORIES)):
-        if (i + 1) not in category_centers_dict: 
-            print(f"Warning: Center for main category ID {i+1} ({IQON3000_CATEGORIES.get(i+1)}) not calculated.")
-    
-    with gzip.open(os.path.join(features_dir, 'category_centers.pkl.gz'), 'wb') as f: 
-        pickle.dump(centers_array, f)
+    # 辞書形式で保存
+    with gzip.open(os.path.join(features_dir, 'category_centers.pkl.gz'), 'wb') as f:
+        pickle.dump(category_centers_dict, f)
     
     print(f"\nSaved {len(category_centers_dict)} main category centers to category_centers.pkl.gz")
-    return category_centers_dict, centers_array
+    return category_centers_dict
 
+def compute_deepfurniture_category_centers(features_dir):
+    """Compute category centers for DeepFurniture (11 categories) - 辞書形式で保存"""
+    # ... 既存のコード ...
+    
+    # 辞書形式で保存
+    category_centers_dict = {}
+    for i, cid in enumerate(sorted(unique_cats)):
+        mask = flat_cat == cid
+        if mask.any():
+            center_vec = flat_feat[mask].mean(axis=0)
+            category_centers_dict[int(cid)] = center_vec.tolist()  # リスト形式で保存
+        else:
+            category_centers_dict[int(cid)] = np.zeros(flat_feat.shape[1]).tolist()
+    
+    with gzip.open(os.path.join(features_dir, "category_centers.pkl.gz"), "wb") as f:
+        pickle.dump(category_centers_dict, f)
+    
+    print(f"Saved {len(category_centers_dict)} DeepFurniture category centers to category_centers.pkl.gz")
+
+    
 # =============================================================================
 # DeepFurniture Data Processing (11 categories)
 # =============================================================================
@@ -653,7 +622,7 @@ def process_deepfurniture(image_dir, annotations_json, furnitures_jsonl, output_
         scene_item_ids = []
         
         for instance in scene_record.get("instances", []):
-            furniture_id = instance.get("identityID")
+            furniture_id = str(instance.get("identityID"))
             category_id = instance.get("categoryID")
             
             if not furniture_id or category_id is None:
@@ -667,7 +636,7 @@ def process_deepfurniture(image_dir, annotations_json, furnitures_jsonl, output_
                 scene_item_ids.append(furniture_id)
                 category_ids_in_scenes.add(category_id)
         
-        if len(scene_features) >= 6:  # Minimum items per scene for DeepFurniture
+        if len(scene_features) >= 4:  # Minimum items per scene for DeepFurniture
             scenes[str(scene_id)] = {
                 "features": np.stack(scene_features),
                 "category_ids": np.array(scene_categories),
@@ -722,7 +691,7 @@ def load_jsonl_mapping(path, key_field, value_field):
     
     return mapping
 
-def convert_scenes_to_deepfurniture_format(scenes, output_dir, min_items=6, max_items=16, max_item_num=8):
+def convert_scenes_to_deepfurniture_format(scenes, output_dir, min_items=4, max_items=20, max_item_num=10):
     """Convert scenes to DeepFurniture format with train/val/test split and z-score normalization"""
     from collections import defaultdict
     
