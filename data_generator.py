@@ -1,4 +1,4 @@
-# data_generator.py - 条件付きネガティブサンプル版
+# data_generator.py - 条件付きネガティブサンプル版（シーンID修正版）
 import os
 import gzip
 import pickle
@@ -76,7 +76,7 @@ class DataGenerator(Sequence):
             print("Skipped negative pool construction (CLNeg disabled - major memory savings)")
         
         # インデックス初期化
-        self.indexes = np.arange(len(self.scene_ids))
+        self.indexes = np.arange(len(self.scene_ids_str))
         if shuffle:
             self.rng.shuffle(self.indexes)
     
@@ -115,59 +115,41 @@ class DataGenerator(Sequence):
         print(f"Dataset: {self.dataset_name}, Expected categories: {self.expected_categories}, Range: {self.category_range}")
     
     def _load_data(self):
-        """データ読み込み"""
-        with open(self.split_path, 'rb') as f:
-            data = pickle.load(f)
-        
-        if isinstance(data, tuple) and len(data) >= 6:
+            """データ読み込み"""
+            with open(self.split_path, 'rb') as f:
+                data = pickle.load(f)
+
+            if not (isinstance(data, tuple) and len(data) >= 8):
+                raise ValueError(f"Unsupported data format in {self.split_path}. Expected a tuple with at least 8 elements.")
+
+            # --- ステップ1: 特徴量とカテゴリを読み込む ---
             self.query_features = np.array(data[0], dtype=np.float32)
             self.positive_features = np.array(data[1], dtype=np.float32)
-            
-            # シーンIDの安全な処理
-            if len(data) > 2:
-                scene_ids_raw = data[2]
-                if isinstance(scene_ids_raw, (list, np.ndarray)):
-                    scene_ids_list = []
-                    for i, sid in enumerate(scene_ids_raw):
-                        try:
-                            if isinstance(sid, (str, bytes, np.str_, np.bytes_)):
-                                scene_ids_list.append(abs(hash(str(sid))) % 1000000)
-                            else:
-                                scene_ids_list.append(int(sid))
-                        except (ValueError, TypeError):
-                            scene_ids_list.append(i)
-                    self.scene_ids = np.array(scene_ids_list, dtype=np.int32)
-                else:
-                    self.scene_ids = np.arange(len(self.query_features), dtype=np.int32)
-            else:
-                self.scene_ids = np.arange(len(self.query_features), dtype=np.int32)
-            
             self.query_categories = np.array(data[3], dtype=np.int32)
             self.positive_categories = np.array(data[4], dtype=np.int32)
+
+             # --- ステップ2: シーンIDの対応表を作成する ---
+            # .pklから読み込んだ文字列IDのリストを、そのまま「インデックス -> 文字列ID」の対応表として保持する
+            self.scene_ids_str = list(data[2])
+            print(f"Loaded {len(self.scene_ids_str)} scene IDs as strings")
+            if self.scene_ids_str:
+                print(f"Example scene IDs: {self.scene_ids_str[:3]}")
             
-            if len(data) > 5:
-                set_sizes_raw = data[5]
-                try:
-                    self.set_sizes = np.array(set_sizes_raw, dtype=np.int32)
-                except (ValueError, TypeError):
-                    self.set_sizes = np.sum(self.query_categories > 0, axis=1)
+            # --- ステップ3: アイテムIDを安全に数値へ変換する ---
+            self.query_ids = self._safe_convert_ids(data[6])
+            self.positive_ids = self._safe_convert_ids(data[7])
+
+            # --- ステップ4: その他の情報を設定する ---
+            if len(data) > 5 and data[5] is not None:
+                self.set_sizes = np.array(data[5], dtype=np.int32)
             else:
                 self.set_sizes = np.sum(self.query_categories > 0, axis=1)
+    
+            self.max_item_num = self.query_features.shape[1]
+            self.feature_dim = self.query_features.shape[2]
             
-            if len(data) > 6:
-                self.query_ids = self._safe_convert_ids(data[6])
-                self.positive_ids = self._safe_convert_ids(data[7] if len(data) > 7 else data[6])
-            else:
-                num_scenes, num_items = self.query_features.shape[:2]
-                self.query_ids = np.arange(num_scenes * num_items).reshape(num_scenes, num_items)
-                self.positive_ids = self.query_ids
-        else:
-            raise ValueError(f"Unsupported data format in {self.split_path}")
-        
-        self.max_item_num = self.query_features.shape[1]
-        self.feature_dim = self.query_features.shape[2]
-        
-        print(f"Loaded data: {len(self.scene_ids)} scenes, {self.max_item_num} max items, {self.feature_dim}D features")
+            # --- 最終確認ログ ---
+            print(f"Loaded data: {len(self.scene_ids_str)} scenes, {self.max_item_num} max items, {self.feature_dim}D features")
     
     def _safe_convert_ids(self, ids_data):
         """IDデータを安全に数値配列に変換"""
@@ -185,15 +167,18 @@ class DataGenerator(Sequence):
         for i, item_id in enumerate(flat_ids):
             try:
                 if isinstance(item_id, (str, bytes, np.str_, np.bytes_)):
-                    item_str = str(item_id)
-                    if item_str == '' or item_str == '0':
-                        converted_ids.append(0)
+                    item_str = str(item_id).strip()
+                    # IDが数字ならそのまま整数に変換
+                    if item_str.isdigit():
+                        converted_ids.append(int(item_str))
                     else:
-                        converted_ids.append(abs(hash(item_str)) % 1000000)
+                        # 数字でないID（パディングの""など）は0として扱う
+                        converted_ids.append(0)
                 else:
                     converted_ids.append(int(item_id))
             except (ValueError, TypeError):
-                converted_ids.append(i % 1000000)
+                # エラーが発生した場合は0にする
+                converted_ids.append(0)
         
         return np.array(converted_ids, dtype=np.int32).reshape(original_shape)
     
@@ -264,7 +249,7 @@ class DataGenerator(Sequence):
         return negative_samples
     
     def __len__(self):
-        return int(np.ceil(len(self.scene_ids) / self.batch_size))
+        return int(np.ceil(len(self.scene_ids_str) / self.batch_size))
     
     def on_epoch_end(self):
         if self.shuffle:
@@ -284,7 +269,9 @@ class DataGenerator(Sequence):
         query_cat_batch = self.query_categories[batch_indices]
         positive_cat_batch = self.positive_categories[batch_indices]
         set_size_batch = self.set_sizes[batch_indices]
-        scene_id_batch = self.scene_ids[batch_indices]
+        
+        # シーンIDを文字列として取得
+        scene_id_batch = batch_indices
         
         # ID取得
         query_id_batch = self._safe_get_batch_ids(self.query_ids, batch_indices)
@@ -294,7 +281,10 @@ class DataGenerator(Sequence):
         combined_features = np.concatenate([query_batch, positive_batch], axis=0)
         dummy_labels = np.zeros_like(combined_features)
         combined_set_sizes = np.concatenate([set_size_batch, set_size_batch])
+        
+        # シーンIDも2倍に拡張（クエリとポジティブ両方のために）
         combined_scene_ids = np.concatenate([scene_id_batch, scene_id_batch])
+        
         combined_query_ids = np.concatenate([query_id_batch, positive_id_batch])
         combined_positive_ids = np.concatenate([positive_id_batch, query_id_batch])
         
@@ -315,7 +305,14 @@ class DataGenerator(Sequence):
             tf.constant(negative_samples, dtype=tf.float32)
         )
         
+        # scene_idsは文字列のリストとして返す
         return inputs, combined_scene_ids
+
+    def get_scene_id_from_index(self, index: int) -> str:
+        """数値インデックスから文字列のシーンIDを取得"""
+        if 0 <= index < len(self.scene_ids_str):
+            return self.scene_ids_str[index]
+        return str(index) # 見つからない場合はインデックスを文字列として返す
     
     def _safe_get_batch_ids(self, ids_data, batch_indices):
         """バッチIDを安全に取得"""
@@ -332,6 +329,12 @@ class DataGenerator(Sequence):
                 return np.arange(batch_size * self.max_item_num).reshape(batch_size, self.max_item_num)
             else:
                 return np.array(batch_indices).reshape(-1, 1)
+    
+    def get_scene_id(self, index):
+        """インデックスからシーンID文字列を取得"""
+        if 0 <= index < len(self.scene_ids):
+            return self.scene_ids[index]
+        return None
     
     def get_data_info(self):
         """データ情報取得"""

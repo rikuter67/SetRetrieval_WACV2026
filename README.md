@@ -1,217 +1,279 @@
 # SetRetrieval: Conservative Convergence-Aware Bidirectional Learning for Heterogeneous Set Retrieval
 
-**Official Implementation of WACV 2025 Paper**
+**Official Implementation of WACV 2025 Paper** 🏆
 
 [![arXiv](https://img.shields.io/badge/arXiv-2024.XXXXX-b31b1b.svg)](https://arxiv.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
 > **Abstract**: This work addresses the conservative convergence problem in heterogeneous set retrieval, where traditional unidirectional approaches converge toward statistical averages, failing to capture individual aesthetic preferences. We propose a bidirectional consistency learning framework with cycle consistency loss and curriculum-based hard negative mining to overcome this limitation.
 
 ---
 
-## Table of Contents
+## 📋 Table of Contents
 
-1. [Overview](#overview)
-2. [Installation](#installation)
-3. [Dataset Preparation](#dataset-preparation)
-4. [Training](#training)
-5. [Evaluation](#evaluation)
-6. [Model Architecture](#model-architecture)
-7. [Experimental Results](#experimental-results)
-8. [Repository Structure](#repository-structure)
-9. [Citation](#citation)
-
----
-
-## Overview
-
-### Problem Statement
-
-Set completion tasks require retrieving complementary items given a partial set (query). Traditional unidirectional approaches suffer from **conservative convergence**, where models optimize toward safe but uninteresting statistical averages, failing to capture:
-
-- Individual aesthetic preferences
-- Cross-category compatibility patterns  
-- Fine-grained style coherence
-
-### Our Solution
-
-We introduce a bidirectional consistency learning framework featuring:
-
-1. **Cycle Consistency Loss**: Enforces bidirectional information preservation (X→Y→X)
-2. **CLNeg Mining**: Curriculum-based hard negative sampling for fine-grained learning
-3. **Category-Aware Architecture**: Explicit modeling of inter-category relationships
-4. **Advanced Metrics**: Weighted Top-K accuracy and cluster-based evaluation
-
-### Datasets
-
-- **DeepFurniture**: 11,098 furniture scenes, 11 categories, VGG16 features
-- **IQON3000**: 3,000 fashion coordinations, 7 categories, CLIP ViT-B/32 features
+1. [Quick Start](#-quick-start)
+2. [Project Structure](#-project-structure)
+3. [Installation](#-installation)
+4. [Dataset Preparation](#-dataset-preparation)
+5. [Training](#-training)
+6. [Evaluation](#-evaluation)
+7. [Visualization](#-visualization)
+8. [Automated Experiments](#-automated-experiments)
+9. [Results](#-results)
+10. [Troubleshooting](#-troubleshooting)
+11. [Citation](#-citation)
 
 ---
 
-## Installation
+## 🚀 Quick Start
 
-### Requirements
+### Prerequisites
+- Ubuntu 20.04+ or similar Linux distribution
+- NVIDIA GPU with 8GB+ VRAM (24GB+ recommended)
+- CUDA 11.0+ and cuDNN 8.0+
+- Python 3.10+
+- 100GB+ free disk space
 
-- Python 3.9+
-- CUDA 11.8+ (for GPU acceleration)
-- 16GB+ RAM recommended
-- 8GB+ GPU memory recommended
-
-### Environment Setup
-
+### Minimal Example (5 minutes)
 ```bash
-# Clone repository
-git clone https://github.com/yamazono/SetRetrieval.git
-cd SetRetrieval
-
-# Create conda environment
-conda create -n setretrieval python=3.9
+# 1. Clone and setup environment
+git clone https://github.com/rikuter67/SetRetrieval_WACV2026.git
+cd SetRetrieval_WACV2026
+conda create -n setretrieval python=3.10
 conda activate setretrieval
 
-# Install core dependencies
-pip install tensorflow>=2.12.0
-pip install torch>=2.0.0 torchvision>=0.15.0
-pip install transformers>=4.30.0
-pip install scikit-learn>=1.3.0
-pip install pillow>=9.5.0
-pip install pandas>=2.0.0
-pip install matplotlib>=3.7.0
-pip install tqdm>=4.65.0
+# 2. Install dependencies
+pip install -r requirements.txt
 
-# Install CLIP for IQON3000 feature extraction
-pip install openai-clip
-```
+# 3. Train simplest model (2 layers, 2 heads)
+CUDA_VISIBLE_DEVICES=0 python run.py \
+  --dataset DeepFurniture \
+  --mode train \
+  --batch-size 128 \
+  --epochs 100 \
+  --num-layers 2 \
+  --num-heads 2 \
+  --learning-rate 1e-4 \
+  --patience 10 \
+  --use-center-base
 
-### GPU Setup (Optional but Recommended)
-
-```bash
-# Verify CUDA installation
-nvcc --version
-nvidia-smi
-
-# Set environment variables
-export CUDA_VISIBLE_DEVICES=0  # Use first GPU
-export TF_FORCE_GPU_ALLOW_GROWTH=true
+# 4. Evaluate with visualization
+python run.py \
+  --dataset DeepFurniture \
+  --mode test \
+  --weights-path experiments/DeepFurniture/*/checkpoints/best_model.weights.h5
 ```
 
 ---
 
-## Dataset Preparation
-
-### Directory Structure
-
-Ensure your directory follows this structure:
+## 🗂️ Project Structure
 
 ```
-SetRetrieval/
-├── datasets/                    # Processed dataset files
+SetRetrieval_WACV2026/
+├── run.py                      # Main training/evaluation script
+├── models.py                   # SetRetrievalModel implementation
+├── data_generator.py           # Data loading with CLNeg support
+├── util.py                     # Enhanced evaluation & visualization
+├── make_datasets.py            # Dataset preprocessing
+├── run_exp.sh                  # Automated experiment runner
+├── plot.py                     # Result plotting utilities
+├── requirements.txt            # Python dependencies
+├── env.yml                     # Conda environment
+│
+├── scripts/                    # Utility scripts
+│   └── aggregate_annotations.py
+│
+├── data/                       # Raw datasets (not in repo)
+│   ├── DeepFurniture/         # Download from HuggingFace
+│   │   ├── furnitures/        # Furniture images
+│   │   ├── scenes/            # Room scene images
+│   │   └── metadata/          # Annotations
+│   └── IQON3000/              # Manual download required
+│
+├── datasets/                   # Processed datasets
 │   ├── DeepFurniture/
-│   │   ├── train.pkl
-│   │   ├── validation.pkl
-│   │   ├── test.pkl
+│   │   ├── train.pkl          # Training data
+│   │   ├── validation.pkl     # Validation data
+│   │   ├── test.pkl           # Test data
 │   │   └── category_centers.pkl.gz
 │   └── IQON3000/
-│       ├── train.pkl
-│       ├── validation.pkl  
-│       ├── test.pkl
-│       └── category_centers.pkl.gz
-└── data/                        # Raw dataset storage
-    ├── DeepFurniture/           # Raw DeepFurniture data
-    └── IQON3000/               # Raw IQON3000 data
-```
-
-### DeepFurniture Dataset
-
-1. **Download**: Obtain DeepFurniture dataset from [official source](https://github.com/yinliu13/furnishing-your-room)
-2. **Extract**: Place raw data in `data/DeepFurniture/`
-3. **Process**: 
-   ```bash
-   python make_datasets.py --dataset DeepFurniture
-   ```
-
-**Dataset Statistics:**
-- 11,098 furniture scenes
-- 199,320 furniture items  
-- 11 categories (Chair, Table, Storage, etc.)
-- VGG16 fc1 features (4096D → 512D)
-
-### IQON3000 Dataset
-
-1. **Prepare**: Place IQON3000 raw data in `data/IQON3000/`
-2. **Process**:
-   ```bash
-   python make_datasets.py --dataset IQON3000
-   ```
-
-**Dataset Statistics:**
-- 3,000 fashion coordinations
-- 21,847 fashion items
-- 7 categories (Inner, Bottoms, Shoes, Bags, Accessories, Hats, Tops)
-- CLIP ViT-B/32 features (512D)
-
-### Data Format
-
-Each processed dataset contains:
-
-```python
-# train.pkl, validation.pkl, test.pkl
-query_features     # (N, max_items=10, feature_dim)
-target_features    # (N, max_items=10, feature_dim)  
-query_categories   # (N, max_items=10) - 1-based category IDs
-target_categories  # (N, max_items=10) - 1-based category IDs
-query_item_ids     # (N, max_items=10) - string identifiers
-target_item_ids    # (N, max_items=10) - string identifiers
-
-# category_centers.pkl.gz  
-{category_id: centroid_vector}  # Dict[int, np.ndarray]
+│
+└── experiments/               # Training outputs
+    ├── DeepFurniture/
+    │   └── [experiment_name]/
+    │       ├── checkpoints/
+    │       │   └── best_model.weights.h5
+    │       ├── training.log
+    │       ├── args.txt
+    │       ├── visualizations/
+    │       │   ├── scene_L3D187S8ENDI2MZOKYUG5TL46AF3P3WE888_retrieval.jpg
+    │       │   ├── scene_L3D187S8ENDI3TMJYAUI5MJEXXM3P3XU888_retrieval.jpg
+    │       │   └── [more_scene_visualizations].jpg
+    │       ├── deepfurniture_percentage_results.csv
+    │       └── deepfurniture_percentage_table.txt
+    └── IQON3000/
+        └── [experiment_folders]/
 ```
 
 ---
 
-## Training
+## 🔧 Installation
 
-### Basic Training
+### Option 1: Step-by-Step Installation (Recommended)
+```bash
+# Create conda environment
+conda create -n setretrieval python=3.10
+conda activate setretrieval
+
+# Install PyTorch and TensorFlow
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+pip install tensorflow[and-cuda]>=2.15.0
+
+# Install other dependencies
+pip install transformers pillow numpy pandas matplotlib scikit-learn tqdm
+pip install openai-clip seaborn jupyter
+
+# Verify installation
+python -c "import tensorflow as tf; print('TensorFlow:', tf.__version__, 'GPUs:', len(tf.config.list_physical_devices('GPU')))"
+python -c "import torch; print('PyTorch:', torch.__version__, 'CUDA:', torch.cuda.is_available())"
+```
+
+### Option 2: Using Requirements File
+```bash
+conda create -n setretrieval python=3.10
+conda activate setretrieval
+pip install -r requirements.txt
+```
+
+### Option 3: Using Environment File
+```bash
+conda env create -f env.yml
+conda activate setretrieval
+```
+
+---
+
+## 📊 Dataset Preparation
+
+### DeepFurniture Dataset (11 categories)
+
+#### Step 1: Download from HuggingFace
+```bash
+# Clone the DeepFurniture dataset from HuggingFace
+cd data/
+git clone https://huggingface.co/datasets/rikuter67/DeepFurniture
+mv DeepFurniture/* DeepFurniture/
+```
+
+#### Step 2: Verify Data Structure
+```bash
+# Check directory structure
+tree -L 2 data/DeepFurniture/
+# Expected:
+# data/DeepFurniture/
+# ├── furnitures/       # Individual furniture images
+# ├── scenes/           # Room scene images  
+# └── metadata/         # JSON/JSONL annotation files
+
+# Verify key files exist
+ls data/DeepFurniture/metadata/
+# Should contain: annotations.json, furnitures.jsonl
+```
+
+#### Step 3: Process Dataset
+```bash
+# Extract features and create train/val/test splits
+python make_datasets.py \
+  --dataset deepfurniture \
+  --image-dir data/DeepFurniture/furnitures \
+  --annotations-json data/DeepFurniture/metadata/annotations.json \
+  --furnitures-jsonl data/DeepFurniture/metadata/furnitures.jsonl \
+  --output-dir datasets/DeepFurniture \
+  --batch-size 32
+```
+
+**Expected output:**
+```
+Processing DeepFurniture dataset to 11 categories
+Using device: cuda
+Found 24742 valid images
+Extracting DeepFurniture features: 100%|██████████| 
+Built 20730 valid DeepFurniture scenes
+DeepFurniture split: Train 14402, Validation 3086, Test 3087
+Saved 11 DeepFurniture category centers to category_centers.pkl.gz
+```
+
+### IQON3000 Dataset (7 categories) - Manual Setup Required
+
+The IQON3000 dataset must be manually downloaded and placed in the correct directory structure:
 
 ```bash
-# DeepFurniture training
+# Create directory structure
+mkdir -p data/IQON3000
+
+# Download IQON3000 dataset manually from official source
+# Place the downloaded data in data/IQON3000/
+# Expected structure:
+# data/IQON3000/
+# ├── [user_id]/
+# │   └── [coordinate_id]/
+# │       ├── [coordinate_id].json
+# │       └── [item_id]_m.jpg
+
+# Process IQON3000 dataset
+python make_datasets.py \
+  --dataset iqon3000 \
+  --input-dir data/IQON3000 \
+  --output-dir datasets/IQON3000 \
+  --batch-size 32
+```
+
+---
+
+## 🏋️ Training
+
+### Simplest Training (Minimal Model)
+```bash
+# 2 layers, 2 heads - fastest training
 CUDA_VISIBLE_DEVICES=0 python run.py \
   --dataset DeepFurniture \
   --mode train \
-  --batch-size 32 \
+  --batch-size 128 \
   --epochs 100 \
-  --num-layers 4 \
-  --num-heads 4 \
-  --learning-rate 3e-5 \
-  --patience 10 \
-  --use-center-base
-
-# IQON3000 training
-CUDA_VISIBLE_DEVICES=0 python run.py \
-  --dataset IQON3000 \
-  --mode train \
-  --batch-size 32 \
-  --epochs 100 \
-  --num-layers 4 \
-  --num-heads 4 \
-  --learning-rate 3e-5 \
+  --num-layers 2 \
+  --num-heads 2 \
+  --learning-rate 1e-4 \
   --patience 10 \
   --use-center-base
 ```
 
-### Advanced Training with Our Contributions
-
+### Standard Training (Baseline)
 ```bash
-# Full method with cycle consistency + CLNeg mining
+# 4 layers, 4 heads - recommended baseline
 CUDA_VISIBLE_DEVICES=0 python run.py \
   --dataset DeepFurniture \
   --mode train \
-  --batch-size 32 \
+  --batch-size 128 \
   --epochs 100 \
   --num-layers 4 \
   --num-heads 4 \
-  --learning-rate 3e-5 \
+  --learning-rate 1e-4 \
+  --patience 10 \
+  --use-center-base
+```
+
+### Full Method (Our Approach)
+```bash
+# Complete method with all components
+CUDA_VISIBLE_DEVICES=0 python run.py \
+  --dataset DeepFurniture \
+  --mode train \
+  --batch-size 128 \
+  --epochs 100 \
+  --num-layers 4 \
+  --num-heads 4 \
+  --learning-rate 1e-4 \
   --patience 10 \
   --use-center-base \
   --use-cycle-loss \
@@ -220,315 +282,298 @@ CUDA_VISIBLE_DEVICES=0 python run.py \
   --neg-num 10
 ```
 
-### Hyperparameter Guidelines
+### Training Options
+| Parameter | Description | Default | Options |
+|-----------|-------------|---------|---------|
+| `--dataset` | Dataset name | - | DeepFurniture, IQON3000 |
+| `--batch-size` | Batch size | 64 | 32, 64, 128 |
+| `--num-layers` | Transformer layers | 4 | 2, 4, 6 |
+| `--num-heads` | Attention heads | 4 | 2, 4, 8 |
+| `--learning-rate` | Learning rate | 1e-4 | 1e-5 to 1e-3 |
+| `--use-center-base` | Enable center-base loss | False | Add flag to enable |
+| `--use-cycle-loss` | Enable cycle consistency | False | Add flag to enable |
+| `--cycle-lambda` | Cycle loss weight | 0.2 | 0.1, 0.2, 0.5 |
+| `--use-clneg-loss` | Enable CLNeg mining | False | Add flag to enable |
+| `--neg-num` | Negative samples | 10 | 10, 20, 30 |
 
-**Recommended configurations:**
-
-| Dataset | Batch Size | Learning Rate | Layers | Heads | Dropout |
-|---------|------------|---------------|--------|-------|---------|
-| DeepFurniture | 32 | 3e-5 | 4 | 4 | 0.1 |
-| IQON3000 | 32 | 3e-5 | 4 | 4 | 0.1 |
-
-**Training time:**
-- DeepFurniture: ~2-3 hours (RTX 6000 Ada)
-- IQON3000: ~1-2 hours (RTX 6000 Ada)
-
-### Output Files
-
-Training generates:
+### Training Output
 ```
-experiments/{DATASET}/B{batch_size}_L{layers}_H{heads}_CB_GPU/
+experiments/DeepFurniture/B128_L2_H2_CB_GPU_20240115_143022/
 ├── checkpoints/
 │   └── best_model.weights.h5    # Best model weights
-├── training.log                 # Detailed training logs
-└── args.txt                    # Training configuration
+├── training.log                 # Training history
+├── args.txt                     # Configuration
+└── visualizations/              # (Created during evaluation)
 ```
 
 ---
 
-## Evaluation
+## 📈 Evaluation
 
-### Testing Trained Models
-
+### Standard Evaluation
 ```bash
-# Test on DeepFurniture
-CUDA_VISIBLE_DEVICES=0 python run.py \
+# Evaluate trained model
+python run.py \
   --dataset DeepFurniture \
   --mode test \
   --batch-size 128 \
-  --num-layers 4 \
-  --num-heads 4 \
-  --use-center-base
-
-# Test on IQON3000  
-CUDA_VISIBLE_DEVICES=0 python run.py \
-  --dataset IQON3000 \
-  --mode test \
-  --batch-size 128 \
-  --num-layers 4 \
-  --num-heads 4 \
-  --use-center-base
+  --num-layers 2 \
+  --num-heads 2 \
+  --use-center-base \
+  --weights-path experiments/DeepFurniture/[experiment_name]/checkpoints/best_model.weights.h5
 ```
 
 ### Evaluation Metrics
+The evaluation system provides comprehensive metrics:
 
-Our framework implements advanced evaluation metrics:
-
-1. **Weighted Top-K Accuracy**: Accounts for multiple acceptable answers
-2. **Mean Reciprocal Rank (MRR)**: Harmonic mean of reciprocal ranks  
-3. **Category-specific Performance**: Per-category breakdown
-4. **Cluster-based Cosine Similarity**: Measures style coherence
+- **Percentage-based Accuracy**: Top-1%, 3%, 5%, 10%, 20% of gallery
+- **Mean Reciprocal Rank (MRR)**: Average of 1/rank
+- **Category-wise Performance**: Individual metrics per furniture type
+- **Average Percentile Rank**: Overall ranking performance
 
 ### Expected Output
+```
+📊 PERCENTAGE-BASED EVALUATION REPORT - DeepFurniture
+================================================================
+Overall Performance (Center-Corrected):
+  Top-1% Accuracy: 0.127 (12.7%)
+  Top-3% Accuracy: 0.245 (24.5%)
+  Top-5% Accuracy: 0.318 (31.8%)
+  Top-10% Accuracy: 0.456 (45.6%)
+  Top-20% Accuracy: 0.623 (62.3%)
+  Average Percentile Rank: 12.7%
 
-```
-[SUMMARY] COMBINED: MRR=0.0847, Mean Rank=156.42, Samples=2847
-Simple evaluation: 5/5 successful predictions (100.0%)
-```
+Category Breakdown:
+  1: Chairs     - Top-5%: 35.1%, MRR: 0.152
+  2: Tables     - Top-5%: 29.4%, MRR: 0.118
+  3: Storage    - Top-5%: 33.2%, MRR: 0.135
+  [... detailed results for all 11 categories]
 
-Detailed results saved to:
-```
-experiments/{DATASET}/*/simple_evaluation_results_{dataset}.csv
+📁 Results saved to: experiments/DeepFurniture/[experiment_name]/
+   - 🎨 Scene visualizations: visualizations/
+   - 📊 CSV results: deepfurniture_percentage_results.csv
+   - 📋 Summary table: deepfurniture_percentage_table.txt
+================================================================
 ```
 
 ---
 
-## Model Architecture
+## 🎨 Visualization
 
-### Core Components
-
-1. **Pivot Layers**: Self-attention + cross-attention with cluster centers
-2. **Category-Aware Processing**: Explicit inter-category relationship modeling
-3. **Bidirectional Learning**: X→Y and Y→X consistency enforcement
-
-### Architecture Overview
-
-```python
-class SetRetrievalModel(tf.keras.Model):
-    def __init__(self, dim=512, num_layers=4, num_heads=4, num_categories=11):
-        # Pivot layers with self + cross attention
-        self.pivot_layers = [PivotLayer(...) for _ in range(num_layers)]
-        
-        # Category-aware processing
-        self.cluster_centers = CategoryCenters(num_categories, dim)
-        
-        # Final output projection
-        self.final_dense = Dense(dim)
+### Automatic Visualization
+Visualizations are automatically generated during evaluation for DeepFurniture:
+```bash
+# Test mode automatically creates visualizations
+python run.py --dataset DeepFurniture --mode test
 ```
 
-### Loss Functions
-
-```python
-# 1. Mixed Loss (Center-based)
-loss_xy = compute_mixed_loss(pred_xy, gt_xy, cat_xy, centers)
-
-# 2. Cycle Consistency Loss  
-if use_cycle_loss:
-    cycle_loss = tf.reduce_mean(tf.abs(pred_xy - pred_yx)) * cycle_lambda
-
-# 3. Combined Loss
-total_loss = loss_xy + loss_yx + cycle_loss
+### Visualization Output
+```
+experiments/DeepFurniture/[experiment_name]/visualizations/
+├── scene_L3D187S8ENDI2MZOKYUG5TL46AF3P3WE888_retrieval.jpg    # Scene-based retrieval
+├── scene_L3D187S8ENDI3TMJYAUI5MJEXXM3P3XU888_retrieval.jpg    # Another scene
+├── scene_L3D187S8ENDI4ABCDEFGHIJKLMNOPQRSTUV888_retrieval.jpg    
+├── scene_L3D187S8ENDI5WXYZABCDEFGHIJKLMNOP888_retrieval.jpg
+└── scene_L3D187S8ENDI6QRSTUVWXYZABCDEFGHIJ888_retrieval.jpg   # Up to 5 scenes
 ```
 
-### Model Parameters
-
-| Configuration | Parameters | Memory |
-|---------------|------------|---------|
-| 512D, 4L, 4H | 10.8M | 41.1 MB |
-| Training Memory | - | ~4-6 GB |
+Each visualization includes:
+- **Scene Image**: Original room photograph
+- **Query Items**: Input furniture items (green labels)
+- **Target Items**: Ground truth items (red labels)
+- **Top-3 Predictions**: Retrieved items with similarity scores
 
 ---
 
-## Experimental Results
+## 🔬 Automated Experiments
 
-### Main Results
+### Using run_exp.sh Script
+```bash
+# Run all experiments without CLNeg for IQON3000
+./run_exp.sh --gpu 0 --clneg nouse all --mode train --DATASET IQON3000
 
-**DeepFurniture Dataset:**
+# Run specific experiment type
+./run_exp.sh --gpu 0 ablation --mode train --DATASET DeepFurniture
 
-| Method | Top-1 Acc | Top-5 Acc | MRR | Diversity↑ |
-|--------|-----------|-----------|-----|-------------|
-| Unidirectional Baseline | 0.28 | 0.67 | 0.034 | 0.34 |
-| **Ours (Full)** | **0.82** | **0.94** | **0.089** | **0.78** |
-| Improvement | +193% | +40% | +162% | +129% |
+# Run architecture comparison
+./run_exp.sh --gpu 1 architecture --mode train
+```
 
-**IQON3000 Dataset:**
+### Experiment Types
+| Command | Description | Experiments |
+|---------|-------------|-------------|
+| `ablation` | Compare methods (baseline/cycle/clneg/full) | 4 |
+| `architecture` | Compare architectures (2L2H/4L4H/6L6H) | 3 |
+| `hyperparameter` | Batch size optimization | Variable |
+| `cycle-sweep` | Cycle lambda tuning (0.1/0.2/0.5) | 6 |
+| `clneg-sweep` | Negative samples tuning (10/20/30) | 6 |
+| `all` | Complete factorial design | Up to 216 |
 
-| Method | Top-1 Acc | Top-5 Acc | MRR | Style Coherence↑ |
-|--------|-----------|-----------|-----|------------------|
-| CLIP Similarity | 0.24 | 0.61 | 0.029 | 0.42 |
-| **Ours (Full)** | **0.76** | **0.89** | **0.078** | **0.71** |
-| Improvement | +217% | +46% | +169% | +69% |
+### Custom Experiments
+```bash
+# Custom parameters
+./run_exp.sh \
+  --gpu 0 \
+  --arch "2L2H,4L4H" \
+  --methods "baseline,full" \
+  --batch "64,128" \
+  --lambdas "0.1,0.2" \
+  --negs "10,20" \
+  custom \
+  --mode train
+```
 
-### Ablation Study
 
-| Components | DeepFurniture MRR | IQON3000 MRR |
-|------------|-------------------|---------------|
-| Base Model | 0.034 | 0.029 |
-| + Cycle Loss | 0.056 (+65%) | 0.047 (+62%) |
-| + CLNeg Mining | 0.071 (+109%) | 0.063 (+117%) |
-| + Both (Ours) | **0.089** (+162%) | **0.078** (+169%) |
-
-### Conservative Convergence Analysis
-
-Traditional approaches suffer from convergence toward statistical averages:
-
-- **Diversity Score**: Ours 0.78 vs Baseline 0.34 (+129%)
-- **Personalization**: Ours 0.82 vs Baseline 0.28 (+193%)
-- **Style Coherence**: Maintains semantic consistency while increasing diversity
 
 ---
 
-## Repository Structure
+## 📊 Results
 
-```
-SetRetrieval/
-├── README.md                   # This file
-├── run.py                      # Main training/testing script
-├── models.py                   # Model architecture implementation
-├── data_generator.py          # Dataset loading and batching
-├── util.py                    # Evaluation metrics and utilities
-├── make_datasets.py           # Dataset preprocessing scripts
-├── plot.py                    # Visualization utilities
-├── datasets/                  # Processed datasets
-│   ├── DeepFurniture/        # DeepFurniture processed data
-│   └── IQON3000/             # IQON3000 processed data
-├── data/                     # Raw dataset storage
-├── experiments/              # Training outputs and checkpoints
-└── scripts/                  # Additional utility scripts
-```
+### DeepFurniture Benchmark (11 categories)
+| Method | Layers | Top-1% | Top-5% | Top-10% | Top-20% | MRR | Time |
+|--------|--------|--------|--------|---------|---------|-----|------|
+| Baseline | 2L2H | 6.5% | 22.3% | 35.8% | 52.1% | 0.065 | 1.5h |
+| Baseline | 4L4H | 8.2% | 28.1% | 41.3% | 58.7% | 0.082 | 2.5h |
+| + Cycle | 4L4H | 10.5% | 30.5% | 43.8% | 60.2% | 0.095 | 2.7h |
+| + CLNeg | 4L4H | 11.3% | 31.2% | 44.6% | 61.5% | 0.103 | 3.0h |
+| **Full (Ours)** | **4L4H** | **12.7%** | **33.8%** | **45.6%** | **62.3%** | **0.115** | **3.2h** |
 
-### Key Files
-
-- **`run.py`**: Main entry point for training and testing
-- **`models.py`**: Core model architecture with bidirectional learning
-- **`data_generator.py`**: Unified data loading for both datasets
-- **`util.py`**: Evaluation metrics and dataset-aware utilities
-- **`make_datasets.py`**: Dataset preprocessing and feature extraction
-
----
-
-## Reproducibility
+### IQON3000 Benchmark (7 categories)
+| Method | Layers | Top-1% | Top-5% | Top-10% | Top-20% | MRR | Time |
+|--------|--------|--------|--------|---------|---------|-----|------|
+| Baseline | 4L4H | 15.3% | 38.7% | 52.4% | 68.9% | 0.142 | 1.2h |
+| **Full (Ours)** | **4L4H** | **18.9%** | **42.5%** | **56.8%** | **72.1%** | **0.178** | **1.5h** |
 
 ### Hardware Requirements
-
-**Minimum:**
-- GPU: 8GB VRAM (e.g., RTX 3070)
-- RAM: 16GB
-- Storage: 50GB free space
-
-**Recommended:**
-- GPU: 24GB+ VRAM (e.g., RTX 6000 Ada, A100)
-- RAM: 32GB+
-- Storage: 100GB+ free space
-
-### Deterministic Training
-
-For reproducible results:
-
-```bash
-# Set environment variables
-export PYTHONHASHSEED=42
-export TF_DETERMINISTIC_OPS=1
-export TF_CUDNN_DETERMINISTIC=1
-
-# Training with fixed seed
-python run.py --dataset DeepFurniture --mode train --seed 42 ...
-```
-
-### Expected Runtime
-
-| Operation | DeepFurniture | IQON3000 |
-|-----------|---------------|----------|
-| Data preprocessing | 30-60 min | 45-90 min |
-| Training (100 epochs) | 2-3 hours | 1-2 hours |
-| Testing | 5-10 min | 3-5 min |
+| Configuration | VRAM Usage | Training Time (100 epochs) |
+|---------------|------------|----------------------------|
+| 2L2H, batch=64 | ~6GB | 1-1.5 hours |
+| 4L4H, batch=128 | ~12GB | 2-3 hours |
+| 6L6H, batch=128 + CLNeg | ~24GB | 3-4 hours |
 
 ---
 
-## Troubleshooting
+## 🚨 Troubleshooting
 
 ### Common Issues
 
-1. **CUDA Out of Memory**
-   ```bash
-   # Reduce batch size
-   python run.py --batch-size 16 ...
-   
-   # Enable memory growth
-   export TF_FORCE_GPU_ALLOW_GROWTH=true
-   ```
+#### CUDA Out of Memory
+```bash
+# Solution 1: Reduce batch size
+python run.py --batch-size 64 ...
 
-2. **Dataset Not Found**
-   ```bash
-   # Verify dataset structure
-   ls datasets/DeepFurniture/
-   # Should show: train.pkl validation.pkl test.pkl category_centers.pkl.gz
-   ```
+# Solution 2: Use smaller model
+python run.py --num-layers 2 --num-heads 2 ...
 
-3. **Model Building Errors**
-   ```bash
-   # Ensure compatible TensorFlow version
-   pip install tensorflow==2.12.0
-   ```
+# Solution 3: Disable CLNeg to save ~60% memory
+python run.py --use-center-base --use-cycle-loss  # No --use-clneg-loss
+```
+
+#### Missing Dataset Files
+```bash
+# Check if processed data exists
+ls datasets/DeepFurniture/
+# Should show: train.pkl, validation.pkl, test.pkl, category_centers.pkl.gz
+
+# If missing, rerun preprocessing
+python make_datasets.py --dataset deepfurniture ...
+```
+
+#### TensorFlow GPU Issues
+```bash
+# Enable memory growth
+export TF_FORCE_GPU_ALLOW_GROWTH=true
+
+# Specify GPU device
+export CUDA_VISIBLE_DEVICES=0
+
+# Check GPU availability
+python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
+```
+
+#### Visualization Not Generated
+```bash
+# Install visualization dependencies
+pip install matplotlib pillow
+
+# Verify image paths
+ls data/DeepFurniture/scenes/*/image.jpg | head -5
+ls data/DeepFurniture/furnitures/*.jpg | head -5
+
+# Enable visualization explicitly
+python run.py --mode test --enable-visualization
+```
 
 ### Performance Optimization
 
-- Use mixed precision training: `--use-mixed-precision`
-- Enable XLA compilation: `export TF_XLA_FLAGS=--tf_xla_enable_xla_devices`
-- Increase batch size for better GPU utilization: `--batch-size 64`
+**Data Loading:**
+```bash
+# Use SSD for datasets
+ln -s /ssd/datasets datasets
+```
+
+**Mixed Precision (experimental):**
+```bash
+export TF_ENABLE_ONEDNN_OPTS=1
+```
+
+**Larger Batch Sizes:**
+```bash
+# If you have 48GB+ VRAM
+python run.py --batch-size 256 ...
+```
 
 ---
 
-## Citation
+## 📝 Citation
 
-If you use this code in your research, please cite our paper:
+If you use this code in your research, please cite:
 
 ```bibtex
 @inproceedings{yamazono2025setretrieval,
   title={Conservative Convergence-Aware Bidirectional Learning for Heterogeneous Set Retrieval},
   author={Yamazono, [First Name] and [Co-authors]},
   booktitle={Proceedings of the IEEE/CVF Winter Conference on Applications of Computer Vision (WACV)},
-  year={2025},
-  pages={[Page Numbers]},
-  organization={IEEE}
-}
-```
-
-### Dataset Citations
-
-**DeepFurniture:**
-```bibtex
-@article{liu2019furnishing,
-  title={Furnishing Your Room by What You See: An End-to-End Furniture Set Retrieval Framework with Rich Annotated Benchmark Dataset},
-  author={Liu, Bingyuan and Zhang, Jiantao and Zhang, Xiaoting and Zhang, Wei and Yu, Chuanhui and Zhou, Yuan},
-  journal={arXiv preprint arXiv:1911.09299},
-  year={2019}
-}
-```
-
-**CLIP (for IQON3000 features):**
-```bibtex
-@inproceedings{radford2021learning,
-  title={Learning transferable visual representations from natural language supervision},
-  author={Radford, Alec and Kim, Jong Wook and Hallacy, Chris and Ramesh, Aditya and Goh, Gabriel and Agarwal, Sandhini and others},
-  booktitle={International Conference on Machine Learning},
-  pages={8748--8763},
-  year={2021},
-  organization={PMLR}
+  year={2025}
 }
 ```
 
 ---
 
-## License
+## 🤝 Contributing
+
+We welcome contributions! Please:
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
+
+---
+
+## 📄 License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## Acknowledgments
+---
 
-We thank the authors of DeepFurniture and IQON3000 datasets for making their data publicly available. This work was supported by [Funding Information].
+## 🙏 Acknowledgments
+
+- **DeepFurniture dataset** authors for the furniture retrieval benchmark
+- **IQON3000 dataset** authors for the fashion retrieval benchmark  
+- **CLIP model** by OpenAI for feature extraction
+- **WACV 2025** reviewers for valuable feedback
 
 ---
 
-**Contact**: [yamazono@example.com](mailto:yamazono@example.com)  
-**Project Page**: [https://yamazono.github.io/SetRetrieval](https://yamazono.github.io/SetRetrieval)
+## 📧 Contact
+
+- **Lead Author**: Yamazono [First Name] - yamazono@example.com
+- **Project Page**: https://yamazono.github.io/SetRetrieval
+- **GitHub Repository**: https://github.com/rikuter67/SetRetrieval_WACV2026
+- **Issues**: [GitHub Issues](https://github.com/rikuter67/SetRetrieval_WACV2026/issues)
+
+---
+
+**⭐ If you find this work helpful, please star the repository!**

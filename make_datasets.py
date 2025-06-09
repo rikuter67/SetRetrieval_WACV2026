@@ -31,7 +31,7 @@ from tqdm import tqdm
 from sklearn.model_selection import train_test_split
 import tensorflow as tf
 
-os.environ["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "1")
+os.environ["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
 
 # Suppress TensorFlow warnings
 tf.get_logger().setLevel("ERROR")
@@ -498,9 +498,58 @@ def convert_to_deepfurniture_format(sets_of_items_data, output_file, max_item_nu
 
 def compute_iqon3000_category_centers(features_dir):
     """Compute category centers for IQON3000 (7 categories) - 辞書形式で保存"""
-    # ... 既存のコード ...
+    print("\nComputing IQON3000 category centers...")
     
-    # 辞書形式で保存（NumPy配列ではなく）
+    # 訓練データを読み込む
+    train_path = os.path.join(features_dir, 'train.pkl')
+    if not os.path.exists(train_path):
+        print(f"Error: {train_path} not found")
+        return
+    
+    with open(train_path, 'rb') as f:
+        train_data = pickle.load(f)
+    
+    # データ構造を確認
+    if len(train_data) >= 8:
+        query_features, target_features, scene_ids, query_categories, target_categories, set_sizes, query_item_ids, target_item_ids = train_data
+    else:
+        print(f"Error: Unexpected data format in {train_path}")
+        return
+    
+    print(f"Loaded training data: {len(query_features)} sets")
+    
+    # IQON3000の7カテゴリID (1-7)
+    active_main_cat_ids = list(range(1, 8))  # 1-7
+    
+    # 特徴量次元を取得
+    if len(query_features) > 0 and query_features[0].shape[-1] > 0:
+        embedding_dim = query_features[0].shape[-1]
+    else:
+        print("Error: No valid features found")
+        return
+    
+    print(f"Feature dimension: {embedding_dim}")
+    
+    # カテゴリ別に全特徴量を収集
+    features_per_main_category = {cat_id: [] for cat_id in active_main_cat_ids}
+    
+    # クエリとターゲットの特徴量を処理
+    all_features = np.concatenate([query_features, target_features], axis=0)  # (total_sets, max_items, feature_dim)
+    all_categories = np.concatenate([query_categories, target_categories], axis=0)  # (total_sets, max_items)
+    
+    print("Collecting features by category...")
+    for set_idx in tqdm(range(len(all_features)), desc="Processing sets"):
+        for item_idx in range(len(all_features[set_idx])):
+            feat = all_features[set_idx][item_idx]
+            cat = all_categories[set_idx][item_idx]
+            
+            # パディング（ゼロベクトル）とカテゴリ範囲外をスキップ
+            if cat == 0 or np.all(feat == 0) or cat not in active_main_cat_ids:
+                continue
+                
+            features_per_main_category[cat].append(feat)
+    
+    # カテゴリ中心を計算
     category_centers_dict = {}
     for main_cat_id in active_main_cat_ids:
         if features_per_main_category[main_cat_id]:
@@ -508,6 +557,7 @@ def compute_iqon3000_category_centers(features_dir):
             norm = np.linalg.norm(center_vec)
             # 辞書のキーは1-based、値はPythonのリスト
             category_centers_dict[main_cat_id] = (center_vec / norm if norm > 1e-9 else center_vec).tolist()
+            print(f"Category {main_cat_id}: {len(features_per_main_category[main_cat_id])} features")
         else:
             print(f"Warning: No features for category ID {main_cat_id}. Initializing randomly.")
             rand_vec = np.random.randn(embedding_dim).astype(np.float32)
@@ -515,10 +565,24 @@ def compute_iqon3000_category_centers(features_dir):
             category_centers_dict[main_cat_id] = (rand_vec / norm_rand if norm_rand > 1e-9 else rand_vec).tolist()
     
     # 辞書形式で保存
-    with gzip.open(os.path.join(features_dir, 'category_centers.pkl.gz'), 'wb') as f:
+    output_path = os.path.join(features_dir, 'category_centers.pkl.gz')
+    with gzip.open(output_path, 'wb') as f:
         pickle.dump(category_centers_dict, f)
     
-    print(f"\nSaved {len(category_centers_dict)} main category centers to category_centers.pkl.gz")
+    print(f"Saved {len(category_centers_dict)} main category centers to {output_path}")
+    
+    # カテゴリ名のマッピングも表示
+    category_names = {
+        1: "outerwear", 2: "tops", 3: "bottoms", 4: "shoes",
+        5: "bags", 6: "hats", 7: "accessories"
+    }
+    
+    print("\nCategory center summary:")
+    for cat_id in sorted(category_centers_dict.keys()):
+        cat_name = category_names.get(cat_id, f"Category {cat_id}")
+        feature_count = len(features_per_main_category[cat_id])
+        print(f"  {cat_id}: {cat_name} - {feature_count} features")
+    
     return category_centers_dict
 
 def compute_deepfurniture_category_centers(features_dir):
@@ -617,31 +681,34 @@ def process_deepfurniture(image_dir, annotations_json, furnitures_jsonl, output_
         if not scene_id:
             continue
         
-        scene_features = []
-        scene_categories = []
-        scene_item_ids = []
+        scene_items_unique = {} # 重複を排除するための辞書 {furniture_id: (feature, category_id)}
         
         for instance in scene_record.get("instances", []):
             furniture_id = str(instance.get("identityID"))
             category_id = instance.get("categoryID")
-            
+    
             if not furniture_id or category_id is None:
                 continue
-            
-            # Find feature for this furniture_id
-            if furniture_id in all_furniture_ids:
-                idx = all_furniture_ids.index(furniture_id)
-                scene_features.append(all_features[idx])
-                scene_categories.append(category_id)
-                scene_item_ids.append(furniture_id)
-                category_ids_in_scenes.add(category_id)
-        
-        if len(scene_features) >= 4:  # Minimum items per scene for DeepFurniture
+ 
+            if furniture_id not in scene_items_unique:
+                # Find feature for this furniture_id
+                if furniture_id in all_furniture_ids:
+                    idx = all_furniture_ids.index(furniture_id)
+                    # 辞書にIDをキーとして保存することで、自動的に重複が排除される
+                    scene_items_unique[furniture_id] = (all_features[idx], category_id)
+
+        # 重複排除されたアイテムを使ってシーンを再構築
+        if len(scene_items_unique) >= 4: # 最小アイテム数のチェック
+            item_ids_final = list(scene_items_unique.keys())
+            features_final = np.array([v[0] for v in scene_items_unique.values()])
+            categories_final = np.array([v[1] for v in scene_items_unique.values()])
+          
             scenes[str(scene_id)] = {
-                "features": np.stack(scene_features),
-                "category_ids": np.array(scene_categories),
-                "item_ids": np.array(scene_item_ids, dtype=object)
+                "features": features_final,
+                "category_ids": categories_final,
+                "item_ids": np.array(item_ids_final, dtype=object)
             }
+            category_ids_in_scenes.update(categories_final)
     
     print(f"Built {len(scenes)} valid DeepFurniture scenes")
     print(f"Found category IDs in scenes: {sorted(list(category_ids_in_scenes))}")
@@ -692,24 +759,43 @@ def load_jsonl_mapping(path, key_field, value_field):
     return mapping
 
 def convert_scenes_to_deepfurniture_format(scenes, output_dir, min_items=4, max_items=20, max_item_num=10):
-    """Convert scenes to DeepFurniture format with train/val/test split and z-score normalization"""
+    """Convert scenes to DeepFurniture format with proper scene-based split"""
     from collections import defaultdict
+    import numpy as np
+    import random
+    from sklearn.model_selection import train_test_split
+    from tqdm import tqdm
+    import pickle
+    import os
     
-    # Build partitions
+    # Build partitions - シーンごとにクエリとポジティブを作成
     q_feats, p_feats, q_cats, p_cats, q_ids, p_ids, s_keys = [], [], [], [], [], [], []
     
     rng = random.Random(42)
+    
+    # 統計情報
+    scene_count = 0
+    skipped_scenes = 0
     
     for sid, rec in tqdm(scenes.items(), desc="Converting DeepFurniture scenes"):
         feats, cats, ids = rec["features"], rec["category_ids"], rec["item_ids"]
         n = len(feats)
         
         if n < min_items or n > max_items:
+            skipped_scenes += 1
             continue
-            
+        
+        # シーン内のアイテムをシャッフルして半分に分ける
         idx = list(range(n))
         rng.shuffle(idx)
-        q_idx, p_idx = idx[:n//2], idx[n//2:]
+        
+        # 重複なしで半分ずつに分割
+        half = n // 2
+        q_idx = idx[:half]      # クエリ用インデックス
+        p_idx = idx[half:]      # ポジティブ用インデックス
+        
+        # クエリとポジティブに同じアイテムが含まれないことを確認
+        assert len(set(q_idx) & set(p_idx)) == 0, f"Query and positive indices overlap in scene {sid}"
         
         # Pad function
         def pad_df(arr, target, pad_val=0):
@@ -735,23 +821,35 @@ def convert_scenes_to_deepfurniture_format(scenes, output_dir, min_items=4, max_
         pi = pad_df(ids[p_idx], max_item_num, pad_val="")
         pc = pad_df(cats[p_idx], max_item_num, pad_val=0)
         
+        # 重複チェック（デバッグ用）
+        q_items_set = set(ids[q_idx])
+        p_items_set = set(ids[p_idx])
+        if q_items_set & p_items_set:
+            print(f"WARNING: Scene {sid} has overlapping items between query and positive!")
+            print(f"  Overlapping items: {q_items_set & p_items_set}")
+            continue
+        
         q_feats.append(qf); q_ids.append(qi); q_cats.append(qc)
         p_feats.append(pf); p_ids.append(pi); p_cats.append(pc)
         s_keys.append(sid)
+        scene_count += 1
+    
+    print(f"\nProcessed {scene_count} scenes (skipped {skipped_scenes} scenes)")
     
     if not q_feats:
         print("No valid scenes found for conversion")
         return
     
+    # NumPy配列に変換
     Q = np.stack(q_feats)
     P = np.stack(p_feats)
     qcat = np.stack(q_cats)
     pcat = np.stack(p_cats)
     qid = np.stack(q_ids)
     pid = np.stack(p_ids)
-    sids = np.array(s_keys)
+    sids = np.array(s_keys)  # これは文字列のリストをNumPy配列に変換
     
-    # Category remap (mask=0)
+    # Category remap (padding=0としてマップ)
     unique = np.unique(np.concatenate([qcat, pcat]))
     unique = unique[unique > 0]
     cat_map = {cid: i + 1 for i, cid in enumerate(sorted(unique))}
@@ -759,38 +857,87 @@ def convert_scenes_to_deepfurniture_format(scenes, output_dir, min_items=4, max_
     qcat = vect(qcat)
     pcat = vect(pcat)
     
-    # Train/val/test split
-    (Q_tr, Q_tmp, qcat_tr, qcat_tmp, P_tr, P_tmp, pcat_tr, pcat_tmp,
-     qid_tr, qid_tmp, pid_tr, pid_tmp, sid_tr, sid_tmp) = train_test_split(
-        Q, qcat, P, pcat, qid, pid, sids,
-        test_size=0.3, random_state=42)
-
-    (Q_val, Q_te, qcat_val, qcat_te, P_val, P_te, pcat_val, pcat_te,
-     qid_val, qid_te, pid_val, pid_te, sid_val, sid_te) = train_test_split(
-        Q_tmp, qcat_tmp, P_tmp, pcat_tmp, qid_tmp, pid_tmp, sid_tmp,
-        test_size=0.5, random_state=42)
-
+    print(f"Found {len(unique)} unique categories, remapped to 1-{len(unique)}")
+    
+    # シーンベースでtrain/val/testに分割
+    # インデックスで分割を管理
+    indices = np.arange(len(Q))
+    
+    # 70/15/15の割合で分割
+    train_idx, temp_idx = train_test_split(indices, test_size=0.3, random_state=42)
+    val_idx, test_idx = train_test_split(temp_idx, test_size=0.5, random_state=42)
+    
+    # 分割データを作成
+    Q_tr, P_tr = Q[train_idx], P[train_idx]
+    qcat_tr, pcat_tr = qcat[train_idx], pcat[train_idx]
+    qid_tr, pid_tr = qid[train_idx], pid[train_idx]
+    sid_tr = sids[train_idx]
+    
+    Q_val, P_val = Q[val_idx], P[val_idx]
+    qcat_val, pcat_val = qcat[val_idx], pcat[val_idx]
+    qid_val, pid_val = qid[val_idx], pid[val_idx]
+    sid_val = sids[val_idx]
+    
+    Q_te, P_te = Q[test_idx], P[test_idx]
+    qcat_te, pcat_te = qcat[test_idx], pcat[test_idx]
+    qid_te, pid_te = qid[test_idx], pid[test_idx]
+    sid_te = sids[test_idx]
+    
+    # 各分割内での重複チェック
+    def check_query_positive_overlap(split_name, q_ids, p_ids):
+        """クエリとポジティブ間の重複をチェック"""
+        overlap_count = 0
+        for i in range(len(q_ids)):
+            q_items = set([item for item in q_ids[i] if item and item != "" and item != "0"])
+            p_items = set([item for item in p_ids[i] if item and item != "" and item != "0"])
+            if q_items & p_items:
+                overlap_count += 1
+        
+        if overlap_count > 0:
+            print(f"⚠️  {split_name}: {overlap_count}/{len(q_ids)} scenes have query-positive overlap")
+        else:
+            print(f"✅ {split_name}: No query-positive overlap in any scene")
+        
+        return overlap_count == 0
+    
+    print("\n=== Query-Positive Overlap Check ===")
+    check_query_positive_overlap("Train", qid_tr, pid_tr)
+    check_query_positive_overlap("Validation", qid_val, pid_val)
+    check_query_positive_overlap("Test", qid_te, pid_te)
+    
     # Z-score normalization
-    Q_tr, P_tr = zscore_normalize(Q_tr), zscore_normalize(P_tr)
-    Q_val, P_val = zscore_normalize(Q_val), zscore_normalize(P_val)
-    Q_te, P_te = zscore_normalize(Q_te), zscore_normalize(P_te)
+    def zscore_normalize(x):
+        mean = x.mean(axis=(0, 1), keepdims=True)
+        std = x.std(axis=(0, 1), keepdims=True) + 1e-7
+        return (x - mean) / std
     
-    print(f"DeepFurniture split: Train {len(Q_tr)}, Validation {len(Q_val)}, Test {len(Q_te)}")
+    Q_tr = zscore_normalize(Q_tr)
+    P_tr = zscore_normalize(P_tr)
+    Q_val = zscore_normalize(Q_val)
+    P_val = zscore_normalize(P_val)
+    Q_te = zscore_normalize(Q_te)
+    P_te = zscore_normalize(P_te)
     
-    # Save partitions
+    print(f"\nDeepFurniture split: Train {len(Q_tr)}, Validation {len(Q_val)}, Test {len(Q_te)}")
+    
+    # Save partitions - 元の形式を維持
     def save_partition(path, objects):
         with open(path, "wb") as f:
             pickle.dump(objects, f)
     
+    # set_sizesはすべて0で初期化（元のコードと同じ）
     save_partition(os.path.join(output_dir, "train.pkl"), 
                   (Q_tr, P_tr, sid_tr, qcat_tr, pcat_tr, np.zeros(len(Q_tr)), qid_tr, pid_tr))
     save_partition(os.path.join(output_dir, "validation.pkl"), 
                   (Q_val, P_val, sid_val, qcat_val, pcat_val, np.zeros(len(Q_val)), qid_val, pid_val))
     save_partition(os.path.join(output_dir, "test.pkl"), 
                   (Q_te, P_te, sid_te, qcat_te, pcat_te, np.zeros(len(Q_te)), qid_te, pid_te))
+    
+    print("\n✅ Dataset saved successfully!")
+
 
 def compute_deepfurniture_category_centers(features_dir):
-    """Compute category centers for DeepFurniture (11 categories)"""
+    """Compute category centers for DeepFurniture (11 categories) - 辞書形式で保存"""
     train_path = os.path.join(features_dir, 'train.pkl')
     
     with open(train_path, 'rb') as f:
@@ -803,15 +950,21 @@ def compute_deepfurniture_category_centers(features_dir):
     unique_cats = np.unique(flat_cat)
     unique_cats = unique_cats[unique_cats > 0]
     
-    centers = np.zeros((len(unique_cats), flat_feat.shape[1]))
-    for i, cid in enumerate(sorted(unique_cats)):
+    # 辞書形式で保存（既存コードとの互換性のため）
+    category_centers_dict = {}
+    for cid in sorted(unique_cats):
         mask = flat_cat == cid
-        centers[i] = flat_feat[mask].mean(axis=0) if mask.any() else 0
+        if mask.any():
+            center_vec = flat_feat[mask].mean(axis=0)
+            category_centers_dict[int(cid)] = center_vec.tolist()  # リスト形式で保存
+        else:
+            category_centers_dict[int(cid)] = np.zeros(flat_feat.shape[1]).tolist()
     
+    import gzip
     with gzip.open(os.path.join(features_dir, "category_centers.pkl.gz"), "wb") as f:
-        pickle.dump(centers, f)
+        pickle.dump(category_centers_dict, f)
     
-    print(f"Saved {len(centers)} DeepFurniture category centers to category_centers.pkl.gz")
+    print(f"Saved {len(category_centers_dict)} DeepFurniture category centers to category_centers.pkl.gz")
 
 # =============================================================================
 # Main Function

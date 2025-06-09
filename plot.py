@@ -1,591 +1,746 @@
-# plot.py - Updated for IQON3000 dataset (11 categories: 1-11)
+# plot.py - Integrated DeepFurniture-style visualization for all datasets
 import os, math
 import pdb
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
-from matplotlib.lines   import Line2D
+from matplotlib.lines import Line2D
 import numpy as np
 import pandas as pd
 import tensorflow as tf
 from PIL import Image, ImageDraw, ImageFont
 from sklearn.decomposition import PCA
 
-from util import append_dataframe_to_csv, load_scene_image, safe_load_furniture_image, find_topk_similar_items_by_euclidean
+from util import (append_dataframe_to_csv, load_scene_image, safe_load_furniture_image, 
+                  find_topk_similar_items_by_euclidean, DATASET_CONFIGS)
 
 # ------------------------------------------------------------------
-# 1.  Learning curve (Loss & Avg-Rank)
+# 1. Training curves (Loss & Avg-Rank) - Dataset agnostic
 # ------------------------------------------------------------------
 def plot_training_metrics(output_dir: str, batch_size: int, epochs: List[int],
                           train_loss: List[float], val_loss: List[float],
-                          train_avg_rank: List[float], val_avg_rank: List[float]):
+                          train_avg_rank: List[float], val_avg_rank: List[float],
+                          dataset_type: str = "DeepFurniture"):
+    """Plot training metrics with dataset-specific styling"""
     os.makedirs(output_dir, exist_ok=True)
-    fig, ax = plt.subplots(1, 2, figsize=(14,5))
+    fig, ax = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Color scheme by dataset
+    colors = {"DeepFurniture": ("blue", "red"), 
+              "IQON3000": ("green", "orange")}
+    train_color, val_color = colors.get(dataset_type, ("blue", "red"))
 
     # Avg‑Rank
-    ax[0].plot(epochs, train_avg_rank, label="Train", color="blue")
-    ax[0].plot(epochs, val_avg_rank,   label="Val.",  color="red")
-    ax[0].set_title("Average Rank (IQON3000)"); ax[0].set_xlabel("Epoch"); ax[0].legend()
+    ax[0].plot(epochs, train_avg_rank, label="Train", color=train_color, linewidth=2)
+    ax[0].plot(epochs, val_avg_rank, label="Val.", color=val_color, linewidth=2)
+    ax[0].set_title(f"Average Rank ({dataset_type})")
+    ax[0].set_xlabel("Epoch")
+    ax[0].set_ylabel("Average Rank")
+    ax[0].legend()
+    ax[0].grid(True, alpha=0.3)
 
     # Loss
-    ax[1].plot(epochs, train_loss, label="Train", color="blue")
-    ax[1].plot(epochs, val_loss,   label="Val.",  color="red")
-    ax[1].set_title("Loss (IQON3000)"); ax[1].set_xlabel("Epoch"); ax[1].legend()
+    ax[1].plot(epochs, train_loss, label="Train", color=train_color, linewidth=2)
+    ax[1].plot(epochs, val_loss, label="Val.", color=val_color, linewidth=2)
+    ax[1].set_title(f"Loss ({dataset_type})")
+    ax[1].set_xlabel("Epoch")
+    ax[1].set_ylabel("Loss")
+    ax[1].legend()
+    ax[1].grid(True, alpha=0.3)
 
-    fn = os.path.join(output_dir, f"iqon3000_loss_rank_bs{batch_size}.png")
-    plt.tight_layout(); plt.savefig(fn); plt.close()
-    print(f"[INFO] saved IQON3000 curves → {fn}")
+    fn = os.path.join(output_dir, f"{dataset_type.lower()}_loss_rank_bs{batch_size}.png")
+    plt.tight_layout()
+    plt.savefig(fn, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"[INFO] Training curves saved → {fn}")
 
+    # Save data as CSV
     df = pd.DataFrame(dict(epoch=epochs,
-                           train_loss=train_loss,   val_loss=val_loss,
-                           train_avg_rank=train_avg_rank,   val_avg_rank=val_avg_rank,
-                           dataset="IQON3000"))
-    append_dataframe_to_csv(df, output_dir, "iqon3000_training_metrics.csv")
+                          train_loss=train_loss, val_loss=val_loss,
+                          train_avg_rank=train_avg_rank, val_avg_rank=val_avg_rank,
+                          dataset=dataset_type))
+    append_dataframe_to_csv(df, output_dir, f"{dataset_type.lower()}_training_metrics.csv")
 
 # ------------------------------------------------------------------
-# 2.  PCA Visualization (individual/whole batch/comprehensive version)
+# 2. PCA Visualization (enhanced for both datasets)
 # ------------------------------------------------------------------
 def _scatter(ax, xy, color, marker, label=None, s=80, alpha=1.0):
+    """Helper function for consistent scatter plotting"""
     ax.scatter(xy[0], xy[1], color=color, marker=marker, s=s, alpha=alpha, label=label)
 
 def visualize_predictions_with_pca(pred, gt, cats, centers,
                                    loss_val: float, out_dir: str,
-                                   step: int = 0):
+                                   step: int = 0, dataset_type: str = "DeepFurniture"):
     """
+    Enhanced PCA visualization for both datasets
     Each batch of samples is displayed individually in 2D-PCA.
-    Updated for IQON3000 dataset with 11 categories.
     """
     os.makedirs(out_dir, exist_ok=True)
     p = pred.numpy(); g = gt.numpy(); c = cats.numpy()
-    B = p.shape[0]; colors = plt.cm.tab10.colors
-    fig, axes = plt.subplots(1, B, figsize=(6*B,5))
+    B = p.shape[0]; 
+    
+    # Get dataset configuration
+    config = DATASET_CONFIGS[dataset_type]
+    num_categories = config['num_categories']
+    min_cat, max_cat = config['category_range']
+    colors = plt.cm.tab10.colors
+
+    fig, axes = plt.subplots(1, B, figsize=(6*B, 5))
     axes = np.atleast_1d(axes)
 
     for b, ax in enumerate(axes):
         valid = c[b] > 0
         
         # Handle different prediction shapes
-        if len(p.shape) == 3 and p.shape[1] == 11:
-            # p is (B, 11, D) - category predictions
-            q = p[b, c[b,valid]-1]  # Select predictions for valid categories (1-based to 0-based)
+        if len(p.shape) == 3 and p.shape[1] == num_categories:
+            # p is (B, num_categories, D) - category predictions
+            q = p[b, c[b, valid] - min_cat]  # Convert to 0-based index
         else:
             # p is (B, N, D) - direct predictions
             q = p[b, valid]
             
         y = g[b]
         data = np.vstack([q, y, centers.numpy()])
+        
+        # Apply PCA
         emb = PCA(2).fit_transform(data)
         n_q = q.shape[0]; n_y = y.shape[0]
         
-        for i, cid in enumerate(c[b,valid]):
-            if 1 <= cid <= 11:  # Valid IQON3000 categories
-                col = colors[(int(cid)-1) % len(colors)]
+        # Plot predicted items
+        for i, cid in enumerate(c[b, valid]):
+            if min_cat <= cid <= max_cat:
+                col = colors[(int(cid) - min_cat) % len(colors)]
                 _scatter(ax, emb[i], col, "x",
-                         f"Pred {cid}" if i==0 else None)
+                         f"Pred {cid}" if i == 0 else None, s=100)
         
+        # Plot ground truth items
         for j in range(n_y):
-            cid = c[b,j]
-            if 1 <= cid <= 11:
-                col = colors[(int(cid)-1) % len(colors)]
+            cid = c[b, j]
+            if min_cat <= cid <= max_cat:
+                col = colors[(int(cid) - min_cat) % len(colors)]
             else:
                 col = "gray"
-            _scatter(ax, emb[n_q+j], col, "o", None, alpha=.6)
+            _scatter(ax, emb[n_q + j], col, "o", None, alpha=0.7, s=80)
+        
+        # Plot category centers
+        for k in range(num_categories):
+            center_idx = n_q + n_y + k
+            if center_idx < len(emb):
+                col = colors[k % len(colors)]
+                _scatter(ax, emb[center_idx], col, "s", None, s=120, alpha=0.8)
             
-        ax.set_title(f"IQON3000 sample {b}")
+        ax.set_title(f"{dataset_type} sample {b}")
+        ax.grid(True, alpha=0.3)
     
-    fig.suptitle(f"IQON3000 PCA - step {step}  loss {loss_val:.4f}")
-    fn = os.path.join(out_dir, f"iqon3000_pca_step{step}.png")
-    plt.savefig(fn); plt.close(); print(f"[INFO] IQON3000 PCA → {fn}")
+    fig.suptitle(f"{dataset_type} PCA Embedding - step {step}, loss {loss_val:.4f}")
+    fn = os.path.join(out_dir, f"{dataset_type.lower()}_pca_step{step}.png")
+    plt.tight_layout()
+    plt.savefig(fn, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"[INFO] {dataset_type} PCA visualization saved → {fn}")
 
 # ------------------------------------------------------------------
-# 3.  Retrieval Collage
+# 3. Enhanced Retrieval Collage (DeepFurniture-style)
 # ------------------------------------------------------------------
 def create_retrieval_collage(scene_img: Image.Image,
                              query_imgs: List[Image.Image],
                              target_imgs: List[Image.Image],
-                             topk: List[List[Tuple[Image.Image,float]]],
+                             topk: List[List[Tuple[Image.Image, float]]],
                              save_path: str,
-                             thumb=(150,150)):
+                             thumb=(150, 150),
+                             dataset_type: str = "DeepFurniture"):
     """
-    Left: Entire scene Top: Query Middle: Target Bottom: Top-K×3
-    Updated for IQON3000 dataset structure
+    Enhanced retrieval collage with dataset-specific styling
+    Layout: Scene | Query row | Target row | Top-1/2/3 rows
     """
-    cw,ch = thumb; rows = 5; cols = 5+max(len(query_imgs), len(target_imgs))
-    canvas = Image.new("RGB", (cols*cw, rows*ch), "white")
-    draw   = ImageDraw.Draw(canvas)
-    font   = ImageFont.load_default()
+    cw, ch = thumb
+    max_items = max(len(query_imgs), len(target_imgs)) if query_imgs or target_imgs else 3
+    rows = 5  # Scene, Query, Target, Top-1, Top-2, Top-3
+    cols = 1 + max_items  # Scene column + item columns
+    
+    # Dataset-specific background colors
+    bg_colors = {
+        "DeepFurniture": "white",
+        "IQON3000": "#f8f9fa"
+    }
+    bg_color = bg_colors.get(dataset_type, "white")
+    
+    canvas = Image.new("RGB", (cols * cw, rows * ch), bg_color)
+    draw = ImageDraw.Draw(canvas)
+    
+    try:
+        font = ImageFont.truetype("arial.ttf", 12)
+    except:
+        font = ImageFont.load_default()
 
-    # scene
+    # Add title at top
+    title_height = 25
+    full_canvas = Image.new("RGB", (cols * cw, rows * ch + title_height), bg_color)
+    title_draw = ImageDraw.Draw(full_canvas)
+    title_draw.text((10, 5), f"{dataset_type} Retrieval Results", fill="black", font=font)
+    
+    # Paste main canvas below title
+    full_canvas.paste(canvas, (0, title_height))
+    canvas = full_canvas
+    draw = ImageDraw.Draw(canvas)
+    
+    # Adjust y coordinates for title offset
+    y_offset = title_height
+
+    # Scene column (spans all rows)
     if scene_img:
-        sc = scene_img.copy(); sc.thumbnail((5*cw,5*ch))
-        canvas.paste(sc, (0,0)); draw.text((5,5),"IQON3000 Scene", fill="black", font=font)
+        sc = scene_img.copy()
+        sc.thumbnail((cw, rows * ch))
+        canvas.paste(sc, (0, y_offset))
+        draw.text((5, y_offset + 5), "Scene", fill="black", font=font)
+    else:
+        # Create dataset-specific scene placeholder
+        scene_colors = {"DeepFurniture": "lightblue", "IQON3000": "lightgreen"}
+        scene_color = scene_colors.get(dataset_type, "lightblue")
+        scene_placeholder = Image.new("RGB", (cw, rows * ch), scene_color)
+        scene_draw = ImageDraw.Draw(scene_placeholder)
+        scene_draw.text((10, ch), f"{dataset_type}\nScene", fill="black", font=font)
+        canvas.paste(scene_placeholder, (0, y_offset))
 
-    # query row
+    # Query row
+    y_query = y_offset
     for i, img in enumerate(query_imgs):
-        x,y = (5+i)*cw, 0
-        tmp = img.copy() if img else Image.new("RGB",thumb,"white")
-        tmp.thumbnail(thumb); canvas.paste(tmp,(x,y))
-        draw.text((x+5, y+ch-18), f"Q{i+1}", fill="black", font=font)
+        x = (i + 1) * cw
+        if img:
+            tmp = img.copy()
+            tmp.thumbnail(thumb)
+            canvas.paste(tmp, (x, y_query))
+        # Add query label with background
+        draw.rectangle((x, y_query + ch - 20, x + 40, y_query + ch), fill="green")
+        draw.text((x + 5, y_query + ch - 18), f"Q{i+1}", fill="white", font=font)
 
-    # target + top‑k
-    for t, timg in enumerate(target_imgs):
-        x0 = (5+t)*cw
-        # target
-        y = ch
-        tmp = timg.copy() if timg else Image.new("RGB",thumb,"white")
-        tmp.thumbnail(thumb); canvas.paste(tmp,(x0,y))
-        draw.text((x0+5, y+ch-18), f"T{t+1}", fill="black", font=font)
-        # top‑k rows
-        for k in range(3):
-            yk = (2+k)*ch
+    # Target row
+    y_target = y_offset + ch
+    for i, img in enumerate(target_imgs):
+        x = (i + 1) * cw
+        if img:
+            tmp = img.copy()
+            tmp.thumbnail(thumb)
+            canvas.paste(tmp, (x, y_target))
+        # Add target label with background
+        draw.rectangle((x, y_target + ch - 20, x + 40, y_target + ch), fill="red")
+        draw.text((x + 5, y_target + ch - 18), f"T{i+1}", fill="white", font=font)
+
+    # Top-K rows
+    for k in range(3):  # Top-1, Top-2, Top-3
+        y_topk = y_offset + (k + 2) * ch
+        for t in range(max_items):
+            x = (t + 1) * cw
             if t < len(topk) and k < len(topk[t]):
                 img, dist = topk[t][k]
-                thumb_img = img.copy(); thumb_img.thumbnail(thumb)
-                canvas.paste(thumb_img,(x0,yk))
-                draw.rectangle((x0,yk+ch-18,x0+cw,yk+ch), fill="black")
-                draw.text((x0+5, yk+ch-18), f"Top{k+1} ({dist:.1f})",
-                          fill="white", font=font)
+                if img:
+                    thumb_img = img.copy()
+                    thumb_img.thumbnail(thumb)
+                    canvas.paste(thumb_img, (x, y_topk))
+                    # Add distance label with gradient background
+                    draw.rectangle((x, y_topk + ch - 20, x + cw, y_topk + ch), fill="black")
+                    draw.text((x + 5, y_topk + ch - 18), f"Top{k+1} ({dist:.2f})",
+                              fill="white", font=font)
             else:
-                canvas.paste(Image.new("RGB",thumb,"white"), (x0,yk))
-    canvas.save(save_path); print(f"[INFO] IQON3000 collage → {save_path}")
+                # Empty placeholder with border
+                placeholder = Image.new("RGB", thumb, "white")
+                placeholder_draw = ImageDraw.Draw(placeholder)
+                placeholder_draw.rectangle((0, 0, thumb[0]-1, thumb[1]-1), outline="lightgray")
+                canvas.paste(placeholder, (x, y_topk))
+
+    canvas.save(save_path)
+    print(f"[INFO] Enhanced {dataset_type} collage saved → {save_path}")
 
 # ------------------------------------------------------------------
-# 4.  Visualize 1 batch of test set with PCA + Collage
+# 4. Advanced test set visualization with collages
 # ------------------------------------------------------------------
 def visualize_test_sets_and_collages(model, test_generator, item_vecs: dict,
-                                     scene_root="data/IQON3000",
-                                     furn_root ="data/IQON3000",
-                                     out_dir   ="visuals",
-                                     pca_background="iqon3000_pca_background",
-                                     top_k=3):
+                                     scene_root: str = "data",
+                                     furn_root: str = "data",
+                                     out_dir: str = "visuals",
+                                     pca_background: str = "pca_background.pkl",
+                                     top_k: int = 3,
+                                     dataset_type: str = "DeepFurniture"):
     """
-    Updated for IQON3000 dataset with 11 categories
+    Enhanced test set visualization with dataset-aware paths and styling
     """
     os.makedirs(out_dir, exist_ok=True)
 
-    # background PCA
+    # Load or create background PCA
     from util import load_background_pca, compute_and_save_background_pca
     try:
         pca_all, embX, embY, embC, catX, catY = load_background_pca(pca_background)
     except (FileNotFoundError, KeyError) as e:
-        print(f"[WARN] IQON3000 PCAバックグラウンドが見つからないか不正です: {e}。新規作成します...")
+        print(f"[WARN] {dataset_type} PCA background not found: {e}. Creating new one...")
         compute_and_save_background_pca(model, test_generator, path=pca_background)
         pca_all, embX, embY, embC, catX, catY = load_background_pca(pca_background)
-        print(f"[INFO] 新しいIQON3000 PCAバックグラウンドを作成し読み込みました。")
+        print(f"[INFO] New {dataset_type} PCA background created and loaded.")
 
-    # 1 batch only processing
-    ((Xc, _, _, catQ, catP, qIDs, tIDs, _), setIDs) = test_generator[0]
-    B = Xc.shape[0]//2
-    cmap = plt.cm.get_cmap("tab10", 11)  # 11 categories for IQON3000
+    # Process 1 batch only for demonstration
+    try:
+        batch_data = next(iter(test_generator))
+        ((Xc, _, _, catQ, catP, qIDs, tIDs, _), setIDs) = batch_data
+    except:
+        print(f"[ERROR] Failed to get batch from {dataset_type} generator")
+        return
+    
+    B = Xc.shape[0] // 2
+    config = DATASET_CONFIGS[dataset_type]
+    cmap = plt.cm.get_cmap("tab10", config['num_categories'])
 
-    scene_ids = [f"iqon3000_b0_s{s}_{setIDs[s]}" for s in range(B)]
+    # Create scene IDs
+    scene_ids = [f"{dataset_type.lower()}_b0_s{s}_{setIDs[s]}" for s in range(B)]
 
-    for s in range(B):
-        Xin, Yin = Xc[s].numpy(), Xc[s+B].numpy()
-        cat_in, cat_tg = catQ[s].numpy(), catP[s].numpy()
-        pred11 = model.infer_single_set(Xin)  # (11, dim)
+    for s in range(min(B, 3)):  # Limit to 3 samples
+        try:
+            Xin, Yin = Xc[s].numpy(), Xc[s+B].numpy()
+            cat_in, cat_tg = catQ[s].numpy(), catP[s].numpy()
+            pred_vecs = model.infer_single_set(Xin)  # (num_categories, dim)
 
-        # ---------- PCA plot ----------
-        comb = np.vstack([Xin, pred11, Yin])
-        emb  = pca_all.transform(comb)
-        nx = Xin.shape[0]
-        fig = plt.figure(figsize=(8,6))
+            # ---------- Enhanced PCA plot ----------
+            comb = np.vstack([Xin, pred_vecs, Yin])
+            emb = pca_all.transform(comb) if pca_all else comb[:, :2]
+            nx = Xin.shape[0]
+            
+            fig = plt.figure(figsize=(10, 8))
+            
+            # Background points with dataset-specific styling
+            if len(embX) > 0 and len(embY) > 0:
+                plt.scatter(embX[:, 0], embX[:, 1], c="lightgray", s=3, alpha=0.01, label="Background")
+                plt.scatter(embY[:, 0], embY[:, 1], c="lightgray", s=3, alpha=0.01)
+            
+            # Category centers
+            for i, v in enumerate(embC[:config['num_categories']]): 
+                plt.scatter(v[0], v[1], marker="s", c=[cmap(i)], s=150, 
+                           label=f"Center {i+1}" if i < 5 else "", edgecolors='black', linewidth=1)
+            
+            # Input items (circles)
+            min_cat, max_cat = config['category_range']
+            for v, cid in zip(emb[:nx], cat_in):
+                if min_cat <= cid <= max_cat: 
+                    plt.scatter(*v, marker="o", c=[cmap(cid-min_cat)], s=150, 
+                               edgecolors='black', linewidth=2)
+            
+            # Predicted category embeddings (crosses)
+            for i, v in enumerate(emb[nx:nx+config['num_categories']]):
+                plt.scatter(*v, marker="x", c=[cmap(i)], s=200, linewidths=4)
+            
+            # Target items (triangles)
+            for v, cid in zip(emb[nx+config['num_categories']:], cat_tg):
+                if min_cat <= cid <= max_cat: 
+                    plt.scatter(*v, marker="^", c=[cmap(cid-min_cat)], s=150,
+                               edgecolors='black', linewidth=2)
+
+            sid = scene_ids[s]
+            plt.title(f"{dataset_type} PCA Embedding Space – {sid}", fontsize=14, fontweight='bold')
+            plt.grid(True, alpha=0.3)
+            plt.xlabel("PC1", fontsize=12)
+            plt.ylabel("PC2", fontsize=12)
+            
+            # Enhanced legend
+            legend_elements = [
+                plt.scatter([], [], marker="o", c="black", s=150, label="● Input items"),
+                plt.scatter([], [], marker="^", c="black", s=150, label="▲ Target items"),
+                plt.scatter([], [], marker="x", c="black", s=200, label="✕ Predictions"),
+                plt.scatter([], [], marker="s", c="black", s=150, label="■ Centers")
+            ]
+            plt.legend(handles=legend_elements, loc='upper right', fontsize=10)
+            
+            fn = os.path.join(out_dir, f"{sid}_pca.png")
+            plt.tight_layout()
+            plt.savefig(fn, dpi=300, bbox_inches='tight')
+            plt.close()
+            print(f"[INFO] {dataset_type} PCA plot saved: {fn}")
+
+            # ---------- Enhanced collage ----------
+            # Load images (with fallbacks for missing files)
+            scene = load_scene_image(str(setIDs[s]), scene_root, dataset_type)
+            q_imgs = [safe_load_furniture_image(str(int(i)), furn_root, dataset_type) 
+                     for i in qIDs[s].numpy()]
+            t_imgs = [safe_load_furniture_image(str(int(i)), furn_root, dataset_type) 
+                     for i in tIDs[s].numpy()]
+
+            # Get top-k retrievals for each target category
+            topks = []
+            for cid in cat_tg:
+                if not min_cat <= cid <= max_cat:
+                    topks.append([])
+                    continue
+                    
+                vec = pred_vecs[cid - min_cat]  # Convert to 0-based
+                excl = {*(str(int(i)) for i in qIDs[s].numpy()), 
+                       *(str(int(i)) for i in tIDs[s].numpy())}
+                rs = find_topk_similar_items_by_euclidean(vec, item_vecs, k=top_k, exclude=excl)
+                topks.append([(safe_load_furniture_image(iid, furn_root, dataset_type), dist) 
+                             for iid, dist in rs])
+
+            collage_fn = os.path.join(out_dir, f"{sid}_collage.jpg")
+            create_retrieval_collage(scene, q_imgs, t_imgs, topks, collage_fn, 
+                                   thumb=(150, 150), dataset_type=dataset_type)
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to process sample {s}: {e}")
+            continue
+
+# ------------------------------------------------------------------
+# 5. Category performance analysis (dataset-aware)
+# ------------------------------------------------------------------
+def plot_category_performance(results_csv: str, output_dir: str, dataset_type: str = None):
+    """
+    Enhanced category performance plotting with dataset detection
+    """
+    if not os.path.exists(results_csv):
+        print(f"[WARN] Results CSV not found: {results_csv}")
+        return
+    
+    df = pd.read_csv(results_csv)
+    
+    # Auto-detect dataset type if not provided
+    if dataset_type is None:
+        if 'IQON3000' in results_csv or 'iqon' in results_csv.lower():
+            dataset_type = "IQON3000"
+        else:
+            dataset_type = "DeepFurniture"
+    
+    config = DATASET_CONFIGS[dataset_type]
+    category_names = config['category_names']
+    min_cat, max_cat = config['category_range']
+    
+    # Filter for valid categories
+    cat_df = df[df['category_id'].between(min_cat, max_cat)].copy() if 'category_id' in df.columns else df
+    
+    if len(cat_df) == 0:
+        print(f"[WARN] No category data found in results CSV for {dataset_type}")
+        return
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Dataset-specific color scheme
+    color_schemes = {
+        "DeepFurniture": plt.cm.Blues,
+        "IQON3000": plt.cm.Greens
+    }
+    cmap = color_schemes.get(dataset_type, plt.cm.Blues)
+    
+    # 1. Category distribution
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+    
+    # Prepare data
+    if 'count' in cat_df.columns:
+        counts = cat_df['count'].values
+        categories = cat_df['category_id'].values if 'category_id' in cat_df.columns else range(len(cat_df))
+    else:
+        counts = [1] * len(cat_df)
+        categories = range(len(cat_df))
+    
+    colors = [cmap(0.3 + 0.5 * i / len(counts)) for i in range(len(counts))]
+    
+    # Bar plot
+    bars1 = ax1.bar(range(len(categories)), counts, color=colors, alpha=0.8, edgecolor='black')
+    ax1.set_title(f'{dataset_type}: Category Distribution', fontsize=14, fontweight='bold')
+    ax1.set_xlabel('Category', fontsize=12)
+    ax1.set_ylabel('Item Count', fontsize=12)
+    
+    # Category labels
+    labels = []
+    for cat_id in categories:
+        cat_name = category_names.get(cat_id, f'Cat{cat_id}')
+        if len(cat_name) > 12:
+            cat_name = cat_name[:12] + "..."
+        labels.append(f"Cat{cat_id}\n{cat_name}")
+    
+    ax1.set_xticks(range(len(categories)))
+    ax1.set_xticklabels(labels, rotation=45, ha='right')
+    ax1.grid(True, alpha=0.3)
+    
+    # Add count labels on bars
+    for i, (bar, count) in enumerate(zip(bars1, counts)):
+        height = bar.get_height()
+        ax1.text(bar.get_x() + bar.get_width()/2., height + max(counts)*0.01,
+                f'{int(count)}', ha='center', va='bottom', fontweight='bold')
+    
+    # 2. Performance metrics (if available)
+    if 'mean_score' in cat_df.columns or any('accuracy' in col for col in cat_df.columns):
+        # Find performance columns
+        perf_cols = [col for col in cat_df.columns if 'score' in col or 'accuracy' in col or 'mrr' in col]
         
-        # background
-        plt.scatter(embX[:,0], embX[:,1], c="lightgray", s=5, alpha=.02)
-        plt.scatter(embY[:,0], embY[:,1], c="lightgray", s=5, alpha=.02)
-        
-        # cluster centers (11 categories)
-        for i,v in enumerate(embC): 
-            plt.scatter(v[0],v[1],marker="s", c=[cmap(i)], s=120, 
-                       label=f"Center {i+1}" if i < 5 else "")
-        
-        # current sample - input items
-        for v, cid in zip(emb[:nx], cat_in):
-            if 1 <= cid <= 11: 
-                plt.scatter(*v, marker="o", c=[cmap(cid-1)], s=120)
-        
-        # predicted category embeddings
-        for i,v in enumerate(emb[nx:nx+11]):
-            plt.scatter(*v, marker="x", c=[cmap(i)], s=120)
-        
-        # target items
-        for v, cid in zip(emb[nx+11:], cat_tg):
-            if 1 <= cid <= 11: 
-                plt.scatter(*v, marker="^", c=[cmap(cid-1)], s=120)
+        if perf_cols:
+            perf_data = cat_df[perf_cols[0]].values  # Use first performance column
+            bars2 = ax2.bar(range(len(categories)), perf_data, color=colors, alpha=0.8, edgecolor='black')
+            ax2.set_title(f'{dataset_type}: Performance by Category', fontsize=14, fontweight='bold')
+            ax2.set_xlabel('Category', fontsize=12)
+            ax2.set_ylabel(perf_cols[0].replace('_', ' ').title(), fontsize=12)
+            ax2.set_xticks(range(len(categories)))
+            ax2.set_xticklabels(labels, rotation=45, ha='right')
+            ax2.grid(True, alpha=0.3)
+            
+            # Add performance labels
+            for i, (bar, perf) in enumerate(zip(bars2, perf_data)):
+                height = bar.get_height()
+                ax2.text(bar.get_x() + bar.get_width()/2., height + max(perf_data)*0.01,
+                        f'{perf:.3f}', ha='center', va='bottom', fontweight='bold')
+        else:
+            ax2.text(0.5, 0.5, 'No performance metrics found', 
+                    transform=ax2.transAxes, ha='center', va='center', fontsize=14)
+            ax2.set_title(f'{dataset_type}: Performance Data', fontsize=14)
+    else:
+        ax2.text(0.5, 0.5, 'No performance metrics available', 
+                transform=ax2.transAxes, ha='center', va='center', fontsize=14)
+        ax2.set_title(f'{dataset_type}: Performance Data', fontsize=14)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f'{dataset_type.lower()}_category_performance.png'), 
+                dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"[INFO] {dataset_type} category performance plots saved to {output_dir}")
 
-        sid = scene_ids[s]
-        plt.title(f"IQON3000 PCA – {sid}"); plt.grid(True)
+# ------------------------------------------------------------------
+# 6. Comprehensive visualization pipeline
+# ------------------------------------------------------------------
+def create_comprehensive_visualization(model, test_generator, item_vecs, 
+                                     results_data, output_dir="visuals",
+                                     dataset_type: str = "DeepFurniture"):
+    """
+    Create comprehensive visualization suite with enhanced DeepFurniture-style output
+    """
+    print(f"[INFO] 🎨 Creating comprehensive {dataset_type} visualization suite")
+    
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(os.path.join(output_dir, "visualizations"), exist_ok=True)
+    
+    try:
+        # 1. Test set visualizations with enhanced collages
+        print(f"[INFO] Creating {dataset_type} test set visualizations...")
+        visualize_test_sets_and_collages(
+            model, test_generator, item_vecs,
+            scene_root=f"data/{dataset_type}",
+            furn_root=f"data/{dataset_type}", 
+            out_dir=os.path.join(output_dir, "visualizations"),
+            pca_background=os.path.join(output_dir, f"{dataset_type.lower()}_pca_background.pkl"),
+            top_k=3,
+            dataset_type=dataset_type
+        )
         
-        # Add legend for first few categories
-        if s == 0:
-            category_names = ["インナー", "ボトムス", "シューズ", "バッグ", "アクセサリー"]
-            legend_elements = [plt.scatter([], [], c=[cmap(i)], s=120, label=name) 
-                             for i, name in enumerate(category_names)]
-            plt.legend(loc='upper right', fontsize=8)
+        # 2. Category performance analysis
+        print(f"[INFO] Creating {dataset_type} category analysis...")
+        if 'category_distribution' in results_data:
+            # Create temporary CSV for plotting
+            temp_csv_data = []
+            for cat_id, count in results_data['category_distribution'].items():
+                temp_csv_data.append({
+                    'category_id': cat_id,
+                    'count': count,
+                    'mean_score': results_data.get('retrieval_metrics', {}).get('category_performance', {}).get(cat_id, {}).get('mean_score', 0.5)
+                })
+            
+            if temp_csv_data:
+                temp_df = pd.DataFrame(temp_csv_data)
+                temp_csv_path = os.path.join(output_dir, f"temp_{dataset_type.lower()}_category_data.csv")
+                temp_df.to_csv(temp_csv_path, index=False)
+                plot_category_performance(temp_csv_path, os.path.join(output_dir, "visualizations"), dataset_type)
+                
+                # Clean up temp file
+                try:
+                    os.remove(temp_csv_path)
+                except:
+                    pass
         
-        fn = os.path.join(out_dir,f"{sid}_pca.png")
-        plt.tight_layout(); plt.savefig(fn); plt.close()
+        # 3. Create summary report
+        create_visualization_summary_report(results_data, output_dir, dataset_type)
+        
+        print(f"[INFO] ✅ Comprehensive {dataset_type} visualization completed. Results in {output_dir}/visualizations/")
+        
+    except Exception as e:
+        print(f"[ERROR] ❌ Comprehensive visualization failed for {dataset_type}: {e}")
+        import traceback
+        traceback.print_exc()
 
-        # ---------- collage ----------
-        scene   = load_scene_image(setIDs[s], scene_root)
-        q_imgs  = [safe_load_furniture_image(str(int(i)), furn_root) for i in qIDs[s].numpy()]
-        t_imgs  = [safe_load_furniture_image(str(int(i)), furn_root) for i in tIDs[s].numpy()]
+def create_visualization_summary_report(results_data, output_dir, dataset_type):
+    """Create a summary report for visualizations"""
+    try:
+        report_path = os.path.join(output_dir, f"{dataset_type.lower()}_visualization_summary.txt")
+        
+        with open(report_path, 'w', encoding='utf-8') as f:
+            f.write("=" * 80 + "\n")
+            f.write(f"{dataset_type} VISUALIZATION SUMMARY REPORT\n")
+            f.write("=" * 80 + "\n\n")
+            
+            f.write(f"Generated visualizations for: {dataset_type}\n")
+            f.write(f"Timestamp: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            
+            # List generated files
+            viz_dir = os.path.join(output_dir, "visualizations")
+            if os.path.exists(viz_dir):
+                f.write("Generated Files:\n")
+                f.write("-" * 40 + "\n")
+                
+                for file in sorted(os.listdir(viz_dir)):
+                    if file.endswith(('.png', '.jpg', '.jpeg')):
+                        f.write(f"  📊 {file}\n")
+                        
+                        # Add description based on filename
+                        if 'pca' in file:
+                            f.write(f"      → PCA embedding space visualization\n")
+                        elif 'collage' in file:
+                            f.write(f"      → Retrieval results collage\n")
+                        elif 'category' in file:
+                            f.write(f"      → Category performance analysis\n")
+                        elif 'training' in file:
+                            f.write(f"      → Training metrics visualization\n")
+                        f.write("\n")
+            
+            # Add dataset statistics
+            if 'category_distribution' in results_data:
+                f.write("Dataset Statistics:\n")
+                f.write("-" * 20 + "\n")
+                total_items = sum(results_data['category_distribution'].values())
+                f.write(f"Total Items: {total_items:,}\n")
+                f.write(f"Categories: {len(results_data['category_distribution'])}\n")
+                f.write(f"Success Rate: {results_data.get('success_rate', 0):.2%}\n\n")
+            
+            f.write("=" * 80 + "\n")
+            f.write(f"Visualization report for {dataset_type} dataset\n")
+            f.write("=" * 80 + "\n")
+        
+        print(f"[INFO] Visualization summary saved to {report_path}")
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to create visualization summary: {e}")
 
-        topks = []
-        for cid in cat_tg:
-            if not 1 <= cid <= 11:
-                topks.append([]); continue
-            vec = pred11[cid-1]  # 1-based to 0-based
-            excl = {*(qIDs[s].numpy()), *(tIDs[s].numpy())}
-            rs = find_topk_similar_items_by_euclidean(vec, item_vecs, k=top_k, 
-                                                    exclude={str(int(i)) for i in excl})
-            topks.append([(safe_load_furniture_image(iid, furn_root), dist) for iid,dist in rs])
-
-        collage_fn = os.path.join(out_dir,f"{sid}_collage.jpg")
-        create_retrieval_collage(scene, q_imgs, t_imgs, topks, collage_fn, thumb=(150,150))
-
+# ------------------------------------------------------------------
+# 7. Ranking visualization (enhanced)
+# ------------------------------------------------------------------
 def visualize_rank_until_correct(
     query_vec: np.ndarray,
-    correct_ids: set[str],
-    item_dict: dict[str, np.ndarray],
+    correct_ids: set,
+    item_dict: dict,
     furn_root: str,
-    thumb_size: tuple[int,int],
+    thumb_size: tuple,
     out_path: str,
     min_items: int,
-    n_cols: int
+    n_cols: int,
+    dataset_type: str = "DeepFurniture"
 ):
     """
-    Visualize ranking until correct item is found
-    Updated for IQON3000 dataset structure
+    Enhanced ranking visualization with dataset-specific styling
     """
     import math
     from PIL import Image, ImageDraw, ImageFont
 
-    # 1) クエリベクトルはすでにホワイトニング・正規化済み
+    # 1) Compute similarities
     q = query_vec
-
-    # 2) 全アイテムとのコサイン類似度リスト
     sims = []
     for iid, v in item_dict.items():
-        # v もホワイトニング・正規化済み
-        sim = float(np.dot(q, v))  # -1〜1
+        sim = float(np.dot(q, v))  # Assuming normalized vectors
         sims.append((iid, sim))
     sims.sort(key=lambda x: x[1], reverse=True)
 
-    # 3) 正解位置取得
+    # 2) Find correct position
     try:
         idx_correct = next(i for i, (iid, _) in enumerate(sims) if iid in correct_ids)
     except StopIteration:
         idx_correct = len(sims) - 1
 
-    # 4) 描画する枚数
+    # 3) Determine items to show
     n = max(idx_correct + 1, min_items)
     n = min(n, len(sims))
 
-    # 5) グリッド描画
+    # 4) Create enhanced grid
     rows = math.ceil(n / n_cols)
     cw, ch = thumb_size
-    # 上部にテキスト用余白 20px
-    canvas = Image.new("RGB", (n_cols * cw, rows * ch + 20), "white")
-    draw = ImageDraw.Draw(canvas)
-    font = ImageFont.load_default()
+    title_height = 30
     
-    # Title
-    draw.text((10, 2), f"IQON3000 Ranking (Correct at rank {idx_correct + 1})", 
-              fill="black", font=font)
+    # Dataset-specific styling
+    bg_colors = {"DeepFurniture": "white", "IQON3000": "#f8f9fa"}
+    accent_colors = {"DeepFurniture": "#2E86C1", "IQON3000": "#28B463"}
+    
+    bg_color = bg_colors.get(dataset_type, "white")
+    accent_color = accent_colors.get(dataset_type, "#2E86C1")
+    
+    canvas = Image.new("RGB", (n_cols * cw, rows * ch + title_height), bg_color)
+    draw = ImageDraw.Draw(canvas)
+    
+    try:
+        font = ImageFont.truetype("arial.ttf", 14)
+        small_font = ImageFont.truetype("arial.ttf", 10)
+    except:
+        font = ImageFont.load_default()
+        small_font = font
+    
+    # Enhanced title
+    draw.text((10, 5), f"{dataset_type} Ranking Visualization", fill=accent_color, font=font)
+    draw.text((10, 20), f"Correct item found at rank {idx_correct + 1}", fill="black", font=small_font)
 
     for i, (iid, sim) in enumerate(sims[:n]):
-        img = safe_load_furniture_image(iid, furn_root, thumb_size)
+        img = safe_load_furniture_image(iid, furn_root, dataset_type, thumb_size)
         img.thumbnail(thumb_size)
+        
         row, col = divmod(i, n_cols)
         x0 = col * cw
-        y0 = row * ch + 20
+        y0 = row * ch + title_height
         canvas.paste(img, (x0, y0))
 
-        # 枠：正解なら赤，それ以外は黒
-        color = "red" if iid in correct_ids else "black"
-        draw.rectangle([x0, y0, x0 + cw - 1, y0 + ch - 1], outline=color, width=4)
+        # Enhanced border for correct items
+        if iid in correct_ids:
+            # Thick green border for correct
+            draw.rectangle([x0-2, y0-2, x0 + cw + 1, y0 + ch + 1], outline="green", width=4)
+            draw.rectangle([x0, y0, x0 + cw - 1, y0 + ch - 1], outline="darkgreen", width=2)
+        else:
+            # Thin gray border for others
+            draw.rectangle([x0, y0, x0 + cw - 1, y0 + ch - 1], outline="lightgray", width=1)
 
-        # 下中央にコサイン類似度を表示
-        text = f"{sim:.2f}"
-        bbox = font.getbbox(text)
+        # Enhanced similarity display
+        text = f"{sim:.3f}"
+        text_color = "darkgreen" if iid in correct_ids else "darkblue"
+        
+        # Text background for better readability
+        bbox = small_font.getbbox(text)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
         tx = x0 + (cw - tw) // 2
-        ty = row * ch + 20 - th - 2
-        draw.text((tx, ty), text, fill="red" if iid in correct_ids else "black", font=font)
+        ty = y0 + ch - th - 5
+        
+        draw.rectangle([tx-2, ty-1, tx+tw+2, ty+th+1], fill="white", outline=text_color)
+        draw.text((tx, ty), text, fill=text_color, font=small_font)
+        
+        # Rank number in top-left
+        rank_text = f"#{i+1}"
+        draw.rectangle([x0, y0, x0+25, y0+15], fill=accent_color)
+        draw.text((x0+2, y0+1), rank_text, fill="white", font=small_font)
 
     canvas.save(out_path)
-    print(f"[INFO] Saved IQON3000 ranking visualization → {out_path}")
+    print(f"[INFO] Enhanced {dataset_type} ranking visualization saved → {out_path}")
 
 # ------------------------------------------------------------------
-# 5. Category-specific visualization for IQON3000
+# 8. Integration function for run.py
 # ------------------------------------------------------------------
-def plot_category_performance(results_csv: str, output_dir: str):
+def integrate_with_evaluation_pipeline(model, test_generator, results_data, output_dir, dataset_type):
     """
-    Plot category-specific performance metrics for IQON3000 dataset
+    🎯 Main integration function called by util.py's main_evaluation_pipeline
+    This ensures all DeepFurniture-style visualizations are created automatically
     """
-    if not os.path.exists(results_csv):
-        print(f"[WARN] Results CSV not found: {results_csv}")
-        return
+    print(f"[INFO] 🎨 Integrating plot.py visualizations for {dataset_type}")
     
-    df = pd.read_csv(results_csv)
-    
-    # Category names for IQON3000
-    category_names = {
-        1: "インナー系",
-        2: "ボトムス系", 
-        3: "シューズ系",
-        4: "バッグ系",
-        5: "アクセサリー系",
-        6: "帽子",
-        7: "Tシャツ・カットソー系",
-        8: "シャツ・ブラウス系", 
-        9: "ニット・セーター系",
-        10: "アウター系",
-        11: "その他"
-    }
-    
-    # Filter for category data
-    cat_df = df[df['category'].between(1, 11)].copy()
-    cat_df['category_name'] = cat_df['category'].map(category_names)
-    
-    if len(cat_df) == 0:
-        print("[WARN] No category data found in results CSV")
-        return
-    
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # 1. Mean rank by category
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
-    
-    # Sort by mean rank for better visualization
-    cat_df_sorted = cat_df.sort_values('mean_rank')
-    
-    bars1 = ax1.bar(range(len(cat_df_sorted)), cat_df_sorted['mean_rank'])
-    ax1.set_title('IQON3000: Mean Rank by Category')
-    ax1.set_xlabel('Category')
-    ax1.set_ylabel('Mean Rank')
-    ax1.set_xticks(range(len(cat_df_sorted)))
-    ax1.set_xticklabels([f"{row['category']}\n{row['category_name'][:8]}" 
-                        for _, row in cat_df_sorted.iterrows()], rotation=45)
-    
-    # Add value labels on bars
-    for i, bar in enumerate(bars1):
-        height = bar.get_height()
-        ax1.text(bar.get_x() + bar.get_width()/2., height,
-                f'{height:.1f}', ha='center', va='bottom')
-    
-    # 2. MRR by category
-    bars2 = ax2.bar(range(len(cat_df_sorted)), cat_df_sorted['mrr'])
-    ax2.set_title('IQON3000: MRR by Category')
-    ax2.set_xlabel('Category')
-    ax2.set_ylabel('Mean Reciprocal Rank')
-    ax2.set_xticks(range(len(cat_df_sorted)))
-    ax2.set_xticklabels([f"{row['category']}\n{row['category_name'][:8]}" 
-                        for _, row in cat_df_sorted.iterrows()], rotation=45)
-    
-    # Add value labels on bars
-    for i, bar in enumerate(bars2):
-        height = bar.get_height()
-        ax2.text(bar.get_x() + bar.get_width()/2., height,
-                f'{height:.3f}', ha='center', va='bottom')
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'iqon3000_category_performance.png'), 
-                dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    # 3. Top-K% accuracy comparison
-    topk_cols = [col for col in cat_df.columns if 'top' in col and '%_accuracy' in col]
-    if topk_cols:
-        fig, ax = plt.subplots(figsize=(12, 8))
-        
-        x = np.arange(len(cat_df))
-        width = 0.15
-        
-        for i, col in enumerate(topk_cols[:5]):  # Max 5 metrics
-            values = cat_df[col].values
-            ax.bar(x + i * width, values, width, label=col.replace('_accuracy', ''))
-        
-        ax.set_title('IQON3000: Top-K% Accuracy by Category')
-        ax.set_xlabel('Category')
-        ax.set_ylabel('Accuracy')
-        ax.set_xticks(x + width * 2)
-        ax.set_xticklabels([f"{row['category']}\n{row['category_name'][:8]}" 
-                           for _, row in cat_df.iterrows()], rotation=45)
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'iqon3000_topk_accuracy.png'), 
-                    dpi=300, bbox_inches='tight')
-        plt.close()
-    
-    # 4. Sample count and gallery size visualization
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
-    
-    # Sample count
-    bars1 = ax1.bar(range(len(cat_df)), cat_df['count'])
-    ax1.set_title('IQON3000: Sample Count by Category')
-    ax1.set_xlabel('Category')
-    ax1.set_ylabel('Sample Count')
-    ax1.set_xticks(range(len(cat_df)))
-    ax1.set_xticklabels([f"{row['category']}\n{row['category_name'][:8]}" 
-                        for _, row in cat_df.iterrows()], rotation=45)
-    
-    for i, bar in enumerate(bars1):
-        height = bar.get_height()
-        ax1.text(bar.get_x() + bar.get_width()/2., height,
-                f'{int(height)}', ha='center', va='bottom')
-    
-    # Average gallery size
-    bars2 = ax2.bar(range(len(cat_df)), cat_df['avg_gallery_size'])
-    ax2.set_title('IQON3000: Average Gallery Size by Category')
-    ax2.set_xlabel('Category')
-    ax2.set_ylabel('Average Gallery Size')
-    ax2.set_xticks(range(len(cat_df)))
-    ax2.set_xticklabels([f"{row['category']}\n{row['category_name'][:8]}" 
-                        for _, row in cat_df.iterrows()], rotation=45)
-    
-    for i, bar in enumerate(bars2):
-        height = bar.get_height()
-        ax2.text(bar.get_x() + bar.get_width()/2., height,
-                f'{height:.0f}', ha='center', va='bottom')
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'iqon3000_data_distribution.png'), 
-                dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    print(f"[INFO] IQON3000 category performance plots saved to {output_dir}")
-
-# ------------------------------------------------------------------
-# 6. Comprehensive visualization pipeline for IQON3000
-# ------------------------------------------------------------------
-def create_comprehensive_iqon3000_visualization(model, test_generator, item_vecs, 
-                                               results_csv, output_dir="iqon3000_visuals"):
-    """
-    Create comprehensive visualization for IQON3000 dataset including:
-    - Category performance plots
-    - PCA visualizations
-    - Sample retrieval collages
-    """
-    print("[INFO] Creating comprehensive IQON3000 visualization")
-    
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # 1. Category performance plots
-    if os.path.exists(results_csv):
-        plot_category_performance(results_csv, output_dir)
-    else:
-        print(f"[WARN] Results CSV not found: {results_csv}")
-    
-    # 2. Test set visualizations with collages
     try:
-        visualize_test_sets_and_collages(
-            model, test_generator, item_vecs,
-            scene_root="data/IQON3000",
-            furn_root="data/IQON3000", 
-            out_dir=output_dir,
-            pca_background=os.path.join(output_dir, "iqon3000_pca_background.pkl"),
-            top_k=3
+        # Build item vectors for retrieval visualization
+        from util import build_item_feature_dict
+        print(f"[INFO] Building item feature dictionary for {dataset_type}...")
+        item_vectors = build_item_feature_dict(model, test_generator)
+        
+        # Create comprehensive visualization suite
+        create_comprehensive_visualization(
+            model=model,
+            test_generator=test_generator, 
+            item_vecs=item_vectors,
+            results_data=results_data,
+            output_dir=output_dir,
+            dataset_type=dataset_type
         )
+        
+        print(f"[INFO] ✅ plot.py integration completed for {dataset_type}")
+        
     except Exception as e:
-        print(f"[WARN] Error creating test set visualizations: {e}")
-    
-    # 3. Create summary report
-    create_iqon3000_summary_report(results_csv, output_dir)
-    
-    print(f"[INFO] Comprehensive IQON3000 visualization completed. Results in {output_dir}")
-
-def create_iqon3000_summary_report(results_csv: str, output_dir: str):
-    """
-    Create a text summary report for IQON3000 results
-    """
-    if not os.path.exists(results_csv):
-        return
-    
-    df = pd.read_csv(results_csv)
-    cat_df = df[df['category'].between(1, 11)].copy()
-    
-    if len(cat_df) == 0:
-        return
-    
-    category_names = {
-        1: "インナー系", 2: "ボトムス系", 3: "シューズ系", 4: "バッグ系", 5: "アクセサリー系",
-        6: "帽子", 7: "Tシャツ・カットソー系", 8: "シャツ・ブラウス系", 9: "ニット・セーター系",
-        10: "アウター系", 11: "その他"
-    }
-    
-    report_path = os.path.join(output_dir, "iqon3000_summary_report.txt")
-    
-    with open(report_path, 'w', encoding='utf-8') as f:
-        f.write("="*80 + "\n")
-        f.write("IQON3000 DATASET EVALUATION SUMMARY REPORT\n")
-        f.write("="*80 + "\n\n")
-        
-        # Overall statistics
-        total_samples = cat_df['count'].sum()
-        avg_mean_rank = cat_df['mean_rank'].mean()
-        avg_mrr = cat_df['mrr'].mean()
-        
-        f.write(f"Overall Statistics:\n")
-        f.write(f"  Total Samples: {total_samples:,}\n")
-        f.write(f"  Average Mean Rank: {avg_mean_rank:.3f}\n")
-        f.write(f"  Average MRR: {avg_mrr:.3f}\n\n")
-        
-        # Category breakdown
-        f.write("Category Performance Breakdown:\n")
-        f.write("-" * 80 + "\n")
-        
-        for _, row in cat_df.iterrows():
-            cat_id = int(row['category'])
-            cat_name = category_names.get(cat_id, f"Category {cat_id}")
-            
-            f.write(f"Category {cat_id}: {cat_name}\n")
-            f.write(f"  Sample Count: {int(row['count']):,}\n")
-            f.write(f"  Mean Rank: {row['mean_rank']:.3f}\n")
-            f.write(f"  Median Rank: {row['median_rank']:.3f}\n")
-            f.write(f"  MRR: {row['mrr']:.3f}\n")
-            f.write(f"  Average Gallery Size: {row['avg_gallery_size']:.0f}\n")
-            
-            # Top-K% metrics if available
-            topk_cols = [col for col in row.index if 'top' in col and '%_accuracy' in col]
-            if topk_cols:
-                f.write(f"  Top-K% Accuracy: ")
-                topk_values = [f"{col.split('top')[1].split('%')[0]}%={row[col]:.1%}" 
-                              for col in sorted(topk_cols)[:3]]
-                f.write(", ".join(topk_values))
-                f.write("\n")
-            
-            f.write("\n")
-        
-        # Best and worst performing categories
-        best_cat = cat_df.loc[cat_df['mrr'].idxmax()]
-        worst_cat = cat_df.loc[cat_df['mrr'].idxmin()]
-        
-        f.write("Performance Highlights:\n")
-        f.write("-" * 40 + "\n")
-        f.write(f"Best Performing Category: {category_names.get(int(best_cat['category']))} "
-                f"(MRR: {best_cat['mrr']:.3f})\n")
-        f.write(f"Worst Performing Category: {category_names.get(int(worst_cat['category']))} "
-                f"(MRR: {worst_cat['mrr']:.3f})\n\n")
-        
-        # Data distribution insights
-        largest_cat = cat_df.loc[cat_df['count'].idxmax()]
-        smallest_cat = cat_df.loc[cat_df['count'].idxmin()]
-        
-        f.write("Data Distribution:\n")
-        f.write("-" * 20 + "\n")
-        f.write(f"Largest Category: {category_names.get(int(largest_cat['category']))} "
-                f"({int(largest_cat['count']):,} samples)\n")
-        f.write(f"Smallest Category: {category_names.get(int(smallest_cat['category']))} "
-                f"({int(smallest_cat['count']):,} samples)\n")
-        
-        f.write("\n" + "="*80 + "\n")
-        f.write("Report generated for IQON3000 dataset evaluation\n")
-        f.write("="*80 + "\n")
-    
-    print(f"[INFO] IQON3000 summary report saved to {report_path}")
+        print(f"[ERROR] ❌ plot.py integration failed for {dataset_type}: {e}")
+        import traceback
+        traceback.print_exc()

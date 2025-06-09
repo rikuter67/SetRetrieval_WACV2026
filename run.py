@@ -84,7 +84,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--ff-dim', type=int, default=None)
     parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--epochs', type=int, default=15)
-    parser.add_argument('--learning-rate', type=float, default=3e-5)
+    parser.add_argument('--learning-rate', type=float, default=1e-4)
     parser.add_argument('--patience', type=int, default=7)
     parser.add_argument('--use-cycle-loss', action='store_true')
     parser.add_argument('--cycle-lambda', type=float, default=0.2)
@@ -312,28 +312,22 @@ def test_model(model: SetRetrievalModel, test_gen: DataGenerator, args: argparse
         logging.error(f"Weights not found: {weights_path}")
         return False
     
-    device_info = "GPU" if GPU_AVAILABLE else "CPU"
-    logging.info(f"Building model completely for weight loading...")
-    
-    # Build model completely using the new method
+    # Build model completely
     try:
         input_shape = (args.batch_size, test_gen.max_item_num, test_gen.feature_dim)
         model.build_model_completely(input_shape)
         logging.info("✅ Model fully built with all layers")
     except Exception as e:
         logging.warning(f"build_model_completely failed: {e}, trying alternative method...")
-        
-        # Fallback: process a dummy batch
         try:
             dummy_batch = next(iter(test_gen))
-            logging.info("Processing dummy batch to build model...")
             _ = model(dummy_batch[0], training=False)
             logging.info("✅ Model built via dummy batch")
         except Exception as e2:
             logging.error(f"Failed to build model: {e2}")
             return False
     
-    logging.info(f"Loading weights: {weights_path}")
+    # Load weights
     try:
         model.load_weights(str(weights_path))
         logging.info("✅ Weights loaded successfully")
@@ -341,62 +335,26 @@ def test_model(model: SetRetrievalModel, test_gen: DataGenerator, args: argparse
         logging.error(f"Failed to load weights: {e}")
         return False
     
-    logging.info(f"Running evaluation on {device_info}...")
+    # 🎯 この部分が重要！enhanced util.pyのmain_evaluation_pipelineを呼び出す
     try:
-        # Simple evaluation without the complex pipeline that might have issues
-        logging.info("Running simple model evaluation...")
+        logging.info("🎨 Running enhanced evaluation with DeepFurniture-style visualization...")
+        from util import main_evaluation_pipeline
         
-        # Test a few batches to verify model works
-        total_batches = 0
-        total_loss = 0.0
+        main_evaluation_pipeline(
+            model=model, 
+            test_generator=test_gen, 
+            output_dir=str(output_dir), 
+            checkpoint_path=str(weights_path), 
+            hard_negative_threshold=0.9, 
+            top_k_percentages=[1, 3, 5, 10, 20], 
+            combine_directions=True, 
+            enable_visualization=True  # 必ずTrueに設定
+        )
+        logging.info("✅ Enhanced evaluation completed successfully")
+        return True
         
-        for i, batch_data in enumerate(test_gen):
-            if i >= 5:  # Test only 5 batches
-                break
-                
-            try:
-                predictions = model(batch_data[0], training=False)
-                logging.info(f"Batch {i+1}: Predictions shape: {predictions.shape}")
-                total_batches += 1
-                
-                # Simple loss calculation
-                batch_loss = tf.reduce_mean(tf.square(predictions))
-                total_loss += float(batch_loss)
-                
-            except Exception as e:
-                logging.error(f"Error in batch {i+1}: {e}")
-                continue
-        
-        if total_batches > 0:
-            avg_loss = total_loss / total_batches
-            logging.info(f"✅ Simple evaluation completed - Average loss: {avg_loss:.4f}")
-            
-            # Try the full evaluation pipeline
-            try:
-                logging.info("Attempting full evaluation pipeline...")
-                main_evaluation_pipeline(
-                    model=model, 
-                    test_generator=test_gen, 
-                    output_dir=str(output_dir), 
-                    checkpoint_path=str(weights_path), 
-                    hard_negative_threshold=0.9, 
-                    top_k_percentages=[1, 3, 5, 10, 20], 
-                    combine_directions=True, 
-                    enable_visualization=False
-                )
-                logging.info("✅ Full evaluation completed")
-            except Exception as eval_error:
-                logging.error(f"Full evaluation failed: {eval_error}")
-                logging.info("Simple evaluation was successful, but full pipeline has issues")
-                # Don't return False here, simple evaluation worked
-            
-            return True
-        else:
-            logging.error("No batches were successfully processed")
-            return False
-            
     except Exception as e:
-        logging.error(f"Evaluation failed: {e}")
+        logging.error(f"Enhanced evaluation failed: {e}")
         import traceback
         traceback.print_exc()
         return False
