@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Environments
+*.yml
+*.yaml
+.env
+
+# Data, Datasets, and Experiments
+data/
+datasets/
+experiments/
+
+# Logs
+*.log
+installation_log.txt
+
+# IDE/Editor specific
+.vscode/
+.idea/

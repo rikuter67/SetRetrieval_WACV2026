@@ -1,1319 +1,1040 @@
-# enhanced_util.py - Complete evaluation pipeline with all visualizations
+"""
+utils.py - Evaluation and Utility Functions for Set Retrieval (WACV 2026)
+===========================================================================
+Comprehensive evaluation pipeline with corrected metrics, GPU management,
+and result visualization for heterogeneous set retrieval.
+"""
+
 import os
 import json
-import time
 import pickle
 import gzip
-from typing import Dict, List, Set, Tuple, Optional
+import time
+from typing import Dict, List, Tuple, Optional, Any
 from collections import defaultdict
+import gc
 
+import json
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-from PIL import Image, ImageDraw, ImageFont
-
-# Import visualization libraries with fallback
-try:
-    import matplotlib.pyplot as plt
-    import matplotlib
-    matplotlib.use('Agg')  # Use non-interactive backend
-    HAS_MATPLOTLIB = True
-except ImportError:
-    HAS_MATPLOTLIB = False
-    print("[WARN] matplotlib not available, visualizations disabled")
 
 try:
-    from sklearn.decomposition import PCA
-    from sklearn.manifold import TSNE
-    HAS_SKLEARN = True
+    from tqdm import tqdm
 except ImportError:
-    HAS_SKLEARN = False
-    print("[WARN] sklearn not available, some visualizations disabled")
+    def tqdm(iterator, *args, **kwargs):
+        return iterator
 
-# CORRECTED Dataset configurations with proper category mappings
+def evaluate_model(model, test_data, output_dir=None):
+    """
+    Evaluate the model on test data
+    
+    Args:
+        model: Trained SetRetrievalModel
+        test_data: Test dataset
+        output_dir: Directory to save results
+        
+    Returns:
+        Dictionary containing evaluation results
+    """
+    
+    print("🔍 Starting evaluation...")
+    
+    # Initialize metrics
+    all_mrr = []
+    all_top1 = []
+    all_top5 = []
+    all_top10 = []
+    
+    batch_count = 0
+    total_queries = 0
+    
+    # Evaluate on test data
+    for batch in test_data:
+        try:
+            # Get model predictions
+            inputs = {
+                'query_features': batch['query_features'],
+                'query_categories': batch['query_categories']
+            }
+            predictions = model(inputs, training=False)
+            
+            # Calculate metrics for this batch
+            batch_metrics = calculate_batch_metrics(
+                predictions,
+                batch['target_features'],
+                batch['target_categories']
+            )
+            
+            if batch_metrics['num_queries'] > 0:
+                all_mrr.extend(batch_metrics['mrr'])
+                all_top1.extend(batch_metrics['top1'])
+                all_top5.extend(batch_metrics['top5'])
+                all_top10.extend(batch_metrics['top10'])
+                total_queries += batch_metrics['num_queries']
+            
+            batch_count += 1
+            
+            # Progress update
+            if batch_count % 50 == 0:
+                print(f"  Processed {batch_count} batches, {total_queries} queries...")
+                
+        except Exception as e:
+            print(f"⚠️ Error in batch {batch_count}: {e}")
+            continue
+    
+    # Calculate overall metrics
+    if total_queries > 0:
+        results = {
+            'overall': {
+                'mrr': np.mean(all_mrr),
+                'top1': np.mean(all_top1),
+                'top5': np.mean(all_top5),
+                'top10': np.mean(all_top10),
+                'num_queries': total_queries,
+                'num_batches': batch_count
+            }
+        }
+        
+        print(f"✅ Evaluation completed on {total_queries} queries")
+        
+        # Save results if output directory is provided
+        if output_dir:
+            results_path = os.path.join(output_dir, 'evaluation_results.json')
+            with open(results_path, 'w') as f:
+                json.dump(results, f, indent=2)
+            print(f"📁 Results saved to: {results_path}")
+        
+        return results
+    else:
+        print("❌ No valid queries found for evaluation")
+        return {'overall': {'mrr': 0.0, 'top1': 0.0, 'top5': 0.0, 'top10': 0.0}}
+        
+# =============================================================================
+# GPU and Memory Management
+# =============================================================================
+
+def setup_gpu_memory():
+    """Configure GPU memory growth and optimization"""
+    
+    print("[INFO] Configuring GPU memory...")
+    
+    gpus = tf.config.experimental.list_physical_devices('GPU')
+    
+    if gpus:
+        try:
+            # Enable memory growth for all GPUs
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            
+            # Set visible devices based on CUDA_VISIBLE_DEVICES
+            cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES')
+            if cuda_visible:
+                print(f"[INFO] Using GPU devices: {cuda_visible}")
+            
+            print(f"[INFO] ✅ GPU memory configured for {len(gpus)} GPU(s)")
+            
+            # Print GPU information
+            for i, gpu in enumerate(gpus):
+                print(f"[INFO] GPU {i}: {gpu.name}")
+                
+        except RuntimeError as e:
+            print(f"[WARN] GPU configuration warning: {e}")
+    else:
+        print("[INFO] No GPUs found, using CPU")
+
+
+def clear_memory():
+    """Clear memory and run garbage collection"""
+    
+    gc.collect()
+    
+    if tf.config.list_physical_devices('GPU'):
+        try:
+            tf.keras.backend.clear_session()
+        except:
+            pass
+
+
+def monitor_memory_usage():
+    """Monitor and print memory usage"""
+    
+    try:
+        import psutil
+        memory_percent = psutil.virtual_memory().percent
+        print(f"[INFO] System memory usage: {memory_percent:.1f}%")
+        
+        # GPU memory if available
+        if tf.config.list_physical_devices('GPU'):
+            try:
+                from pynvml import nvmlInit, nvmlDeviceGetHandleByIndex, nvmlDeviceGetMemoryInfo
+                nvmlInit()
+                handle = nvmlDeviceGetHandleByIndex(0)
+                mem_info = nvmlDeviceGetMemoryInfo(handle)
+                gpu_percent = (mem_info.used / mem_info.total) * 100
+                print(f"[INFO] GPU memory usage: {gpu_percent:.1f}%")
+            except:
+                pass
+                
+    except ImportError:
+        pass
+
+
+# =============================================================================
+# Dataset Configuration and Detection
+# =============================================================================
+
 DATASET_CONFIGS = {
+    'IQON3000': {
+        'num_categories': 7,
+        'category_range': (1, 7),
+        'category_names': {
+            1: "トップス系", 2: "アウター系", 3: "ボトムス系",
+            4: "ワンピース・ドレス系", 5: "シューズ系",
+            6: "バッグ系", 7: "アクセサリー・小物系"
+        }
+    },
     'DeepFurniture': {
         'num_categories': 11,
         'category_range': (1, 11),
         'category_names': {
-            1: "Chairs",
-            2: "Tables", 
-            3: "Storage",
-            4: "Beds",
-            5: "Sofas",
-            6: "Lighting",
-            7: "Decor",
-            8: "Electronics",
-            9: "Kitchen",
-            10: "Outdoor",
-            11: "Others"
-        },
-        'image_paths': {
-            'furniture': 'data/DeepFurniture/furnitures',
-            'scenes': 'data/DeepFurniture/scenes'
-        }
-    },
-    'IQON3000': {
-        'num_categories': 7,  # CORRECTED: 7 categories instead of 11
-        'category_range': (1, 7),  # CORRECTED: 1-7 instead of 1-11
-        'category_names': {
-            1: "インナー系",
-            2: "ボトムス系", 
-            3: "シューズ系",
-            4: "バッグ系",
-            5: "アクセサリー系",
-            6: "帽子",
-            7: "トップス系"  # CORRECTED: simplified category names
-        },
-        'image_paths': {
-            'furniture': 'data/IQON3000',  # Two-level structure: setId/itemId
-            'scenes': 'data/IQON3000'
+            1: "chair", 2: "table", 3: "sofa", 4: "bed", 5: "cabinet",
+            6: "lamp", 7: "bookshelf", 8: "desk", 9: "dresser",
+            10: "nightstand", 11: "other_furniture"
         }
     }
 }
 
-def detect_dataset_from_generator(test_generator):
-    """Detect dataset type from data generator"""
+
+def detect_dataset_type(test_data) -> str:
+    """Detect dataset type from test data"""
+    
     try:
-        if hasattr(test_generator, 'dataset_name'):
-            return test_generator.dataset_name
-        if hasattr(test_generator, 'data_path'):
-            if 'DeepFurniture' in test_generator.data_path:
-                return 'DeepFurniture'
-            elif 'IQON3000' in test_generator.data_path:
+        # Try to get a sample batch
+        sample_batch = next(iter(test_data.take(1)))
+        
+        # Check category range
+        if 'target_categories' in sample_batch:
+            categories = sample_batch['target_categories'].numpy()
+            max_cat = int(np.max(categories[categories > 0]))
+            
+            if max_cat <= 7:
                 return 'IQON3000'
-        print("[WARN] Could not detect dataset type, defaulting to DeepFurniture")
-        return 'DeepFurniture'
-    except Exception as e:
-        print(f"[WARN] Dataset detection failed: {e}, defaulting to DeepFurniture")
-        return 'DeepFurniture'
-
-# ------------------------------------------------------------------
-# 🖼️ Enhanced real image loading utilities
-# ------------------------------------------------------------------
-def load_real_furniture_image(item_id: str, dataset_type: str = "DeepFurniture", thumb_size=(150, 150)):
-    """Load real furniture/item image from dataset with robust path handling"""
-    # デバッグ出力を削除または簡素化
-    # print(f"[DEBUG] Attempting to load image. Received ID: '{item_id}' (Type: {type(item_id)}), Dataset: {dataset_type}")
-    if item_id == "0" or item_id == 0 or not item_id:
-        return None
-    
-    try:
-        item_id_str = str(item_id).strip()
-        if not item_id_str or item_id_str == "0":
-            return None
-            
-        config = DATASET_CONFIGS[dataset_type]
-        image_paths = config['image_paths']
-        base_dir = image_paths['furniture']
-        
-        if dataset_type == "IQON3000":
-            # IQON3000の処理（変更なし）
-            possible_base_dirs = [
-                base_dir, 
-                "data/IQON3000", 
-                "./data/IQON3000", 
-                "~/SetRetrieval_WACV2026/data/IQON3000",
-                "~/setRetrieval/Datasets/IQON3000",
-                "IQON3000"
-            ]
-            
-            for base in possible_base_dirs:
-                expanded_base = os.path.expanduser(base)
-                if not os.path.exists(expanded_base):
-                    continue
-                    
-                try:
-                    for set_dir in os.listdir(expanded_base):
-                        set_path = os.path.join(expanded_base, set_dir)
-                        if not os.path.isdir(set_path):
-                            continue
-                            
-                        possible_files = [
-                            f"{item_id_str}_m.jpg",
-                            f"{item_id_str}_s.jpg",
-                            f"{item_id_str}_l.jpg",
-                            f"{item_id_str}.jpg", 
-                            f"{item_id_str}.png", 
-                            f"{item_id_str}.jpeg"
-                        ]
-                        
-                        for filename in possible_files:
-                            img_path = os.path.join(set_path, filename)
-                            if os.path.exists(img_path):
-                                try:
-                                    img = Image.open(img_path).convert("RGB")
-                                    # print(f"[SUCCESS] 👗 Loaded IQON3000 real image: {img_path}")
-                                    img.thumbnail(thumb_size, Image.Resampling.LANCZOS)
-                                    result = Image.new("RGB", thumb_size, "white")
-                                    paste_x = (thumb_size[0] - img.width) // 2
-                                    paste_y = (thumb_size[1] - img.height) // 2
-                                    result.paste(img, (paste_x, paste_y))
-                                    return result
-                                except Exception as e:
-                                    continue
-                except Exception as e:
-                    continue
-                    
-        else:  # DeepFurniture
-            possible_base_dirs = [
-                base_dir,
-                "data/DeepFurniture/furnitures",
-                "./data/DeepFurniture/furnitures",
-                "~/SetRetrieval_WACV2026/data/DeepFurniture/furnitures",
-                "DeepFurniture/furnitures",
-            ]
-            
-            possible_extensions = [".png", ".jpg", ".jpeg"]
-            
-            for base in possible_base_dirs:
-                expanded_base = os.path.expanduser(base)
-                for ext in possible_extensions:
-                    img_path = os.path.join(expanded_base, f"{item_id_str}{ext}")
-                    if os.path.exists(img_path):
-                        try:
-                            img = Image.open(img_path).convert("RGB")
-                            # print(f"[SUCCESS] 🪑 Loaded DeepFurniture real image: {img_path}")
-                            img.thumbnail(thumb_size, Image.Resampling.LANCZOS)
-                            result = Image.new("RGB", thumb_size, "white")
-                            paste_x = (thumb_size[0] - img.width) // 2
-                            paste_y = (thumb_size[1] - img.height) // 2
-                            result.paste(img, (paste_x, paste_y))
-                            return result
-                        except Exception as e:
-                            continue
-        # print(f"[WARN] 🔍 Real image not found for {dataset_type} ID {item_id_str}")
-            
-    except Exception as e:
-        print(f"[ERROR] Error loading real image {item_id}: {e}")
-    
-    return None
-
-def create_category_placeholder(category_id: int, item_type: str, thumb_size=(150, 150), dataset_type: str = "DeepFurniture"):
-    """Create visually appealing category-specific placeholder images"""
-    
-    config = DATASET_CONFIGS[dataset_type]
-    category_names = config['category_names']
-    
-    # Category-specific colors
-    if dataset_type == "DeepFurniture":
-        category_colors = {
-            1: "#8B4513", 2: "#D2691E", 3: "#708090", 4: "#9370DB", 5: "#20B2AA",
-            6: "#FFD700", 7: "#FF69B4", 8: "#4169E1", 9: "#32CD32", 10: "#228B22", 11: "#808080"
-        }
-    else:  # IQON3000
-        category_colors = {
-            1: "#FFF8DC", 2: "#4169E1", 3: "#8B4513", 4: "#DAA520", 5: "#FF69B4", 
-            6: "#2F4F4F", 7: "#98FB98", 8: "#FFB6C1", 9: "#DDA0DD", 10: "#F0E68C", 11: "#D3D3D3"
-        }
-    
-    # Item type specific colors
-    type_colors = {
-        "Query": "#90EE90", "Target": "#FFB6C1", "Retrieval": "#FFFFE0", "Scene": "#87CEEB"
-    }
-    
-    base_color = category_colors.get(category_id, "#D3D3D3")
-    type_color = type_colors.get(item_type, "#F0F0F0")
-    
-    img = Image.new("RGB", thumb_size, base_color)
-    draw = ImageDraw.Draw(img)
-    
-    try:
-        font_large = ImageFont.truetype("arial.ttf", 16)
-        font_small = ImageFont.truetype("arial.ttf", 12)
-    except:
-        font_large = ImageFont.load_default()
-        font_small = ImageFont.load_default()
-    
-    # Add border
-    border_color = "#333333"
-    draw.rectangle([0, 0, thumb_size[0]-1, thumb_size[1]-1], outline=border_color, width=2)
-    
-    # Add type indicator background
-    type_height = 25
-    draw.rectangle([5, 5, thumb_size[0]-5, 5+type_height], fill=type_color, outline=border_color)
-    if font_small:
-        draw.text((10, 8), item_type, fill="black", font=font_small)
-    
-    # Add category info
-    cat_name = category_names.get(category_id, "Unknown")
-    text_y = thumb_size[1] // 2 - 15
-    if font_large:
-        draw.text((10, text_y), f"Cat {category_id}", fill="white", font=font_large)
-    if font_small:
-        # Truncate long category names
-        display_name = cat_name[:12] + "..." if len(cat_name) > 12 else cat_name
-        draw.text((10, text_y + 20), display_name, fill="white", font=font_small)
-        draw.text((10, thumb_size[1] - 35), "NO IMAGE", fill="red", font=font_small)
-    
-    # Add decorative elements
-    corner_size = 8
-    draw.rectangle([thumb_size[0]-corner_size-5, thumb_size[1]-corner_size-5, 
-                   thumb_size[0]-5, thumb_size[1]-5], fill="white", outline=border_color)
-    
-    return img
-
-def safe_load_furniture_image(item_id: str, furn_root: str, dataset_type: str = "DeepFurniture", 
-                            thumb_size=(150, 150), item_type: str = "Item", category_id: int = 1):
-    """Main function: Try to load real image first, then enhanced placeholder"""
-    real_img = load_real_furniture_image(item_id, dataset_type, thumb_size)
-    if real_img is not None:
-        return real_img
-    return create_category_placeholder(category_id, item_type, thumb_size, dataset_type)
-
-def load_scene_image(scene_id: str, scene_root: str, dataset_type: str = "DeepFurniture", thumb_size=(400, 300)):
-    """
-    DeepFurniture用のシーン画像読み込み
-    data/DeepFurniture/scenes/[scene_id]/image.jpg から読み込み
-    """
-    try:
-        # 可能なベースパス
-        possible_base_dirs = [
-            "data/DeepFurniture/scenes",
-            "./data/DeepFurniture/scenes",
-            "~/SetRetrieval_WACV2026/data/DeepFurniture/scenes",
-            "/home/yamazono/SetRetrieval_WACV2026/data/DeepFurniture/scenes"
-        ]
-        
-        for base_dir in possible_base_dirs:
-            expanded_base = os.path.expanduser(base_dir)
-            scene_image_path = os.path.join(expanded_base, str(scene_id), "image.jpg")
-            
-            if os.path.exists(scene_image_path):
-                try:
-                    img = Image.open(scene_image_path).convert("RGB")
-                    print(f"[SUCCESS] 🏠 Loaded DeepFurniture scene: {scene_image_path}")
-                    img.thumbnail(thumb_size, Image.Resampling.LANCZOS)
-                    result = Image.new("RGB", thumb_size, "white")
-                    paste_x = (thumb_size[0] - img.width) // 2
-                    paste_y = (thumb_size[1] - img.height) // 2
-                    result.paste(img, (paste_x, paste_y))
-                    return result
-                except Exception as e:
-                    print(f"[ERROR] Failed to load scene {scene_image_path}: {e}")
-                    continue
-        
-        print(f"[WARN] 🔍 Scene image not found for scene ID: {scene_id}")
-        
-    except Exception as e:
-        print(f"[ERROR] Error loading scene image {scene_id}: {e}")
-    
-    # フォールバック: プレースホルダー画像を作成
-    return create_scene_placeholder(scene_id, thumb_size)
-
-def create_scene_placeholder(scene_id: str, thumb_size=(400, 300)):
-    """シーン用プレースホルダー画像を作成"""
-    img = Image.new("RGB", thumb_size, "#E6F3FF")
-    draw = ImageDraw.Draw(img)
-    
-    try:
-        font_large = ImageFont.truetype("arial.ttf", 24)
-        font_small = ImageFont.truetype("arial.ttf", 16)
-    except:
-        font_large = ImageFont.load_default()
-        font_small = ImageFont.load_default()
-    
-    # 枠線を描画
-    draw.rectangle([0, 0, thumb_size[0]-1, thumb_size[1]-1], outline="#2E86C1", width=3)
-    
-    # テキストを描画
-    text_lines = [
-        "DeepFurniture Scene",
-        f"ID: {scene_id}",
-        "Image not found"
-    ]
-    
-    y_offset = thumb_size[1] // 2 - 40
-    for i, line in enumerate(text_lines):
-        font = font_large if i == 0 else font_small
-        bbox = draw.textbbox((0, 0), line, font=font)
-        text_width = bbox[2] - bbox[0]
-        x = (thumb_size[0] - text_width) // 2
-        draw.text((x, y_offset), line, fill="#2E86C1", font=font)
-        y_offset += 30 if i == 0 else 25
-    
-    return img
-
-# ------------------------------------------------------------------
-# Data collection and processing
-# ------------------------------------------------------------------
-def gather_test_items_fixed(test_generator):
-    """Fixed version of gather_test_items with robust error handling AND detailed logging"""
-    print("[INFO] Starting fixed test item collection...")
-    
-    items = []
-    successful_batches = 0
-    total_batches = 0
-    
-    try:
-        max_batches = len(test_generator)
-        print(f"[INFO] Generator length: {max_batches}, attempting to process all batches.")
-    except TypeError:
-        max_batches = float('inf')
-        print("[WARN] Generator length not available, processing until iterator is exhausted.")
-
-    if hasattr(test_generator, 'on_epoch_end'):
-        test_generator.on_epoch_end()
-    
-    iterator = iter(test_generator)
-    
-    while total_batches < max_batches:
-        # print(f"[DEBUG] Loop START: total_batches={total_batches}, successful_batches={successful_batches}")
-        try:
-            batch_data = next(iterator)
-            total_batches += 1
-            
-            if batch_data is None:
-                print("[DEBUG] batch_data is None. Skipping.")
-                continue
-            
-            if not isinstance(batch_data, (list, tuple)) or len(batch_data) < 2:
-                print(f"[DEBUG] Invalid batch_data format. Type: {type(batch_data)}. Skipping.")
-                continue
-            
-            features_tuple, _ = batch_data
-            
-            if features_tuple is None or len(features_tuple) < 7:
-                print("[DEBUG] features_tuple is invalid. Skipping.")
-                continue
-            
-            Xconcat = features_tuple[0]
-            if hasattr(Xconcat, 'numpy'): Xconcat = Xconcat.numpy()
-
-            if len(Xconcat.shape) != 3:
-                print(f"[DEBUG] Invalid Xconcat shape: {Xconcat.shape}. Skipping.")
-                continue
-            
-            half = Xconcat.shape[0] // 2
-            if half == 0:
-                print("[DEBUG] Batch half-size is 0. Skipping.")
-                continue
-            
-            # (item extraction logic remains the same)
-            catQ, catP, q_ids, t_ids = (features_tuple[i] for i in [3, 4, 5, 6])
-            if hasattr(catQ, 'numpy'): catQ = catQ.numpy()
-            if hasattr(catP, 'numpy'): catP = catP.numpy()
-            if hasattr(q_ids, 'numpy'): q_ids = q_ids.numpy()
-            if hasattr(t_ids, 'numpy'): t_ids = t_ids.numpy()
-
-            for i in range(half):
-                item = (Xconcat[i], catQ[i], Xconcat[i + half], catP[i], q_ids[i], t_ids[i])
-                items.append(item)
-            
-            successful_batches += 1
-            # print(f"[DEBUG] Successfully processed batch. Items collected so far: {len(items)}")
-
-        except StopIteration:
-            print("[DEBUG] 'StopIteration' caught. This means the generator is exhausted. Breaking loop.")
-            break
-        except Exception as e:
-            print(f"\n--- !!! UNEXPECTED ERROR in gather_test_items_fixed !!! ---")
-            print(f"An error occurred while processing batch number: {total_batches}")
-            print(f"Error details: {e}")
-            import traceback
-            traceback.print_exc()
-            print(f"-------------------------------------------------------------\n")
-            break
-
-    # This final print is outside the loop
-    # print(f"[INFO] Collection loop finished. Collected {len(items)} items from {successful_batches} successful batches out of {total_batches} total batches attempted.")
-    return items if len(items) > 0 else None
-
-def build_item_feature_dict(model, test_gen) -> Dict[str, np.ndarray]:
-    """Build a dictionary of item_id → feature from all test batches."""
-    vecs: Dict[str, np.ndarray] = {}
-    
-    try:
-        batch_count = 0
-        for batch_data in test_gen:
-            if batch_count >= 10:  # Limit to avoid memory issues
-                break
-                
-            if batch_data is None or len(batch_data) < 2:
-                continue
-                
-            features_tuple = batch_data[0]
-            if features_tuple is None or len(features_tuple) < 7:
-                continue
-                
-            concat_ft, _, _, _, _, q_ids, t_ids = features_tuple[:7]
-            
-            cf = concat_ft.numpy() if hasattr(concat_ft, 'numpy') else concat_ft
-            q_ids_np = q_ids.numpy() if hasattr(q_ids, 'numpy') else q_ids
-            t_ids_np = t_ids.numpy() if hasattr(t_ids, 'numpy') else t_ids
-            
-            B2, N, _ = cf.shape
-            half = B2 // 2
-
-            # Process both query and target items
-            for b in range(half):
-                for vec, iid in zip(cf[b], q_ids_np[b]):
-                    if iid > 0: 
-                        vecs[str(int(iid))] = vec
-            
-            for b in range(half, B2):
-                for vec, iid in zip(cf[b], t_ids_np[b-half]):
-                    if iid > 0: 
-                        vecs[str(int(iid))] = vec
-            
-            batch_count += 1
-                        
-    except Exception as e:
-        print(f"[ERROR] Failed to build feature dict: {e}")
-        
-    print(f"[INFO] Built feature dict: {len(vecs)} items")
-    return vecs
-
-def find_topk_similar_items_by_euclidean(query_vec: np.ndarray,
-                                         item_dict: Dict[str, np.ndarray],
-                                         k: int = 3,
-                                         exclude: Set[str] = None) -> List[Tuple[str, float]]:
-    """Find top-k similar items using Euclidean distance"""
-    exclude = exclude or set()
-    
-    # クエリベクトルを正規化
-    query_norm = query_vec / np.linalg.norm(query_vec)
-    
-    similarities = []
-    for iid, v in item_dict.items():
-        if iid not in exclude and iid != "0":
-            # アイテムベクトルを正規化
-            v_norm = v / np.linalg.norm(v)
-            # コサイン類似度を計算（内積）
-            cosine_sim = float(np.dot(query_norm, v_norm))
-            similarities.append((iid, cosine_sim))
-    
-    # 類似度の高い順（降順）でソート
-    return sorted(similarities, key=lambda x: x[1], reverse=True)[:k]
-
-def create_item_placeholder(item_id: str, item_type: str, thumb_size=(150, 150)):
-    """個別アイテム用のプレースホルダー画像"""
-    type_colors = {
-        "Query": "#90EE90",
-        "Target": "#FFB6C1", 
-        "Pred-1": "#FFE4B5",
-        "Pred-2": "#E0E0E0",
-        "Pred-3": "#F0F0F0"
-    }
-    
-    bg_color = type_colors.get(item_type, "#F5F5F5")
-    
-    img = Image.new("RGB", thumb_size, bg_color)
-    draw = ImageDraw.Draw(img)
-    
-    try:
-        font = ImageFont.truetype("arial.ttf", 12)
-    except:
-        font = ImageFont.load_default()
-    
-    # 枠線
-    draw.rectangle([0, 0, thumb_size[0]-1, thumb_size[1]-1], outline="black", width=2)
-    
-    # テキスト
-    text_lines = [item_type, f"ID: {item_id}"]
-    y_start = thumb_size[1] // 2 - 20
-    
-    for i, line in enumerate(text_lines):
-        bbox = draw.textbbox((0, 0), line, font=font)
-        text_width = bbox[2] - bbox[0]
-        x = (thumb_size[0] - text_width) // 2
-        y = y_start + i * 20
-        draw.text((x, y), line, fill="black", font=font)
-    
-    return img
-
-# ------------------------------------------------------------------
-# Enhanced Visualization functions
-# ------------------------------------------------------------------
-def create_retrieval_collage(scene_img: Image.Image,
-                             query_imgs: List[Image.Image],
-                             target_imgs: List[Image.Image],
-                             topk: List[List[Tuple[Image.Image, float]]],
-                             save_path: str,
-                             thumb=(150, 150),
-                             dataset_type: str = "DeepFurniture",
-                             scene_id: str = "unknown"):
-    """
-    シーンベースのレイアウトで修正したcreate_retrieval_collage
-    全ての未定義変数エラーを解決した完全版
-    """
-    thumb_size = thumb
-    scene_size = (300, 300)
-    
-    # レイアウト計算 - 未定義変数を修正
-    max_items = max(len(query_imgs), len(target_imgs)) if query_imgs or target_imgs else 3
-    top_k = 3
-    
-    scene_width = scene_size[0]
-    items_width = max_items * thumb_size[0]
-    
-    canvas_width = scene_width + items_width + 20
-    canvas_height = max(scene_size[1], (1 + 1 + top_k) * thumb_size[1]) + 80
-    
-    # キャンバス作成
-    canvas = Image.new("RGB", (canvas_width, canvas_height), "white")
-    draw = ImageDraw.Draw(canvas)
-    
-    try:
-        font_title = ImageFont.truetype("arial.ttf", 16)
-        font_label = ImageFont.truetype("arial.ttf", 12)
-    except:
-        font_title = ImageFont.load_default()
-        font_label = ImageFont.load_default()
-    
-    # タイトル描画
-    title = f"DeepFurniture Scene Retrieval - {scene_id}"
-    draw.text((10, 10), title, fill="black", font=font_title)
-    
-    y_offset = 50
-    
-    # 1. シーン画像（左側に1つだけ）
-    if scene_img:
-        # scene_imgのサイズ調整
-        scene_resized = scene_img.copy()
-        scene_resized.thumbnail(scene_size, Image.Resampling.LANCZOS)
-        canvas.paste(scene_resized, (10, y_offset))
-        draw.text((15, y_offset - 20), "Scene", fill="black", font=font_label)
-    
-    # アイテム表示開始位置
-    items_x_start = scene_width + 30
-    
-    # 2. クエリアイテム行
-    y_query = y_offset
-    draw.text((items_x_start, y_query - 20), "Query Items:", fill="green", font=font_label)
-    for i, img in enumerate(query_imgs[:max_items]):
-        x = items_x_start + i * thumb_size[0]
-        if img:
-            img_resized = img.copy()
-            img_resized.thumbnail(thumb_size, Image.Resampling.LANCZOS)
-            canvas.paste(img_resized, (x, y_query))
-        # クエリラベル
-        draw.rectangle((x, y_query + thumb_size[1] - 20, x + 40, y_query + thumb_size[1]), fill="green")
-        draw.text((x + 5, y_query + thumb_size[1] - 18), f"Q{i+1}", fill="white", font=font_label)
-    
-    # 3. ターゲットアイテム行
-    y_target = y_offset + thumb_size[1]
-    draw.text((items_x_start, y_target - 20), "Target Items:", fill="red", font=font_label)
-    for i, img in enumerate(target_imgs[:max_items]):
-        x = items_x_start + i * thumb_size[0]
-        if img:
-            img_resized = img.copy()
-            img_resized.thumbnail(thumb_size, Image.Resampling.LANCZOS)
-            canvas.paste(img_resized, (x, y_target))
-        # ターゲットラベル
-        draw.rectangle((x, y_target + thumb_size[1] - 20, x + 40, y_target + thumb_size[1]), fill="red")
-        draw.text((x + 5, y_target + thumb_size[1] - 18), f"T{i+1}", fill="white", font=font_label)
-    
-    # 4. 予測結果行
-    for k in range(top_k):
-        y_pred = y_offset + (k + 2) * thumb_size[1]
-        draw.text((items_x_start, y_pred - 20), f"Top-{k+1} Predictions:", fill="blue", font=font_label)
-        
-        for i in range(max_items):
-            x = items_x_start + i * thumb_size[0]
-            
-            if i < len(topk) and k < len(topk[i]):
-                img, dist = topk[i][k]
-                if img:
-                    img_resized = img.copy()
-                    img_resized.thumbnail(thumb_size, Image.Resampling.LANCZOS)
-                    canvas.paste(img_resized, (x, y_pred))
-                    
-                    # 類似度スコア
-                    score_text = f"{dist:.3f}"
-                    bbox = draw.textbbox((0, 0), score_text, font=font_label)
-                    text_width = bbox[2] - bbox[0]
-                    score_x = x + (thumb_size[0] - text_width) // 2
-                    draw.text((score_x, y_pred + thumb_size[1] + 5), score_text, fill="blue", font=font_label)
             else:
-                # 空のプレースホルダー
-                placeholder = Image.new("RGB", thumb_size, "lightgray")
-                placeholder_draw = ImageDraw.Draw(placeholder)
-                placeholder_draw.rectangle([0, 0, thumb_size[0]-1, thumb_size[1]-1], outline="gray")
-                canvas.paste(placeholder, (x, y_pred))
-    
-    canvas.save(save_path)
-    print(f"[INFO] 🎨 Scene-based collage saved → {save_path}")
-
-def visualize_test_sets_and_collages(model, test_generator, item_vecs: dict,
-                                     scene_root: str = "data",
-                                     furn_root: str = "data", 
-                                     out_dir: str = "visuals",
-                                     top_k: int = 3,
-                                     dataset_type: str = "DeepFurniture"):
-    """元の関数構造を保ちつつ、シーンベース対応"""
-    os.makedirs(out_dir, exist_ok=True)
-    
-    print(f"[INFO] 🎨 Creating SCENE-BASED visualizations for {dataset_type}")
-    
-    if dataset_type != "DeepFurniture":
-        print(f"[INFO] Skipping visualization for {dataset_type}")
-        return
-    
-    try:
-        batch_data = next(iter(test_generator))
-        ((Xc, _, _, catQ, catP, qIDs, tIDs, _), setIDs) = batch_data
-    except Exception as e:
-        print(f"[ERROR] Failed to get batch: {e}")
-        return
-    
-    B = Xc.shape[0] // 2
-    config = DATASET_CONFIGS[dataset_type]
-
-    setIDs = [test_generator.get_scene_id_from_index(idx) for idx in setIDs[:B]]
-    
-    for s in range(min(B, 5)):
-        try:
-            scene_id = str(setIDs[s])
-            
-            # モデル予測
-            Xin = Xc[s].numpy()
-            pred_vecs = model.infer_single_set(Xin)
-            
-            # 🔧 重要な修正：load_scene_image を使ってシーン画像を読み込み
-            scene = load_scene_image(scene_id, scene_root, dataset_type, thumb_size=(400, 300))
-            
-            # クエリ・ターゲット画像（プレースホルダーを使用）
-            q_imgs = [safe_load_furniture_image(str(int(i)), furn_root, dataset_type, 
-                                              item_type="Query", category_id=int(c)) 
-                     for i, c in zip(qIDs[s].numpy(), catQ[s].numpy()) if int(i) > 0]
-            
-            t_imgs = [safe_load_furniture_image(str(int(i)), furn_root, dataset_type,
-                                              item_type="Target", category_id=int(c)) 
-                     for i, c in zip(tIDs[s].numpy(), catP[s].numpy()) if int(i) > 0]
-            
-            # 予測結果の取得
-            target_categories = [int(cat) for cat in catP[s].numpy() if int(cat) > 0]
-            query_item_ids = [str(int(id)) for id in qIDs[s].numpy() if int(id) > 0]
-            target_item_ids = [str(int(id)) for id in tIDs[s].numpy() if int(id) > 0]
-            
-            min_cat, max_cat = config['category_range']
-            topks = []
-            
-            for i, cat_id in enumerate(target_categories):
-                if not min_cat <= cat_id <= max_cat:
-                    topks.append([])
-                    continue
-                    
-                pred_vec = pred_vecs[cat_id - min_cat]
-                exclude_items = set(query_item_ids + target_item_ids)
-                
-                # 類似アイテム検索
-                similar_items = find_topk_similar_items_by_euclidean(
-                    pred_vec, item_vecs, k=top_k, exclude=exclude_items
-                )
-                
-                # 画像付きの結果に変換
-                topk_with_imgs = []
-                for item_id, similarity in similar_items:
-                    img = safe_load_furniture_image(item_id, furn_root, dataset_type,
-                                                  item_type="Retrieval", category_id=cat_id)
-                    topk_with_imgs.append((img, similarity))
-                
-                topks.append(topk_with_imgs)
-            
-            # 🔧 重要：元のcreate_retrieval_collage関数を呼び出し（scene_idを追加）
-            collage_fn = os.path.join(out_dir, f"scene_{scene_id}_retrieval.jpg")
-            create_retrieval_collage(
-                scene, q_imgs, t_imgs, topks, collage_fn, 
-                thumb=(150, 150), dataset_type=dataset_type, scene_id=scene_id
-            )
-            
-        except Exception as e:
-            print(f"[ERROR] Failed to process scene {s}: {e}")
-            import traceback
-            traceback.print_exc()
-            continue
-    
-    print(f"[INFO] ✅ Scene-based visualizations completed")
-
-# ------------------------------------------------------------------
-# Main evaluation pipeline
-# ------------------------------------------------------------------
-# util.py の main_evaluation_pipeline 関数の修正箇所
-
-def main_evaluation_pipeline(model, test_generator, output_dir="output", 
-                           checkpoint_path=None, hard_negative_threshold=0.9,
-                           top_k_percentages=[1, 3, 5, 10, 20],
-                           combine_directions=True, enable_visualization=True):
-    """
-    メイン評価パイプライン（修正版 - シーンベース可視化対応）
-    """
-    print(f"[INFO] 🎯 Starting percentage-based evaluation pipeline")
-    
-    try:
-        # Auto-detect dataset type
-        dataset_type = detect_dataset_from_generator(test_generator)
-        config = DATASET_CONFIGS[dataset_type]
-        print(f"[INFO] Detected dataset type: {dataset_type} ({config['num_categories']} categories)")
+                return 'DeepFurniture'
         
-        # Create output directories
+    except Exception as e:
+        print(f"[WARN] Could not detect dataset type: {e}")
+    
+    # Default fallback
+    return 'IQON3000'
+
+
+def get_dataset_config(dataset_type: str) -> Dict[str, Any]:
+    """Get configuration for dataset type"""
+    
+    if dataset_type not in DATASET_CONFIGS:
+        print(f"[WARN] Unknown dataset type: {dataset_type}, using IQON3000")
+        dataset_type = 'IQON3000'
+    
+    return DATASET_CONFIGS[dataset_type].copy()
+
+class NumpyJSONEncoder(json.JSONEncoder):
+    """
+    Custom JSON encoder for NumPy types.
+    Converts np.integer, np.floating, and np.ndarray to native Python types.
+    """
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super(NumpyJSONEncoder, self).default(obj)
+
+
+# =============================================================================
+# Data Collection and Gallery Building
+# =============================================================================
+
+def collect_test_data(test_data, max_batches: Optional[int] = None) -> Tuple[List, Dict, str]:
+    """
+    Collect test data and build gallery for evaluation
+    
+    Args:
+        test_data: TensorFlow dataset
+        max_batches: Maximum number of batches to process (None for all)
+        
+    Returns:
+        Tuple of (test_items, gallery_by_category, dataset_type)
+    """
+    
+    print("[INFO] 📥 Collecting test data and building gallery...")
+    
+    # Detect dataset type
+    dataset_type = detect_dataset_type(test_data)
+    config = get_dataset_config(dataset_type)
+    min_cat, max_cat = config['category_range']
+    
+    print(f"[INFO] Dataset detected: {dataset_type}")
+    print(f"[INFO] Categories: {min_cat}-{max_cat}")
+    
+    # Collect all batches
+    all_batches = []
+    batch_count = 0
+
+    for batch in tqdm(test_data, desc="Collecting batches"):
+        all_batches.append(batch)
+        batch_count += 1
+        if max_batches and batch_count >= max_batches:
+            break
+        if batch_count % 50 == 0:
+            clear_memory()
+    
+    print(f"[INFO] Collected {len(all_batches)} batches")
+    if not all_batches:
+        raise ValueError("No test data collected")
+    
+    test_items = []
+    gallery_by_category = defaultdict(dict)
+    
+    print("[INFO] Processing batches...")
+
+    
+    for batch in tqdm(test_data, desc="Collecting batches"):
+        query_features = batch['query_features'].numpy()
+        query_categories = batch['query_categories'].numpy()
+        target_features = batch['target_features'].numpy()
+        target_categories = batch['target_categories'].numpy()
+        
+        # item_idの取得を安全に行う
+        query_ids_val = batch.get('query_item_ids')
+        target_ids_val = batch.get('target_item_ids')
+
+        query_ids = query_ids_val.numpy() if query_ids_val is not None else np.arange(len(query_features))
+        target_ids = target_ids_val.numpy() if target_ids_val is not None else np.arange(len(target_features))
+
+        batch_size = query_features.shape[0]
+        
+        # Create test items
+        for i in range(batch_size):
+            test_items.append({
+                'query_features': query_features[i],
+                'query_categories': query_categories[i],
+                'target_features': target_features[i],
+                'target_categories': target_categories[i],
+                'query_ids': query_ids[i] if len(query_ids.shape) > 1 else [query_ids[i]],
+                'target_ids': target_ids[i] if len(target_ids.shape) > 1 else [target_ids[i]]
+            })
+            
+            # Build gallery from target items
+            for j, (feat, cat, item_id) in enumerate(zip(
+                target_features[i], target_categories[i], 
+                target_ids[i] if len(target_ids.shape) > 1 else [target_ids[i]]
+            )):
+                # Skip padding items
+                if cat == 0 or np.all(feat == 0):
+                    continue
+                
+                # Check category range
+                if not (min_cat <= cat <= max_cat):
+                    continue
+                
+                # Normalize feature
+                feat_norm = np.linalg.norm(feat)
+                if feat_norm > 0:
+                    feat = feat / feat_norm
+                
+                # Add to gallery
+                item_id_str = str(int(item_id)) if isinstance(item_id, (int, float)) else str(item_id)
+                gallery_by_category[int(cat)][item_id_str] = feat.astype(np.float32)
+    
+    # Convert gallery to array format for efficient computation
+    for cat_id in gallery_by_category:
+        items = gallery_by_category[cat_id]
+        if items:
+            gallery_by_category[cat_id] = {
+                'ids': np.array(list(items.keys())),
+                'features': np.array(list(items.values()))
+            }
+    
+    # Print gallery statistics
+    total_gallery_items = 0
+    print(f"[INFO] Gallery statistics:")
+    for cat_id in sorted(gallery_by_category.keys()):
+        size = len(gallery_by_category[cat_id]['ids'])
+        total_gallery_items += size
+        cat_name = config['category_names'].get(cat_id, f"Cat{cat_id}")
+        print(f"  Category {cat_id} ({cat_name}): {size:,} items")
+    
+    print(f"[INFO] ✅ Data collection complete:")
+    print(f"  Test items: {len(test_items):,}")
+    print(f"  Gallery items: {total_gallery_items:,}")
+    
+    return test_items, dict(gallery_by_category), dataset_type
+
+
+# =============================================================================
+# Model Evaluation with Corrected Metrics
+# =============================================================================
+
+def evaluate_model_comprehensive(model, test_items: List, gallery_by_category: Dict, 
+                                dataset_type: str) -> Dict[str, Any]:
+    """
+    Comprehensive model evaluation with corrected Top-K metrics
+    
+    Args:
+        model: Trained model
+        test_items: List of test items
+        gallery_by_category: Gallery organized by category
+        dataset_type: Type of dataset (IQON3000 or DeepFurniture)
+        
+    Returns:
+        Dictionary containing evaluation results
+    """
+    
+    print("[INFO] 🎯 Starting comprehensive evaluation...")
+    
+    config = get_dataset_config(dataset_type)
+    min_cat, max_cat = config['category_range']
+    
+    # Collect queries by category
+    queries_by_category = defaultdict(list)
+    
+    print("[INFO] Organizing queries by category...")
+    for item in tqdm(test_items, desc="Processing test items"):
+        target_features = item['target_features']
+        target_categories = item['target_categories']
+        target_ids = item['target_ids']
+        
+        # Process each target item as a potential query
+        for j, (cat_id, target_id) in enumerate(zip(target_categories, target_ids)):
+            # Skip padding items
+            if cat_id == 0 or not (min_cat <= cat_id <= max_cat):
+                continue
+            
+            target_id_str = str(int(target_id)) if isinstance(target_id, (int, float)) else str(target_id)
+            
+            # Check if target exists in gallery
+            if (cat_id in gallery_by_category and 
+                target_id_str in gallery_by_category[cat_id]['ids']):
+                
+                queries_by_category[int(cat_id)].append({
+                    'query_features': item['query_features'],
+                    'query_categories': item['query_categories'],
+                    'target_id': target_id_str,
+                    'category': int(cat_id)
+                })
+    
+    # Print query statistics
+    total_queries = sum(len(queries) for queries in queries_by_category.values())
+    print(f"[INFO] Query distribution:")
+    for cat_id in sorted(queries_by_category.keys()):
+        count = len(queries_by_category[cat_id])
+        cat_name = config['category_names'].get(cat_id, f"Cat{cat_id}")
+        print(f"  Category {cat_id} ({cat_name}): {count:,} queries")
+    
+    if total_queries == 0:
+        raise ValueError("No valid queries found for evaluation")
+    
+    # Evaluate each category
+    category_results = {}
+    all_ranks = []
+    successful_predictions = 0
+    failed_predictions = 0
+    
+    print("[INFO] Computing rankings...")
+    
+    for cat_id, queries in tqdm(queries_by_category.items(), desc="Evaluating categories"):
+        if cat_id not in gallery_by_category or len(gallery_by_category[cat_id]['ids']) == 0:
+            continue
+        
+        gallery = gallery_by_category[cat_id]
+        gallery_size = len(gallery['ids'])
+        category_ranks = []
+        
+        cat_name = config['category_names'].get(cat_id, f"Cat{cat_id}")
+        print(f"[INFO] Processing Category {cat_id} ({cat_name}): {len(queries)} queries, {gallery_size} gallery items")
+        
+        for query in queries[:1000]:  # Limit to 1000 queries per category for memory
+            try:
+                # Prepare query input
+                query_features = query['query_features']
+                query_categories = query['query_categories']
+                target_id = query['target_id']
+                
+                # Normalize query features
+                query_features_norm = query_features / (np.linalg.norm(query_features, axis=-1, keepdims=True) + 1e-9)
+                
+                # Model inference
+                query_input = {
+                    'query_features': tf.constant(query_features_norm[None, :, :], dtype=tf.float32),
+                    'query_categories': tf.constant(query_categories[None, :], dtype=tf.int32)
+                }
+                
+                # Get predictions
+                predictions = model(query_input, training=False)
+                
+                if predictions is None:
+                    failed_predictions += 1
+                    continue
+                
+                # Convert to numpy
+                if hasattr(predictions, 'numpy'):
+                    predictions = predictions.numpy()
+                
+                # Extract category-specific prediction
+                if len(predictions.shape) == 3 and predictions.shape[1] >= cat_id:
+                    pred_vector = predictions[0, cat_id - 1, :]  # 0-based indexing
+                    
+                    # Normalize prediction
+                    pred_norm = np.linalg.norm(pred_vector)
+                    if pred_norm > 0:
+                        pred_vector = pred_vector / pred_norm
+                    
+                    # Compute similarities with gallery
+                    gallery_features = gallery['features']
+                    similarities = np.dot(gallery_features, pred_vector)
+                    
+                    # Get ranking
+                    sorted_indices = np.argsort(similarities)[::-1]  # Descending order
+                    
+                    # Find target position
+                    target_indices = np.where(gallery['ids'] == target_id)[0]
+                    
+                    if len(target_indices) > 0:
+                        target_idx = target_indices[0]
+                        rank_position = np.where(sorted_indices == target_idx)[0]
+                        
+                        if len(rank_position) > 0:
+                            rank = rank_position[0] + 1  # 1-based rank
+                            category_ranks.append(rank)
+                            all_ranks.append(rank)
+                            successful_predictions += 1
+                        else:
+                            failed_predictions += 1
+                    else:
+                        failed_predictions += 1
+                else:
+                    failed_predictions += 1
+                    
+            except Exception as e:
+                failed_predictions += 1
+                continue
+        
+        # Store category results
+        if category_ranks:
+            category_ranks = np.array(category_ranks)
+            # ▼▼▼▼▼▼▼▼▼▼【ここから修正】▼▼▼▼▼▼▼▼▼▼
+            # 'ranks': category_ranks, の行を削除。巨大な生配列はJSONに保存しない。
+            category_results[cat_id] = {
+                'count': len(category_ranks),
+                'gallery_size': gallery_size,
+                # 'ranks': category_ranks, # この行を削除またはコメントアウト
+                'mrr': float(np.mean(1.0 / category_ranks)),
+                'r_at_1': float(np.mean(category_ranks == 1)),
+                'r_at_5': float(np.mean(category_ranks <= 5)),
+                'r_at_10': float(np.mean(category_ranks <= 10)),
+                'r_at_20': float(np.mean(category_ranks <= 20)),
+                'mnr': float(np.mean(category_ranks)),
+                'mdr': float(np.median(category_ranks)),
+                'rsum': float(np.sum(category_ranks)),
+                'avg_percentile': float(np.mean(category_ranks / gallery_size * 100))
+            }
+    
+    print(f"[INFO] Evaluation complete:")
+    print(f"  Successful predictions: {successful_predictions:,}")
+    print(f"  Failed predictions: {failed_predictions:,}")
+    
+    # Compute overall results
+    if not all_ranks:
+        raise ValueError("No successful rankings computed")
+    
+    all_ranks = np.array(all_ranks)
+    
+    # ランクの合計を計算
+    ranks_sum = float(np.sum(all_ranks))
+
+    overall_results = {
+        'total_queries': len(all_ranks),
+        'successful_predictions': successful_predictions,
+        'failed_predictions': failed_predictions,
+        'mrr': float(np.mean(1.0 / all_ranks)),
+        'r_at_1': float(np.mean(all_ranks == 1)),         # R@1
+        'r_at_5': float(np.mean(all_ranks <= 5)),         # R@5
+        'r_at_10': float(np.mean(all_ranks <= 10)),       # R@10
+        'r_at_20': float(np.mean(all_ranks <= 20)),       # Top-20も念のため残す
+        'mnr': float(np.mean(all_ranks)),                 # MnR (Mean Rank)
+        'mdr': float(np.median(all_ranks)),               # MdR (Median Rank)
+        'rsum': ranks_sum                                 # Rsum (Sum of Ranks)
+    }
+    
+    # Create final results
+    results = {
+        'dataset': dataset_type,
+        'overall': overall_results,
+        'categories': category_results,
+        'evaluation_info': {
+            'total_test_items': len(test_items),
+            'total_gallery_items': sum(len(gallery['ids']) for gallery in gallery_by_category.values()),
+            'categories_evaluated': len(category_results)
+        }
+    }
+    
+    print("[INFO] ✅ Comprehensive evaluation completed")
+    return results
+
+
+# =============================================================================
+# Main Evaluation Pipeline
+# =============================================================================
+
+def evaluate_model(model, test_data, output_dir: str) -> Optional[Dict[str, Any]]:
+    """
+    Main evaluation pipeline
+    
+    Args:
+        model: Trained model to evaluate
+        test_data: Test dataset
+        output_dir: Directory to save results
+        
+    Returns:
+        Evaluation results dictionary or None if failed
+    """
+    
+    print(f"\n[INFO] 🚀 Starting model evaluation pipeline...")
+    print(f"[INFO] Output directory: {output_dir}")
+    
+    try:
         os.makedirs(output_dir, exist_ok=True)
         
-        # 1. テストアイテム収集
-        print("[INFO] Gathering test items...")
-        test_items = gather_test_items_fixed(test_generator)
+        # Step 1: Collect test data and build gallery
+        test_items, gallery_by_category, dataset_type = collect_test_data(test_data)
         
-        if test_items is None or len(test_items) == 0:
-            print("[ERROR] No test items could be collected")
-            return
+        # Step 2: Run comprehensive evaluation
+        results = evaluate_model_comprehensive(model, test_items, gallery_by_category, dataset_type)
         
-        print(f"[INFO] Successfully collected {len(test_items)} test items")
+        # Step 3: Save and display results
+        save_evaluation_results(results, output_dir)
+        display_evaluation_results(results)
         
-        # 2. 評価メトリクス計算
-        print("[INFO] Computing percentage-based metrics...")
-        metrics = compute_comprehensive_metrics(model, test_items, dataset_type)
+        # Memory cleanup
+        clear_memory()
         
-        # 3. 結果表作成
-        print("[INFO] Creating percentage-based results table...")
-        results_df = create_quantitative_results_table(metrics, output_dir, dataset_type)
-        
-        # 4. 可視化（DeepFurnitureのみ、シーンベース）
-        if enable_visualization and dataset_type == "DeepFurniture":
-            print("[INFO] 🎨 Creating SCENE-BASED visualizations for DeepFurniture...")
-            
-            # アイテム特徴量辞書を構築
-            item_vecs = build_item_feature_dict(model, test_generator)
-            
-            # シーンベース可視化を実行
-            vis_dir = os.path.join(output_dir, "visualizations")
-            visualize_test_sets_and_collages(
-                model=model,
-                test_generator=test_generator,
-                item_vecs=item_vecs,
-                scene_root="data/DeepFurniture/scenes",
-                furn_root="data/DeepFurniture/furnitures",
-                out_dir=vis_dir,
-                top_k=3,
-                dataset_type=dataset_type
-            )
-            
-            print(f"[INFO] ✅ Scene-based visualizations saved to: {vis_dir}")
-        elif enable_visualization and dataset_type != "DeepFurniture":
-            print(f"[INFO] Skipping visualization for {dataset_type} (only DeepFurniture scene visualization supported)")
-        
-        # 5. 結果出力
-        print(f"\n{'='*80}")
-        print(f"🎯 PERCENTAGE-BASED EVALUATION REPORT - {dataset_type}")
-        print(f"{'='*80}")
-        print(f"📊 Dataset: {dataset_type}")
-        print(f"📊 Total Queries: {metrics['overall']['total_queries']}")
-        print(f"📊 Categories: {len(metrics['categories'])}")
-        print(f"📊 Evaluation Method: Top-K% (percentage of gallery)")
-        print(f"")
-        print(f"📈 OVERALL PERFORMANCE")
-        print(f"----------------------------------------")
-        overall = metrics['overall']
-        print(f"Mean Reciprocal Rank (MRR): {overall['mrr']:.3f}")
-        
-        if 'top1_pct' in overall:
-            print(f"Top-1% Accuracy: {overall['top1_pct']:.3f} ({overall['top1_pct']*100:.1f}%)")
-            print(f"Top-3% Accuracy: {overall['top3_pct']:.3f} ({overall['top3_pct']*100:.1f}%)")
-            print(f"Top-5% Accuracy: {overall['top5_pct']:.3f} ({overall['top5_pct']*100:.1f}%)")
-            print(f"Top-10% Accuracy: {overall['top10_pct']:.3f} ({overall['top10_pct']*100:.1f}%)")
-            print(f"Top-20% Accuracy: {overall['top20_pct']:.3f} ({overall['top20_pct']*100:.1f}%)")
-            if 'avg_percentile_rank' in overall:
-                print(f"Average Percentile Rank: {overall['avg_percentile_rank']:.1f}%")
-        
-        print(f"\n📁 Results saved to: {output_dir}/")
-        if dataset_type == "DeepFurniture":
-            print(f"   - 🎨 Scene visualizations: {output_dir}/visualizations/")
-        print(f"   - 📊 CSV results: {output_dir}/{dataset_type.lower()}_percentage_results.csv")
-        print(f"   - 📋 Table: {output_dir}/{dataset_type.lower()}_percentage_table.txt")
-        print(f"{'='*80}")
-        
-        print(f"[INFO] ✅ Evaluation completed successfully!")
-        
-        return metrics
+        return results
         
     except Exception as e:
         print(f"[ERROR] ❌ Evaluation failed: {e}")
         import traceback
         traceback.print_exc()
+        
+        # Save error log
+        error_path = os.path.join(output_dir, 'evaluation_error.txt')
+        with open(error_path, 'w') as f:
+            f.write(f"Evaluation Error: {str(e)}\n\n")
+            f.write("Traceback:\n")
+            f.write(traceback.format_exc())
+        
         return None
 
-# util.py の compute_comprehensive_metrics 関数内に追加
 
-def compute_comprehensive_metrics(model, test_items, dataset_type, max_items=10000):
-    """
-    K%ベースの評価メトリクス計算（学習時と一致した中心基準の評価）
-    """
-    print("[INFO] Computing percentage-based evaluation metrics with cluster center correction...")
+# =============================================================================
+# Results Display and Saving
+# =============================================================================
+
+def display_evaluation_results(results: Dict[str, Any]):
+    """Display evaluation results in a formatted table"""
     
-    config = DATASET_CONFIGS[dataset_type]
-    min_cat, max_cat = config['category_range']
-    
-    items_to_process = min(len(test_items), max_items)
-    test_items_subset = test_items[:items_to_process]
-
-    # ==================================================================
-    # STEP 0: Get cluster centers from model
-    # ==================================================================
-    try:
-        cluster_centers = model.get_cluster_center().numpy()  # (num_categories, dim)
-        print(f"[INFO] Retrieved cluster centers: {cluster_centers.shape}")
-    except Exception as e:
-        print(f"[ERROR] Could not get cluster centers: {e}")
-        print("[WARN] Falling back to evaluation without cluster center correction")
-        # ここで元の評価に戻すか、エラーを出すか
-        return compute_comprehensive_metrics_original(model, test_items, dataset_type, max_items)
-
-    # ==================================================================
-    # STEP 1: Build the gallery of all items in the test set
-    # ==================================================================
-    print("[INFO] Step 1/3: Building a gallery of all test items...")
-    gallery_by_cat = defaultdict(list)
-    for item in test_items_subset:
-        _, _, t_feats, t_cats, _, t_ids = item
-        for i, cat_id in enumerate(t_cats):
-            if cat_id > 0: # Valid category
-                gallery_by_cat[cat_id].append((str(int(t_ids[i])), t_feats[i]))
-
-    # Convert to numpy arrays for efficiency
-    for cat_id in gallery_by_cat:
-        ids, feats = zip(*gallery_by_cat[cat_id])
-        gallery_by_cat[cat_id] = {'ids': np.array(ids), 'feats': np.array(feats)}
-    
-    print(f"[INFO] Gallery built. Found items in {len(gallery_by_cat)} categories.")
-    
-    # カテゴリ別のギャラリーサイズを表示
-    for cat_id, gallery in gallery_by_cat.items():
-        print(f"  Category {cat_id}: {len(gallery['ids'])} items")
-
-    # ==================================================================
-    # STEP 2: Iterate through queries and compute percentage-based ranks
-    # ==================================================================
-    print("[INFO] Step 2/3: Processing queries with CENTER-CORRECTED evaluation...")
-    
-    # Initialize metrics storage
-    category_metrics = {cat: {'ranks': [], 'percentile_ranks': []} for cat in range(min_cat, max_cat + 1)}
-    
-    debug_sample_count = 0
-    max_debug_samples = 3
-    
-    for i, item in enumerate(test_items_subset):
-        if i % 1000 == 0:
-            print(f"  Processing query {i}/{items_to_process}...")
-            
-        try:
-            q_feats, q_cats, t_feats, t_cats, q_ids, t_ids = item
-            
-            # デバッグ情報（最初の数サンプルのみ）
-            if debug_sample_count < max_debug_samples:
-                print(f"\n=== DEBUG: Sample {debug_sample_count + 1} (CENTER-CORRECTED) ===")
-                debug_sample_count += 1
-            
-            # Get model prediction for all categories
-            pred_vecs = model.infer_single_set(q_feats[None, :])  # (num_categories, dim)
-            
-            # For each target item in the current scene
-            for j, cat_id in enumerate(t_cats):
-                if not (min_cat <= cat_id <= max_cat):
-                    continue
-
-                target_id_str = str(int(t_ids[j]))
-                
-                # Get the prediction and cluster center for this specific category
-                pred_vec = pred_vecs[cat_id - min_cat]  # 0-based index
-                center_vec = cluster_centers[cat_id - min_cat]  # クラスタ中心
-                
-                # 🔧 重要: 学習時と同じく中心からの残差ベクトルを計算
-                pred_residual = pred_vec - center_vec
-
-                # Get the gallery for this category
-                gallery = gallery_by_cat.get(cat_id)
-                if not gallery or len(gallery['ids']) == 0:
-                    continue
-
-                gallery_ids = gallery['ids']
-                gallery_feats = gallery['feats']
-                gallery_size = len(gallery_ids)
-
-                # 🔧 重要: ギャラリーアイテムも中心からの残差ベクトルに変換
-                gallery_residuals = gallery_feats - center_vec
-
-                # Compute cosine similarity using residual vectors (学習時と同じ)
-                pred_residual_norm = np.linalg.norm(pred_residual)
-                gallery_residuals_norm = np.linalg.norm(gallery_residuals, axis=1)
-                
-                if pred_residual_norm == 0: 
-                    continue
-                
-                # 残差ベクトル同士の類似度計算（学習時と一致）
-                similarities = np.dot(gallery_residuals, pred_residual) / (gallery_residuals_norm * pred_residual_norm + 1e-8)
-                
-                # Get sorted indices (highest similarity first)
-                sorted_indices = np.argsort(similarities)[::-1]
-                
-                # Find the rank of the true target item
-                rank_list = np.where(gallery_ids[sorted_indices] == target_id_str)[0]
-                
-                if len(rank_list) > 0:
-                    # 1-based rank
-                    rank = rank_list[0] + 1
-                    
-                    # Convert to percentile rank (0-100%)
-                    percentile_rank = (rank / gallery_size) * 100
-                    
-                    category_metrics[cat_id]['ranks'].append(rank)
-                    category_metrics[cat_id]['percentile_ranks'].append(percentile_rank)
-                    
-                    # デバッグ情報: 修正前後の比較
-                    if debug_sample_count <= max_debug_samples and j < 3:
-                        # print(f"\n--- Target {j+1} Debug (CENTER-CORRECTED) ---")
-                        # print(f"Target ID: {target_id_str}, Category: {cat_id}")
-                        # print(f"Gallery size: {gallery_size}")
-                        # print(f"Rank: {rank}/{gallery_size} ({percentile_rank:.1f}%)")
-                        
-                        # 修正前の方法との比較のため、生ベクトルでの順位も計算
-                        similarities_raw = np.dot(gallery_feats, pred_vec) / (np.linalg.norm(gallery_feats, axis=1) * np.linalg.norm(pred_vec) + 1e-8)
-                        sorted_indices_raw = np.argsort(similarities_raw)[::-1]
-                        rank_list_raw = np.where(gallery_ids[sorted_indices_raw] == target_id_str)[0]
-                        rank_raw = rank_list_raw[0] + 1 if len(rank_list_raw) > 0 else gallery_size
-                        percentile_raw = (rank_raw / gallery_size) * 100
-                        
-                        # print(f"COMPARISON:")
-                        # print(f"  Raw vectors rank: {rank_raw}/{gallery_size} ({percentile_raw:.1f}%)")
-                        # print(f"  Residual vectors rank: {rank}/{gallery_size} ({percentile_rank:.1f}%)")
-                        # print(f"  Improvement: {percentile_raw - percentile_rank:.1f} percentile points")
-                        
-                        # Top-5の結果を表示
-                        # print("Top-5 similar items (CENTER-CORRECTED):")
-                        top5_indices = sorted_indices[:5]
-                        for k, idx in enumerate(top5_indices):
-                            sim_score = similarities[idx]
-                            item_id = gallery_ids[idx]
-                            is_target = "✅ TARGET" if item_id == target_id_str else ""
-                            # print(f"  {k+1}. ID:{item_id} Sim:{sim_score:.4f} {is_target}")
-
-        except Exception as e:
-            print(f"  [ERROR] Error processing query {i}: {e}")
-            continue
-
-    # ==================================================================
-    # STEP 3: Compute percentage-based metrics
-    # ==================================================================
-    print("[INFO] Step 3/3: Computing percentage-based metrics...")
-    results = {'dataset': dataset_type, 'overall': {}, 'categories': {}}
-    all_percentile_ranks = []
-
-    for cat_id, metrics_data in category_metrics.items():
-        percentile_ranks = np.array(metrics_data['percentile_ranks'])
-        if len(percentile_ranks) == 0:
-            continue
-            
-        all_percentile_ranks.extend(percentile_ranks)
-        
-        # Calculate percentage-based accuracies
-        top1_pct = np.mean(percentile_ranks <= 1.0)    # Top 1%
-        top3_pct = np.mean(percentile_ranks <= 3.0)    # Top 3%
-        top5_pct = np.mean(percentile_ranks <= 5.0)    # Top 5%
-        top10_pct = np.mean(percentile_ranks <= 10.0)  # Top 10%
-        top20_pct = np.mean(percentile_ranks <= 20.0)  # Top 20%
-        
-        # MRR based on ranks (traditional)
-        ranks = np.array(metrics_data['ranks'])
-        mrr = np.mean(1.0 / ranks)
-        
-        results['categories'][cat_id] = {
-            'mrr': mrr,
-            'top1_pct': top1_pct,
-            'top3_pct': top3_pct, 
-            'top5_pct': top5_pct,
-            'top10_pct': top10_pct,
-            'top20_pct': top20_pct,
-            'count': len(ranks),
-            'avg_percentile_rank': np.mean(percentile_ranks)
-        }
-
-    # Overall metrics
-    if all_percentile_ranks:
-        overall_percentile_ranks = np.array(all_percentile_ranks)
-        
-        all_ranks = []
-        for cat_id, metrics_data in category_metrics.items():
-            all_ranks.extend(metrics_data['ranks'])
-        
-        overall_ranks = np.array(all_ranks)
-        
-        results['overall'] = {
-            'mrr': np.mean(1.0 / overall_ranks),
-            'top1_pct': np.mean(overall_percentile_ranks <= 1.0),
-            'top3_pct': np.mean(overall_percentile_ranks <= 3.0),
-            'top5_pct': np.mean(overall_percentile_ranks <= 5.0),
-            'top10_pct': np.mean(overall_percentile_ranks <= 10.0),
-            'top20_pct': np.mean(overall_percentile_ranks <= 20.0),
-            'total_queries': len(overall_ranks),
-            'avg_percentile_rank': np.mean(overall_percentile_ranks)
-        }
-    else:
-        results['overall'] = {
-            'total_queries': 0, 'mrr': 0, 
-            'top1_pct': 0, 'top3_pct': 0, 'top5_pct': 0, 'top10_pct': 0, 'top20_pct': 0,
-            'avg_percentile_rank': 0
-        }
-
-    print(f"[INFO] CENTER-CORRECTED metrics computed for {results['overall']['total_queries']} queries.")
-    print(f"[INFO] Average percentile rank: {results['overall']['avg_percentile_rank']:.1f}%")
-    print(f"[INFO] Expected improvement: Much better alignment with training (target: ~12.7%)")
-
-    return results
-
-def create_pca_visualization(model, test_items, output_dir, dataset_type, sample_size=3):
-    """Create PCA embedding visualization"""
-    if not HAS_SKLEARN or not HAS_MATPLOTLIB:
-        print("[WARN] PCA visualization skipped - missing dependencies")
+    if not results or 'overall' not in results:
+        print("[ERROR] No results to display")
         return
     
-    print(f"[INFO] Creating PCA visualization for {dataset_type}")
+    overall = results['overall']
     
-    config = DATASET_CONFIGS[dataset_type]
-    min_cat, max_cat = config['category_range']
-    colors = plt.cm.tab10.colors
+    print(f"\n{'='*70}")
+    print(f"🎯 EVALUATION RESULTS - {results['dataset']}")
+    print(f"{'='*70}")
+    print(f"Total Queries: {overall.get('total_queries', 0):,}")
+    print(f"Successful Predictions: {overall.get('successful_predictions', 0):,}")
+    print(f"-" * 70)
+    # ▼▼▼▼▼▼▼▼▼▼【ここから修正】▼▼▼▼▼▼▼▼▼▼
+    # 表示名をシンプルな形式に変更
+    print(f"R@1 : {overall.get('r_at_1', 0):.2%}")
+    print(f"R@5 : {overall.get('r_at_5', 0):.2%}")
+    print(f"R@10: {overall.get('r_at_10', 0):.2%}")
+    print(f"MnR : {overall.get('mnr', 0):.2f}")
+    print(f"MdR : {overall.get('mdr', 0):.2f}")
+    print(f"Rsum: {overall.get('rsum', 0):,.0f}")
+    print(f"MRR : {overall.get('mrr', 0):.4f}")
+    # ▲▲▲▲▲▲▲▲▲▲【ここまで修正】▲▲▲▲▲▲▲▲▲▲
+    print(f"{'='*70}")
     
-    # Collect all embeddings
-    all_embeddings = []
-    all_categories = []
-    all_types = []  # 'query', 'target', 'prediction'
-    
-    sample_items = test_items[:sample_size]
-    
-    for i, item in enumerate(sample_items):
-        try:
-            q_feats, q_cats, t_feats, t_cats, _, _ = item
+    # カテゴリ別結果のヘッダーも修正
+    if 'categories' in results and results['categories']:
+        print(f"\n📊 PER-CATEGORY RESULTS:")
+        print(f"-" * 80)
+        # ▼▼▼▼▼▼▼▼▼▼【ここから修正】▼▼▼▼▼▼▼▼▼▼
+        print(f"{'Cat':<3} {'Name':<20} {'Queries':<8} {'MRR':<8} {'R@1':<7} {'R@5':<7} {'R@10':<8} {'MnR':<8} {'MdR':<8}")
+        # ▲▲▲▲▲▲▲▲▲▲【ここまで修正】▲▲▲▲▲▲▲▲▲▲
+        print(f"-" * 80)
+        
+        config = get_dataset_config(results['dataset'])
+        
+        for cat_id in sorted(results['categories'].keys()):
+            cat_result = results['categories'][cat_id]
+            cat_name = config['category_names'].get(cat_id, f"Cat{cat_id}")[:19]
             
-            # Get model predictions
-            pred_vecs = model.infer_single_set(q_feats[None, :])  # (num_categories, dim)
-            
-            # Add query items
-            for j, (feat, cat) in enumerate(zip(q_feats, q_cats)):
-                if min_cat <= cat <= max_cat:
-                    all_embeddings.append(feat)
-                    all_categories.append(cat)
-                    all_types.append('query')
-            
-            # Add target items
-            for j, (feat, cat) in enumerate(zip(t_feats, t_cats)):
-                if min_cat <= cat <= max_cat:
-                    all_embeddings.append(feat)
-                    all_categories.append(cat)
-                    all_types.append('target')
-            
-            # Add predictions
-            for cat_idx in range(config['num_categories']):
-                all_embeddings.append(pred_vecs[cat_idx])
-                all_categories.append(cat_idx + min_cat)
-                all_types.append('prediction')
-                
-        except Exception as e:
-            print(f"[ERROR] Failed to process item {i}: {e}")
-            continue
+            # ▼▼▼▼▼▼▼▼▼▼【ここから修正】▼▼▼▼▼▼▼▼▼▼
+            print(f"{cat_id:<3} {cat_name:<20} {cat_result.get('count', 0):<8} "
+                  f"{cat_result.get('mrr', 0):<8.4f} "
+                  f"{cat_result.get('r_at_1', 0):<7.2%} "
+                  f"{cat_result.get('r_at_5', 0):<7.2%} "
+                  f"{cat_result.get('r_at_10', 0):<8.2%} "
+                  f"{cat_result.get('mnr', 0):<8.1f} "
+                  f"{cat_result.get('mdr', 0):<8.1f}")
+            # ▲▲▲▲▲▲▲▲▲▲【ここまで修正】▲▲▲▲▲▲▲▲▲▲
+        
+        print(f"-" * 80)
+
+
+def save_evaluation_results(results: Dict[str, Any], output_dir: str):
+    """Save evaluation results to files"""
     
-    if len(all_embeddings) < 10:
-        print("[WARN] Not enough embeddings for PCA visualization")
+    print(f"[INFO] 💾 Saving evaluation results...")
+    
+    # Save JSON results
+    json_path = os.path.join(output_dir, 'evaluation_results.json')
+    # cls=NumpyJSONEncoder を追加してカスタムエンコーダを指定
+    with open(json_path, 'w') as f:
+        json.dump(results, f, indent=2, cls=NumpyJSONEncoder)
+    print(f"[INFO] Results saved to: {json_path}")
+    
+    # Save CSV summary
+    csv_path = os.path.join(output_dir, 'results_summary.csv')
+    save_results_csv(results, csv_path)
+    
+    # Save detailed text report
+    report_path = os.path.join(output_dir, 'evaluation_report.txt')
+    save_text_report(results, report_path)
+    
+    print(f"[INFO] ✅ All results saved to: {output_dir}")
+
+
+def save_results_csv(results: Dict[str, Any], csv_path: str):
+    """Save results as CSV file"""
+    
+    if 'categories' not in results:
         return
     
-    # Apply PCA
-    embeddings_np = np.array(all_embeddings)
-    pca = PCA(n_components=2)
-    embeddings_2d = pca.fit_transform(embeddings_np)
+    data = []
+    config = get_dataset_config(results['dataset'])
     
-    # Create plot
-    plt.figure(figsize=(12, 8))
-    
-    # Plot points by type
-    for point_type in ['query', 'target', 'prediction']:
-        mask = np.array(all_types) == point_type
-        if not np.any(mask):
-            continue
-            
-        x = embeddings_2d[mask, 0]
-        y = embeddings_2d[mask, 1]
-        cats = np.array(all_categories)[mask]
+    # Category results
+    for cat_id in sorted(results['categories'].keys()):
+        cat_result = results['categories'][cat_id]
+        cat_name = config['category_names'].get(cat_id, f"Category_{cat_id}")
         
-        if point_type == 'query':
-            marker, label = 'o', '● Query items'
-            size, alpha = 150, 0.8
-        elif point_type == 'target':
-            marker, label = '^', '▲ Target items'
-            size, alpha = 150, 0.8
-        else:  # prediction
-            marker, label = 'x', '✕ Predictions'
-            size, alpha = 200, 1.0
-        
-        # Color by category
-        for cat in range(min_cat, max_cat + 1):
-            cat_mask = cats == cat
-            if np.any(cat_mask):
-                color = colors[(cat - min_cat) % len(colors)]
-                plt.scatter(x[cat_mask], y[cat_mask], c=[color], marker=marker, 
-                           s=size, alpha=alpha, edgecolors='black', linewidth=1)
-    
-    plt.title(f"{dataset_type} PCA Embedding Space", fontsize=14, fontweight='bold')
-    plt.xlabel(f"PC1 (explained variance: {pca.explained_variance_ratio_[0]:.2%})")
-    plt.ylabel(f"PC2 (explained variance: {pca.explained_variance_ratio_[1]:.2%})")
-    plt.grid(True, alpha=0.3)
-    
-    # Create legend
-    legend_elements = [
-        plt.scatter([], [], marker="o", c="black", s=150, label="● Query items"),
-        plt.scatter([], [], marker="^", c="black", s=150, label="▲ Target items"),
-        plt.scatter([], [], marker="x", c="black", s=200, label="✕ Predictions"),
-    ]
-    plt.legend(handles=legend_elements, loc='upper right', fontsize=10)
-    
-    plt.tight_layout()
-    pca_path = os.path.join(output_dir, f"{dataset_type.lower()}_pca_embedding.png")
-    plt.savefig(pca_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    print(f"[INFO] PCA visualization saved → {pca_path}")
-
-def create_quantitative_results_table(metrics, output_dir, dataset_type):
-    """K%ベースの結果表を作成"""
-    print(f"[INFO] Creating percentage-based results table for {dataset_type}")
-    
-    config = DATASET_CONFIGS[dataset_type]
-    category_names = config['category_names']
-    
-    # Prepare table data
-    table_data = []
-    
-    # Add category rows
-    for cat_id in sorted(metrics['categories'].keys()):
-        cat_metrics = metrics['categories'][cat_id]
-        cat_name = category_names.get(cat_id, f'Category {cat_id}')
-        
-        table_data.append({
-            'Category': f"{cat_id}",
-            'Name': cat_name[:15] + "..." if len(cat_name) > 15 else cat_name,
-            'Count': cat_metrics['count'],
-            'MRR': f"{cat_metrics['mrr']:.3f}",
-            'Top1%': f"{cat_metrics['top1_pct']:.3f}",
-            'Top3%': f"{cat_metrics['top3_pct']:.3f}",
-            'Top5%': f"{cat_metrics['top5_pct']:.3f}",
-            'Top10%': f"{cat_metrics['top10_pct']:.3f}",
-            'Top20%': f"{cat_metrics['top20_pct']:.3f}",
-            'AvgPercentile': f"{cat_metrics['avg_percentile_rank']:.1f}%"
+        # ▼▼▼▼▼▼▼▼▼▼【ここから修正】▼▼▼▼▼▼▼▼▼▼
+        # CSVのヘッダーと使用するキーを新しい形式に統一
+        data.append({
+            'Category_ID': cat_id,
+            'Category_Name': cat_name,
+            'Query_Count': cat_result.get('count', 0),
+            'Gallery_Size': cat_result.get('gallery_size', 0),
+            'MRR': cat_result.get('mrr', 0),
+            'R@1': cat_result.get('r_at_1', 0),
+            'R@5': cat_result.get('r_at_5', 0),
+            'R@10': cat_result.get('r_at_10', 0),
+            'MnR': cat_result.get('mnr', 0),
+            'MdR': cat_result.get('mdr', 0),
+            'Rsum': cat_result.get('rsum', 0)
         })
+        # ▲▲▲▲▲▲▲▲▲▲【ここまで修正】▲▲▲▲▲▲▲▲▲▲
     
-    # Add overall row
-    overall = metrics['overall']
-    table_data.append({
-        'Category': 'Overall',
-        'Name': 'All Categories',
-        'Count': overall['total_queries'],
-        'MRR': f"{overall['mrr']:.3f}",
-        'Top1%': f"{overall['top1_pct']:.3f}",
-        'Top3%': f"{overall['top3_pct']:.3f}",
-        'Top5%': f"{overall['top5_pct']:.3f}",
-        'Top10%': f"{overall['top10_pct']:.3f}",
-        'Top20%': f"{overall['top20_pct']:.3f}",
-        'AvgPercentile': f"{overall['avg_percentile_rank']:.1f}%"
+    # Overall results
+    overall = results['overall']
+    # ▼▼▼▼▼▼▼▼▼▼【ここから修正】▼▼▼▼▼▼▼▼▼▼
+    # CSVのヘッダーと使用するキーを新しい形式に統一
+    data.append({
+        'Category_ID': 'Overall',
+        'Category_Name': 'All Categories',
+        'Query_Count': overall.get('total_queries', 0),
+        'Gallery_Size': sum(results['categories'][cat].get('gallery_size', 0) for cat in results['categories']),
+        'MRR': overall.get('mrr', 0),
+        'R@1': overall.get('r_at_1', 0),
+        'R@5': overall.get('r_at_5', 0),
+        'R@10': overall.get('r_at_10', 0),
+        'MnR': overall.get('mnr', 0),
+        'MdR': overall.get('mdr', 0),
+        'Rsum': overall.get('rsum', 0)
     })
+    # ▲▲▲▲▲▲▲▲▲▲【ここまで修正】▲▲▲▲▲▲▲▲▲▲
     
-    # Save as CSV
-    df = pd.DataFrame(table_data)
-    csv_path = os.path.join(output_dir, f"{dataset_type.lower()}_percentage_results.csv")
+    # Create and save DataFrame
+    df = pd.DataFrame(data)
     df.to_csv(csv_path, index=False)
-    
-    # Create formatted text table
-    table_path = os.path.join(output_dir, f"{dataset_type.lower()}_percentage_table.txt")
-    
-    with open(table_path, 'w', encoding='utf-8') as f:
-        f.write(f"📊 **{dataset_type} Percentage-Based Results (Top-K%)**\n")
-        f.write("=" * 100 + "\n\n")
-        
-        # Header
-        f.write(f"{'Category':<10} {'Name':<20} {'Count':<8} {'MRR':<8} {'Top1%':<8} {'Top3%':<8} {'Top5%':<8} {'Top10%':<8} {'Top20%':<8} {'AvgPct':<8}\n")
-        f.write("-" * 100 + "\n")
-        
-        # Category rows
-        for _, row in df.iterrows():
-            f.write(f"{row['Category']:<10} {row['Name']:<20} {row['Count']:<8} {row['MRR']:<8} "
-                   f"{row['Top1%']:<8} {row['Top3%']:<8} {row['Top5%']:<8} {row['Top10%']:<8} {row['Top20%']:<8} {row['AvgPercentile']:<8}\n")
-        
-        f.write("\n" + "=" * 100 + "\n")
-        f.write(f"Dataset: {dataset_type}\n")
-        f.write(f"Total Queries: {overall['total_queries']}\n")
-        f.write(f"Categories: {len(metrics['categories'])}\n")
-        f.write(f"Evaluation Method: Percentage-based (Top-K% of gallery)\n")
-        f.write(f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-    
-    print(f"[INFO] Percentage-based results saved:")
-    print(f"  - CSV: {csv_path}")
-    print(f"  - Table: {table_path}")
-    
-    return df
+    print(f"[INFO] CSV summary saved to: {csv_path}")
 
-def create_comprehensive_report(metrics, output_dir, dataset_type):
-    """Create comprehensive evaluation report"""
-    report_path = os.path.join(output_dir, f"{dataset_type.lower()}_comprehensive_report.txt")
+
+def save_text_report(results: Dict[str, Any], report_path: str):
+    """Save detailed text report"""
     
     with open(report_path, 'w', encoding='utf-8') as f:
-        f.write("=" * 80 + "\n")
-        f.write(f"🎯 COMPREHENSIVE EVALUATION REPORT - {dataset_type}\n")
-        f.write("=" * 80 + "\n\n")
+        f.write("SET RETRIEVAL EVALUATION REPORT\n")
+        f.write("=" * 50 + "\n\n")
         
-        f.write(f"Dataset: {dataset_type}\n")
-        f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"Total Queries: {metrics['overall']['total_queries']}\n")
-        f.write(f"Categories Evaluated: {len(metrics['categories'])}\n\n")
+        f.write(f"Dataset: {results.get('dataset', 'N/A')}\n")
+        f.write(f"Evaluation Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
         
-        # Overall performance
-        f.write("📊 OVERALL PERFORMANCE\n")
-        f.write("-" * 40 + "\n")
-        overall = metrics['overall']
-        f.write(f"Mean Reciprocal Rank (MRR): {overall['mrr']:.3f}\n")
-        f.write(f"Top-1 Accuracy: {overall['top1_acc']:.3f} ({overall['top1_acc']*100:.1f}%)\n")
-        f.write(f"Top-5 Accuracy: {overall['top5_acc']:.3f} ({overall['top5_acc']*100:.1f}%)\n")
-        f.write(f"Top-10 Accuracy: {overall['top10_acc']:.3f} ({overall['top10_acc']*100:.1f}%)\n")
-        f.write(f"Top-20 Accuracy: {overall['top20_acc']:.3f} ({overall['top20_acc']*100:.1f}%)\n\n")
+        # Overall results
+        overall = results.get('overall', {})
+        f.write("OVERALL RESULTS\n")
+        f.write("-" * 20 + "\n")
+        total_queries = overall.get('total_queries', 0)
+        successful_predictions = overall.get('successful_predictions', 0)
+        failed_predictions = overall.get('failed_predictions', 0)
         
-        # Category breakdown
-        f.write("📈 CATEGORY BREAKDOWN\n")
-        f.write("-" * 40 + "\n")
-        config = DATASET_CONFIGS[dataset_type]
-        category_names = config['category_names']
+        f.write(f"Total Queries: {total_queries:,}\n")
+        f.write(f"Successful Predictions: {successful_predictions:,}\n")
+        if (total_queries + failed_predictions) > 0:
+             success_rate = successful_predictions / (total_queries + failed_predictions)
+             f.write(f"Success Rate: {success_rate:.1%}\n\n")
         
-        for cat_id in sorted(metrics['categories'].keys()):
-            cat_metrics = metrics['categories'][cat_id]
-            cat_name = category_names.get(cat_id, f'Category {cat_id}')
+        f.write("METRICS\n")
+        f.write("-" * 10 + "\n")
+        # ▼▼▼▼▼▼▼▼▼▼【ここから修正】▼▼▼▼▼▼▼▼▼▼
+        # 新しいキー名と表示形式に統一
+        f.write(f"R@1 : {overall.get('r_at_1', 0):.2%}\n")
+        f.write(f"R@5 : {overall.get('r_at_5', 0):.2%}\n")
+        f.write(f"R@10: {overall.get('r_at_10', 0):.2%}\n")
+        f.write(f"MnR : {overall.get('mnr', 0):.2f}\n")
+        f.write(f"MdR : {overall.get('mdr', 0):.2f}\n")
+        f.write(f"Rsum: {overall.get('rsum', 0):,.0f}\n")
+        f.write(f"MRR : {overall.get('mrr', 0):.4f}\n\n")
+        # ▲▲▲▲▲▲▲▲▲▲【ここまで修正】▲▲▲▲▲▲▲▲▲▲
+        
+        # Category results
+        if 'categories' in results:
+            f.write("CATEGORY-WISE RESULTS\n")
+            f.write("-" * 25 + "\n")
             
-            f.write(f"\nCategory {cat_id}: {cat_name}\n")
-            f.write(f"  Queries: {cat_metrics['count']}\n")
-            f.write(f"  MRR: {cat_metrics['mrr']:.3f}\n")
-            f.write(f"  Top-1: {cat_metrics['top1_acc']:.3f} ({cat_metrics['top1_acc']*100:.1f}%)\n")
-            f.write(f"  Top-5: {cat_metrics['top5_acc']:.3f} ({cat_metrics['top5_acc']*100:.1f}%)\n")
-            f.write(f"  Top-10: {cat_metrics['top10_acc']:.3f} ({cat_metrics['top10_acc']*100:.1f}%)\n")
-            f.write(f"  Top-20: {cat_metrics['top20_acc']:.3f} ({cat_metrics['top20_acc']*100:.1f}%)\n")
+            config = get_dataset_config(results.get('dataset', 'N/A'))
+            
+            for cat_id in sorted(results['categories'].keys()):
+                cat_result = results['categories'][cat_id]
+                cat_name = config['category_names'].get(cat_id, f"Category_{cat_id}")
+                
+                f.write(f"\nCategory {cat_id}: {cat_name}\n")
+                f.write(f"  Queries: {cat_result.get('count', 0):,}\n")
+                f.write(f"  Gallery Size: {cat_result.get('gallery_size', 0):,}\n")
+                # ▼▼▼▼▼▼▼▼▼▼【ここから修正】▼▼▼▼▼▼▼▼▼▼
+                f.write(f"  MRR : {cat_result.get('mrr', 0):.4f}\n")
+                f.write(f"  R@1 : {cat_result.get('r_at_1', 0):.2%}\n")
+                f.write(f"  R@5 : {cat_result.get('r_at_5', 0):.2%}\n")
+                f.write(f"  R@10: {cat_result.get('r_at_10', 0):.2%}\n")
+                f.write(f"  MnR : {cat_result.get('mnr', 0):.2f}\n")
+                f.write(f"  MdR : {cat_result.get('mdr', 0):.2f}\n")
+                f.write(f"  Rsum: {cat_result.get('rsum', 0):,.0f}\n")
+                # ▲▲▲▲▲▲▲▲▲▲【ここまで修正】▲▲▲▲▲▲▲▲▲▲
         
-        f.write("\n" + "=" * 80 + "\n")
-        f.write("📁 Generated Files:\n")
-        f.write(f"  - Quantitative Results: {dataset_type.lower()}_quantitative_results.csv\n")
-        f.write(f"  - Results Table: {dataset_type.lower()}_results_table.txt\n")
-        f.write(f"  - Retrieval Collages: *_collage.jpg\n")
-        f.write(f"  - PCA Embeddings: {dataset_type.lower()}_pca_embedding.png\n")
-        f.write("=" * 80 + "\n")
+        # Evaluation info
+        if 'evaluation_info' in results:
+            eval_info = results['evaluation_info']
+            f.write(f"\nEVALUATION INFO\n")
+            f.write("-" * 20 + "\n")
+            f.write(f"Total Test Items: {eval_info.get('total_test_items', 0):,}\n")
+            f.write(f"Total Gallery Items: {eval_info.get('total_gallery_items', 0):,}\n")
+            f.write(f"Categories Evaluated: {eval_info.get('categories_evaluated', 0)}\n")
     
-    print(f"[INFO] Comprehensive report saved → {report_path}")
+    print(f"[INFO] Detailed report saved to: {report_path}")
 
-# Legacy compatibility function
-def compute_global_rank(model, test_generator, output_dir="output", 
-                       checkpoint_path=None, hard_negative_threshold=0.9,
-                       top_k_values=[5, 10, 20], 
-                       top_k_percentages=[5, 10, 20],
-                       combine_directions=True, enable_visualization=False,
-                       dataset_type=None):
-    """Legacy function - redirects to main pipeline"""
-    print("[INFO] Redirecting to comprehensive evaluation pipeline...")
-    return main_evaluation_pipeline(
-        model=model,
-        test_generator=test_generator,
-        output_dir=output_dir,
-        checkpoint_path=checkpoint_path,
-        hard_negative_threshold=hard_negative_threshold,
-        top_k_percentages=top_k_percentages,
-        combine_directions=combine_directions,
-        enable_visualization=enable_visualization
-    )
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+def save_results(results: Dict[str, Any], output_dir: str):
+    """Main function to save all results"""
+    save_evaluation_results(results, output_dir)
+
+
+def normalize_features(features):
+    """L2 normalize features"""
+    if isinstance(features, tf.Tensor):
+        norm = tf.norm(features, axis=-1, keepdims=True)
+        norm = tf.where(norm == 0, 1e-9, norm)
+        return features / norm
+    else:
+        norm = np.linalg.norm(features, axis=-1, keepdims=True)
+        norm[norm == 0] = 1e-9
+        return features / norm
+
+
+def compute_similarity_matrix(features1, features2):
+    """Compute similarity matrix between two feature sets"""
+    # Normalize features
+    features1_norm = normalize_features(features1)
+    features2_norm = normalize_features(features2)
+    
+    # Compute cosine similarity
+    if isinstance(features1, tf.Tensor):
+        similarities = tf.matmul(features1_norm, features2_norm, transpose_b=True)
+    else:
+        similarities = np.dot(features1_norm, features2_norm.T)
+    
+    return similarities
+
+
+def get_top_k_indices(similarities, k: int):
+    """Get top-k indices from similarity matrix"""
+    if isinstance(similarities, tf.Tensor):
+        _, top_k_indices = tf.nn.top_k(similarities, k=k)
+        return top_k_indices.numpy()
+    else:
+        return np.argsort(similarities, axis=-1)[:, -k:][:, ::-1]
+
+
+# =============================================================================
+# Performance Analysis
+# =============================================================================
+
+def analyze_performance_by_set_size(results: Dict[str, Any], test_items: List) -> Dict[str, Any]:
+    """Analyze performance by set size"""
+    
+    print("[INFO] Analyzing performance by set size...")
+    
+    # Group results by set size
+    size_groups = defaultdict(list)
+    
+    for item in test_items:
+        query_size = np.sum(item['query_categories'] > 0)
+        target_size = np.sum(item['target_categories'] > 0)
+        avg_size = (query_size + target_size) / 2
+        
+        # Group by size ranges
+        if avg_size <= 3:
+            size_groups['Small (≤3)'].append(item)
+        elif avg_size <= 6:
+            size_groups['Medium (4-6)'].append(item)
+        else:
+            size_groups['Large (≥7)'].append(item)
+    
+    # Compute metrics for each group
+    size_analysis = {}
+    for size_name, items in size_groups.items():
+        size_analysis[size_name] = {
+            'count': len(items),
+            'avg_query_size': np.mean([np.sum(item['query_categories'] > 0) for item in items]),
+            'avg_target_size': np.mean([np.sum(item['target_categories'] > 0) for item in items])
+        }
+    
+    return size_analysis
+
+
+def create_performance_visualization(results: Dict[str, Any], output_dir: str):
+    """Create performance visualization charts"""
+    
+    try:
+        import matplotlib.pyplot as plt
+        
+        # Create category performance chart
+        if 'categories' in results:
+            categories = results['categories']
+            cat_ids = sorted(categories.keys())
+            
+            metrics = ['top1', 'top5', 'top10', 'mrr']
+            metric_names = ['Top-1', 'Top-5', 'Top-10', 'MRR']
+            
+            fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+            axes = axes.flatten()
+            
+            for i, (metric, name) in enumerate(zip(metrics, metric_names)):
+                values = [categories[cat_id][metric] for cat_id in cat_ids]
+                axes[i].bar(cat_ids, values)
+                axes[i].set_title(f'{name} by Category')
+                axes[i].set_xlabel('Category ID')
+                axes[i].set_ylabel(name)
+                axes[i].grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            viz_path = os.path.join(output_dir, 'performance_by_category.png')
+            plt.savefig(viz_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            
+            print(f"[INFO] Performance visualization saved: {viz_path}")
+            
+    except ImportError:
+        print("[WARN] Matplotlib not available, skipping visualization")
+
+
+# =============================================================================
+# Testing and Validation
+# =============================================================================
+
+def validate_evaluation_pipeline(sample_size: int = 100):
+    """Validate evaluation pipeline with synthetic data"""
+    
+    print(f"[INFO] 🧪 Validating evaluation pipeline with {sample_size} samples...")
+    
+    # Create synthetic model and data
+    from models import create_model
+    
+    model_config = {
+        'feature_dim': 512,
+        'num_heads': 2,
+        'num_layers': 1,
+        'num_categories': 7,
+        'hidden_dim': 512
+    }
+    
+    model = create_model(model_config)
+    
+    # Create synthetic test data
+    test_items = []
+    for i in range(sample_size):
+        test_items.append({
+            'query_features': np.random.randn(10, 512).astype(np.float32),
+            'query_categories': np.random.randint(1, 8, (10,)).astype(np.int32),
+            'target_features': np.random.randn(10, 512).astype(np.float32),
+            'target_categories': np.random.randint(1, 8, (10,)).astype(np.int32),
+            'query_ids': np.arange(10).astype(str),
+            'target_ids': np.arange(10, 20).astype(str)
+        })
+    
+    # Create synthetic gallery
+    gallery_by_category = {}
+    for cat_id in range(1, 8):
+        gallery_by_category[cat_id] = {
+            'ids': np.array([f"item_{i}" for i in range(100)]),
+            'features': np.random.randn(100, 512).astype(np.float32)
+        }
+    
+    # Run evaluation
+    try:
+        results = evaluate_model_comprehensive(model, test_items, gallery_by_category, 'IQON3000')
+        
+        if results and 'overall' in results:
+            print("[INFO] ✅ Evaluation pipeline validation passed")
+            print(f"[INFO] Sample results - MRR: {results['overall']['mrr']:.4f}")
+            return True
+        else:
+            print("[ERROR] ❌ Evaluation pipeline validation failed - no results")
+            return False
+            
+    except Exception as e:
+        print(f"[ERROR] ❌ Evaluation pipeline validation failed: {e}")
+        return False
+
+
+if __name__ == "__main__":
+    # Test the evaluation pipeline
+    print("Set Retrieval Utils - WACV 2026")
+    print("=" * 40)
+    
+    # Setup GPU
+    setup_gpu_memory()
+    
+    # Validate pipeline
+    validate_evaluation_pipeline()
+    
+    print("Utils module ready for use!")

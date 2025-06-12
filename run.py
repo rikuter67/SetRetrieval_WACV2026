@@ -1,427 +1,390 @@
 #!/usr/bin/env python3
 """
-SetRetrieval - Strategy-Compatible GPU Version
-Properly handles TensorFlow distribution strategies to avoid conflicts
+run.py - Correct Set Retrieval Training Script
+===============================================
+Query set → Target set prediction with gallery evaluation
 """
 
-import argparse
 import os
 import sys
-import logging
-import time
-import gc
-from pathlib import Path
-
-# Environment setup - let TensorFlow handle GPU selection
-os.environ.update({
-    'TF_CPP_MIN_LOG_LEVEL': '2',
-    'PYTHONWARNINGS': 'ignore',
-})
-
-import numpy as np
-import tensorflow as tf
-from tensorflow.keras.callbacks import ReduceLROnPlateau, ModelCheckpoint, EarlyStopping
-
-print("🔧 TensorFlow GPU Strategy setup...")
-
-def setup_strategy():
-    """Setup appropriate strategy for training"""
-    gpus = tf.config.list_physical_devices('GPU')
-    if gpus:
-        try:
-            # Enable memory growth to avoid OOM
-            for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
-            
-            # Use first GPU with OneDeviceStrategy
-            strategy = tf.distribute.OneDeviceStrategy("/gpu:0")
-            print(f"✅ Using GPU strategy: {gpus[0]}")
-            return strategy, True
-        except Exception as e:
-            print(f"⚠️ GPU setup failed: {e}, falling back to CPU")
-            return tf.distribute.get_strategy(), False
-    else:
-        print("❌ No GPU found, using CPU")
-        return tf.distribute.get_strategy(), False
-
-# Setup global strategy
-STRATEGY, GPU_AVAILABLE = setup_strategy()
-
 import warnings
 warnings.filterwarnings('ignore')
 
-tf.random.set_seed(42)
-np.random.seed(42)
+# Suppress TensorFlow warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['CUDA_VISIBLE_DEVICES'] = os.environ.get('CUDA_VISIBLE_DEVICES', '0')
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
-from data_generator import DataGenerator
-from models import SetRetrievalModel
-from util import main_evaluation_pipeline
+import argparse
+import json
+import pickle
+import gzip
+from datetime import datetime
+import time
 
-# Dataset configuration
-DATASET_CONFIG = {
-    'DeepFurniture': {'feature_dim': 512, 'num_categories': 11, 'data_dir': 'datasets/DeepFurniture'},
-    'IQON3000': {'feature_dim': 512, 'num_categories': 7, 'data_dir': 'datasets/IQON3000'}
-}
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 
-class SimpleCallback(tf.keras.callbacks.Callback):
-    """Memory management callback"""
-    
-    def on_epoch_end(self, epoch, logs=None):
-        if epoch % 5 == 0:
-            gc.collect()
+# Suppress TF warnings
+tf.get_logger().setLevel('ERROR')
 
-def parse_args() -> argparse.Namespace:
-    """Parse command line arguments"""
-    parser = argparse.ArgumentParser(description="SetRetrieval Framework - Strategy Compatible")
-    
-    parser.add_argument('--dataset', type=str, required=True, choices=['DeepFurniture', 'IQON3000'])
-    parser.add_argument('--mode', choices=['train', 'test'], default='train')
-    parser.add_argument('--data-dir', type=str, default=None)
-    parser.add_argument('--batch-size', type=int, default=64)
-    parser.add_argument('--embedding-dim', type=int, default=None)
-    parser.add_argument('--num-layers', type=int, default=4)
-    parser.add_argument('--num-heads', type=int, default=4)
-    parser.add_argument('--ff-dim', type=int, default=None)
-    parser.add_argument('--dropout', type=float, default=0.1)
-    parser.add_argument('--epochs', type=int, default=15)
-    parser.add_argument('--learning-rate', type=float, default=1e-4)
-    parser.add_argument('--patience', type=int, default=7)
-    parser.add_argument('--use-cycle-loss', action='store_true')
-    parser.add_argument('--cycle-lambda', type=float, default=0.2)
-    parser.add_argument('--use-clneg-loss', action='store_true')
-    parser.add_argument('--use-center-base', action='store_true')
-    parser.add_argument('--neg-num', type=int, default=10)
-    parser.add_argument('--output-dir', type=str, default=None)
-    parser.add_argument('--experiment-name', type=str, default=None)
-    parser.add_argument('--weights-path', type=str, default=None)
-    parser.add_argument('--verbose', action='store_true')
-    
-    return parser.parse_args()
+from models import create_model, contrastive_loss_with_negatives
+from util import evaluate_model
 
-def setup_logging(output_dir: Path, verbose: bool = False):
-    """Setup logging"""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level, 
-        format='%(asctime)s - %(levelname)s - %(message)s', 
-        handlers=[
-            logging.FileHandler(output_dir / 'training.log'), 
-            logging.StreamHandler(sys.stdout)
-        ]
-    )
 
-def create_output_dir(args: argparse.Namespace) -> Path:
-    """Create output directory"""
-    if args.output_dir:
-        return Path(args.output_dir)
-    
-    if args.experiment_name:
-        exp_name = args.experiment_name
-    else:
-        components = [f"B{args.batch_size}", f"L{args.num_layers}", f"H{args.num_heads}"]
-        if args.use_center_base: components.append("CB")
-        if args.use_clneg_loss: components.append("CLNeg")
-        if GPU_AVAILABLE: components.append("GPU")
-        exp_name = "_".join(components)
-    
-    return Path("experiments") / args.dataset / exp_name
-
-def prepare_data_generators(args: argparse.Namespace):
-    """Prepare data generators"""
-    data_dir = Path(args.data_dir or DATASET_CONFIG[args.dataset]['data_dir'])
-    if not data_dir.exists():
-        raise FileNotFoundError(f"Data directory not found: {data_dir}")
-    
-    required_files = ['train.pkl', 'validation.pkl', 'test.pkl', 'category_centers.pkl.gz']
-    for filename in required_files:
-        if not (data_dir / filename).exists():
-            raise FileNotFoundError(f"Required file not found: {data_dir / filename}")
-    
-    logging.info(f"Loading data from {data_dir}")
-    start_time = time.time()
-    
-    use_negatives = args.use_clneg_loss
-    neg_num = args.neg_num if use_negatives else 0
-    
-    if use_negatives:
-        print("✓ CLNeg loss enabled")
-    else:
-        print("✓ CLNeg loss disabled - memory savings")
-    
-    generators = {}
-    for split in ['train', 'validation', 'test']:
-        generators[split] = DataGenerator(
-            str(data_dir / f'{split}.pkl'), 
-            batch_size=args.batch_size, 
-            shuffle=(split == 'train'), 
-            seed=42, 
-            center_path=str(data_dir / 'category_centers.pkl.gz'), 
-            dataset_name=args.dataset,
-            neg_num=neg_num,
-            use_negatives=use_negatives
-        )
-    
-    train_gen, val_gen, test_gen = generators['train'], generators['validation'], generators['test']
-    
-    load_time = time.time() - start_time
-    logging.info(f"Data loaded in {load_time:.2f}s")
-    
-    return train_gen, val_gen, test_gen
-
-def create_model(args: argparse.Namespace, train_gen: DataGenerator):
-    """Create model within strategy scope"""
-    dataset_config = DATASET_CONFIG[args.dataset]
-    
-    actual_feature_dim = train_gen.feature_dim
-    embedding_dim = args.embedding_dim or actual_feature_dim
-    ff_dim = args.ff_dim or embedding_dim
-    
-    device_info = "GPU" if GPU_AVAILABLE else "CPU"
-    print(f"🔧 Creating model on {device_info}...")
-    
-    # Create model within strategy scope
-    with STRATEGY.scope():
-        model = SetRetrievalModel(
-            dim=embedding_dim, 
-            num_layers=args.num_layers, 
-            num_heads=args.num_heads, 
-            ff_dim=ff_dim,
-            cycle_lambda=args.cycle_lambda, 
-            use_cycle_loss=args.use_cycle_loss, 
-            use_CLNeg_loss=args.use_clneg_loss,
-            use_center_base=args.use_center_base, 
-            num_categories=dataset_config['num_categories'], 
-            dropout_rate=args.dropout
-        )
-        
-        if train_gen.cluster_centers is not None:
-            model.set_cluster_center(train_gen.cluster_centers)
-            logging.info(f"Set cluster centers: {train_gen.cluster_centers.shape}")
-        
-        print("Building model...")
-        # Build model with proper input shape
-        dummy_input = tf.zeros((args.batch_size, train_gen.max_item_num, embedding_dim))
-        _ = model.forward_pass(dummy_input)
-        
-        # For test mode, also build the full call method
-        if args.mode == 'test':
-            print("Building full model for test mode...")
-            dummy_batch = next(iter(train_gen))
-            _ = model(dummy_batch[0], training=False)
-            
-        print("✅ Model built successfully")
-        
-        # Create optimizer within strategy scope
-        optimizer = tf.keras.optimizers.Adam(
-            learning_rate=args.learning_rate,
-            clipnorm=1.0
-        )
-        
-        model.compile(optimizer=optimizer, run_eagerly=False)
-    
-    logging.info(f"Model: {embedding_dim}D, {args.num_layers}L, {args.num_heads}H")
-    model.display_parameter_summary()
-    
-    return model
-
-def train_model(model: SetRetrievalModel, train_gen: DataGenerator, val_gen: DataGenerator, args: argparse.Namespace, output_dir: Path):
-    """Train model with strategy"""
-    checkpoint_path = output_dir / 'checkpoints' / 'best_model.weights.h5'
-    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    monitor_metric = 'val_val_top1_acc'
-    
-    device_info = "GPU" if GPU_AVAILABLE else "CPU"
-    logging.info(f"Training on {device_info} for {args.epochs} epochs")
-    logging.info(f"Batch size: {args.batch_size}")
-    
-    simple_callback = SimpleCallback()
-    
-    callbacks = [
-        ModelCheckpoint(
-            str(checkpoint_path), 
-            monitor=monitor_metric, 
-            save_best_only=True, 
-            save_weights_only=True, 
-            mode='max', 
-            verbose=1
-        ),
-        ReduceLROnPlateau(
-            monitor=monitor_metric, 
-            factor=0.7, 
-            patience=args.patience, 
-            min_lr=1e-6, 
-            verbose=1, 
-            mode='max'
-        ),
-        EarlyStopping(
-            monitor=monitor_metric, 
-            patience=args.patience * 2, 
-            mode='max', 
-            verbose=1, 
-            restore_best_weights=True
-        ),
-        simple_callback
-    ]
-    
-    print(f"🚀 Starting training on {device_info}...")
-    start_time = time.time()
-    
-    try:
-        # Train model - strategy handles device placement automatically
-        history = model.fit(
-            train_gen,
-            validation_data=val_gen,
-            epochs=args.epochs,
-            callbacks=callbacks,
-            verbose=1
-        )
-        
-        print(f"✅ Training completed on {device_info}")
-        
-    except Exception as e:
-        print(f"❌ Training failed: {e}")
-        logging.error(f"Training error: {e}")
-        raise
-    
-    training_time = time.time() - start_time
-    logging.info(f"Training completed in {training_time:.2f}s on {device_info}")
-    
-    # Display results
-    if history.history:
-        final_top1 = history.history.get('train_top1_acc', [0])[-1]
-        val_top1 = history.history.get('val_val_top1_acc', [0])[-1]
-        best_val_top1 = max(history.history.get('val_val_top1_acc', [0]))
-        
-        print(f"\n{'='*60}")
-        print(f"TRAINING RESULTS ({device_info})")
-        print(f"{'='*60}")
-        print(f"Final Train Top-1: {final_top1:.3f} ({final_top1*100:.1f}%)")
-        print(f"Final Val Top-1: {val_top1:.3f} ({val_top1*100:.1f}%)")
-        print(f"Best Val Top-1: {best_val_top1:.3f} ({best_val_top1*100:.1f}%)")
-        print(f"{'='*60}")
-    
-    return history
-
-def test_model(model: SetRetrievalModel, test_gen: DataGenerator, args: argparse.Namespace, output_dir: Path):
-    """Test model with improved error handling"""
-    weights_path = Path(args.weights_path) if args.weights_path else output_dir / 'checkpoints' / 'best_model.weights.h5'
-    
-    if not weights_path.exists():
-        logging.error(f"Weights not found: {weights_path}")
-        return False
-    
-    # Build model completely
-    try:
-        input_shape = (args.batch_size, test_gen.max_item_num, test_gen.feature_dim)
-        model.build_model_completely(input_shape)
-        logging.info("✅ Model fully built with all layers")
-    except Exception as e:
-        logging.warning(f"build_model_completely failed: {e}, trying alternative method...")
+def setup_gpu():
+    """Setup GPU configuration"""
+    gpus = tf.config.experimental.list_physical_devices('GPU')
+    if gpus:
         try:
-            dummy_batch = next(iter(test_gen))
-            _ = model(dummy_batch[0], training=False)
-            logging.info("✅ Model built via dummy batch")
-        except Exception as e2:
-            logging.error(f"Failed to build model: {e2}")
-            return False
-    
-    # Load weights
-    try:
-        model.load_weights(str(weights_path))
-        logging.info("✅ Weights loaded successfully")
-    except Exception as e:
-        logging.error(f"Failed to load weights: {e}")
-        return False
-    
-    # 🎯 この部分が重要！enhanced util.pyのmain_evaluation_pipelineを呼び出す
-    try:
-        logging.info("🎨 Running enhanced evaluation with DeepFurniture-style visualization...")
-        from util import main_evaluation_pipeline
-        
-        main_evaluation_pipeline(
-            model=model, 
-            test_generator=test_gen, 
-            output_dir=str(output_dir), 
-            checkpoint_path=str(weights_path), 
-            hard_negative_threshold=0.9, 
-            top_k_percentages=[1, 3, 5, 10, 20], 
-            combine_directions=True, 
-            enable_visualization=True  # 必ずTrueに設定
-        )
-        logging.info("✅ Enhanced evaluation completed successfully")
-        return True
-        
-    except Exception as e:
-        logging.error(f"Enhanced evaluation failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            print("🚀 GPU setup completed")
+        except RuntimeError as e:
+            print(f"GPU setup error: {e}")
 
-def save_args(args: argparse.Namespace, output_dir: Path):
-    """Save arguments"""
-    args_file = output_dir / 'args.txt'
-    with open(args_file, 'w') as f:
-        f.write(f"GPU_AVAILABLE: {GPU_AVAILABLE}\n")
-        f.write(f"STRATEGY: {type(STRATEGY).__name__}\n")
-        for key, value in vars(args).items():
-            f.write(f"{key}: {value}\n")
-    logging.info(f"Arguments saved to: {args_file}")
+
+def load_data(dataset_path, split, batch_size):
+    """Load dataset with correct format"""
+    file_path = os.path.join(dataset_path, f'{split}.pkl')
+    
+    try:
+        # Try the tuple format first
+        with open(file_path, 'rb') as f:
+            data_tuple = pickle.load(f)
+        
+        if isinstance(data_tuple, (list, tuple)) and len(data_tuple) >= 5:
+            # Format: (query_features, target_features, scene_ids, query_categories, target_categories)
+            query_features, target_features, query_categories, target_categories = data_tuple[0], data_tuple[1], data_tuple[3], data_tuple[4]
+            print(f"📋 Loaded data tuple format: {len(data_tuple)} elements")
+        else:
+            raise ValueError("Unexpected tuple format")
+            
+    except (EOFError, ValueError, IndexError):
+        try:
+            # Try the sequential format
+            with open(file_path, 'rb') as f:
+                query_features = pickle.load(f)
+                target_features = pickle.load(f)
+                query_categories = pickle.load(f)
+                target_categories = pickle.load(f)
+                query_item_ids = pickle.load(f)
+                target_item_ids = pickle.load(f)
+            print("📋 Loaded sequential pickle format")
+        except EOFError:
+            raise ValueError(f"Could not read pickle file: {file_path}")
+    
+    # Convert to numpy arrays
+    query_features = np.array(query_features, dtype=np.float32)
+    target_features = np.array(target_features, dtype=np.float32)
+    query_categories = np.array(query_categories, dtype=np.int32)
+    target_categories = np.array(target_categories, dtype=np.int32)
+    
+    print(f"📊 Data shapes: query_features={query_features.shape}, target_features={target_features.shape}")
+    print(f"📊 Category shapes: query_categories={query_categories.shape}, target_categories={target_categories.shape}")
+    
+    # Create data dictionary - CORRECT FORMAT FOR CROSS-ATTENTION
+    data = {
+        'query_features': query_features,      # Query set items
+        'query_categories': query_categories,  # Query categories (for reference)
+        'target_features': target_features,    # Target set items (ground truth)
+        'target_categories': target_categories # Target categories (for loss)
+    }
+    
+    # For gallery evaluation, also collect all target items
+    if split == 'test':
+        # Flatten all target items for gallery
+        all_target_items = target_features.reshape(-1, target_features.shape[-1])
+        # Remove zero vectors (padding)
+        valid_mask = np.sum(np.abs(all_target_items), axis=1) > 0
+        all_target_items = all_target_items[valid_mask]
+        
+        return dataset_from_data(data, batch_size, split), len(query_features), all_target_items
+    
+    return dataset_from_data(data, batch_size, split), len(query_features), None
+
+
+def dataset_from_data(data, batch_size, split):
+    """Create TensorFlow dataset from data in the format expected by util.py"""
+    # Create dummy targets for Keras
+    dummy_targets = np.zeros((len(data['query_features']), 1), dtype=np.float32)
+    
+    # Format data as individual tensors (not nested dict) for util.py compatibility
+    dataset = tf.data.Dataset.from_tensor_slices({
+        'query_features': data['query_features'],
+        'query_categories': data['query_categories'],
+        'target_features': data['target_features'],
+        'target_categories': data['target_categories']
+    })
+    
+    # Optimize dataset pipeline
+    if split == 'train':
+        dataset = dataset.shuffle(buffer_size=1000, reshuffle_each_iteration=True)
+    
+    dataset = dataset.batch(batch_size, drop_remainder=True)
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
+    
+    return dataset
+
+
+def detect_num_categories(dataset_path):
+    """Detect number of categories from dataset"""
+    # Try category_info.pkl first
+    category_info_path = os.path.join(dataset_path, 'category_info.pkl')
+    if os.path.exists(category_info_path):
+        try:
+            with open(category_info_path, 'rb') as f:
+                category_info = pickle.load(f)
+            if 'main_categories_def' in category_info:
+                return len(category_info['main_categories_def'])
+        except:
+            pass
+    
+    # Fallback to train.pkl
+    train_path = os.path.join(dataset_path, 'train.pkl')
+    if os.path.exists(train_path):
+        try:
+            # Try tuple format first
+            with open(train_path, 'rb') as f:
+                data_tuple = pickle.load(f)
+            
+            if isinstance(data_tuple, (list, tuple)) and len(data_tuple) >= 5:
+                query_categories, target_categories = data_tuple[3], data_tuple[4]
+            else:
+                raise ValueError("Not tuple format")
+                
+        except (EOFError, ValueError, IndexError):
+            try:
+                # Try sequential format
+                with open(train_path, 'rb') as f:
+                    query_features = pickle.load(f)
+                    target_features = pickle.load(f)
+                    query_categories = pickle.load(f)
+                    target_categories = pickle.load(f)
+            except:
+                return 7  # Default fallback
+        
+        try:
+            all_cats = np.concatenate([
+                np.array(query_categories).flatten(), 
+                np.array(target_categories).flatten()
+            ])
+            max_cat = int(np.max(all_cats[all_cats > 0]))
+            print(f"📊 Detected {max_cat} categories from data")
+            return max_cat
+        except:
+            pass
+    
+    print("📊 Using default 7 categories")
+    return 7
+
 
 def main():
-    """Main function"""
-    args = parse_args()
+    parser = argparse.ArgumentParser(description="Correct Set Retrieval Training")
+    parser.add_argument('--dataset', default='IQON3000', choices=['IQON3000', 'DeepFurniture'])
+    parser.add_argument('--mode', default='train', choices=['train', 'test'])
+    parser.add_argument('--batch-size', type=int, default=64)
+    parser.add_argument('--num-heads', type=int, default=8)
+    parser.add_argument('--num-layers', type=int, default=6)
+    parser.add_argument('--epochs', type=int, default=200)
+    parser.add_argument('--learning-rate', type=float, default=1e-4)
+    parser.add_argument('--temperature', type=float, default=1.0)
+    parser.add_argument('--weight-decay', type=float, default=1e-4)
+    parser.add_argument('--use-cycle-loss', action='store_true')
+    parser.add_argument('--data-dir', default='datasets')
+    parser.add_argument('--output-dir', default=None)
+    parser.add_argument('--model-path', default=None)
     
-    if args.embedding_dim is None:
-        args.embedding_dim = DATASET_CONFIG[args.dataset]['feature_dim']
+    args = parser.parse_args()
     
-    output_dir = create_output_dir(args)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    setup_logging(output_dir, args.verbose)
+    # Setup
+    if args.output_dir is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.output_dir = f"experiments/{args.dataset}/Correct_{timestamp}"
+    os.makedirs(args.output_dir, exist_ok=True)
     
-    device_info = "GPU" if GPU_AVAILABLE else "CPU"
-    logging.info(f"SetRetrieval Framework - {args.mode.upper()} on {device_info}")
-    logging.info(f"Dataset: {args.dataset}, Embedding: {args.embedding_dim}D")
-    logging.info(f"Output: {output_dir}")
-    logging.info(f"Strategy: {type(STRATEGY).__name__}")
+    setup_gpu()
     
-    save_args(args, output_dir)
+    # Dataset
+    dataset_path = os.path.join(args.data_dir, args.dataset)
+    if not os.path.exists(dataset_path):
+        print(f"Error: Dataset not found at {dataset_path}")
+        return 1
     
-    try:
-        # Prepare data
-        train_gen, val_gen, test_gen = prepare_data_generators(args)
+    # Load data
+    print("📊 Loading dataset...")
+    train_data, n_train, _ = load_data(dataset_path, 'train', args.batch_size)
+    val_data, n_val, _ = load_data(dataset_path, 'validation', args.batch_size)
+    test_data, n_test, test_gallery = load_data(dataset_path, 'test', args.batch_size)
+    
+    print(f"📊 Dataset: {args.dataset}")
+    print(f"📈 Train: {n_train:,} | Val: {n_val:,} | Test: {n_test:,}")
+    print(f"🏛️ Test gallery: {test_gallery.shape[0]:,} items" if test_gallery is not None else "")
+    print(f"⚡ Batch size: {args.batch_size}")
+    
+    # Model
+    num_categories = detect_num_categories(dataset_path)
+    model_config = {
+        'feature_dim': 512,
+        'num_heads': args.num_heads,
+        'num_layers': args.num_layers,
+        'num_categories': num_categories,
+        'hidden_dim': 512,
+        'use_cycle_loss': args.use_cycle_loss,
+        'temperature': args.temperature,
+        'dropout_rate': 0.1
+    }
+    
+    model = create_model(model_config)
+    
+    # Load category centers BEFORE building model
+    centers_path = os.path.join(dataset_path, 'category_centers.pkl.gz')
+    if os.path.exists(centers_path):
+        try:
+            with gzip.open(centers_path, 'rb') as f:
+                centers = pickle.load(f)
+            if isinstance(centers, dict):
+                centers_array = np.zeros((num_categories, 512))
+                for cat_id, center in centers.items():
+                    if 1 <= cat_id <= num_categories:
+                        centers_array[cat_id - 1] = center
+                model.set_category_centers(centers_array)
+                print("✅ Category centers loaded and initialized")
+        except Exception as e:
+            print(f"⚠️ Warning: Could not load category centers: {e}")
+            # Initialize with random centers
+            random_centers = np.random.normal(0, 0.02, (num_categories, 512)).astype(np.float32)
+            model.set_category_centers(random_centers)
+            print("🎲 Random category centers initialized")
+    else:
+        # Initialize with random centers if file doesn't exist
+        random_centers = np.random.normal(0, 0.02, (num_categories, 512)).astype(np.float32)
+        model.set_category_centers(random_centers)
+        print("🎲 Random category centers initialized (no file found)")
+    
+    # Build model with dummy data AFTER setting category centers
+    print("🔨 Building model...")
+    dummy_input = {
+        'query_features': tf.random.normal((args.batch_size, 10, 512), dtype=tf.float32),
+        'query_categories': tf.random.uniform((args.batch_size, 10), 1, num_categories + 1, dtype=tf.int32)
+    }
+    _ = model(dummy_input, training=False)
+    
+    total_params = model.count_params()
+    print(f"🚀 Model: {args.num_heads}H-{args.num_layers}L-{num_categories}C | {total_params:,} params")
+    print(f"🎯 Cross-attention: Category centers → Query set")
+    
+    # Training
+    if args.mode == 'train':
+        print(f"\n🎯 Training: {args.epochs} epochs")
+        print(f"💡 Problem: Query set → Target set prediction (cross-attention)")
         
-        # Create model
-        model = create_model(args, train_gen)
+        # Compile model with custom training step
+        print("🔧 Compiling model with custom contrastive loss...")
         
-        if args.mode == 'train':
-            history = train_model(model, train_gen, val_gen, args, output_dir)
-            if history is not None:
-                logging.info("Training completed successfully")
-                logging.info("Running post-training evaluation...")
-                test_model(model, test_gen, args, output_dir)
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(
+                learning_rate=args.learning_rate,
+                weight_decay=args.weight_decay
+            ),
+            run_eagerly=False
+        )
+        
+        # Callbacks
+        callbacks = [
+            EarlyStopping(
+                monitor='val_loss', 
+                patience=15,
+                restore_best_weights=True, 
+                verbose=1
+            ),
+            ReduceLROnPlateau(
+                monitor='val_loss', 
+                factor=0.5,
+                patience=8, 
+                min_lr=1e-6,
+                verbose=1
+            )
+        ]
+        
+        try:
+            print("🔥 Starting training...")
+            start_time = time.time()
+            
+            history = model.fit(
+                train_data,
+                validation_data=val_data,
+                epochs=args.epochs,
+                callbacks=callbacks,
+                verbose=1
+            )
+            
+            total_time = time.time() - start_time
+            print(f"🏁 Training completed in {total_time:.1f}s")
+            
+            # Save model
+            model_path = os.path.join(args.output_dir, 'model.weights.h5')
+            model.save_weights(model_path)
+            
+            with open(os.path.join(args.output_dir, 'model_config.json'), 'w') as f:
+                json.dump(model_config, f, indent=2)
+            
+            print(f"💾 Model saved: {model_path}")
+            
+        except Exception as e:
+            print(f"❌ Training failed: {e}")
+            return 1
+    
+    # Load model for testing
+    if args.model_path:
+        try:
+            model.load_weights(args.model_path)
+            print(f"✅ Model loaded: {args.model_path}")
+        except Exception as e:
+            print(f"❌ Failed to load model: {e}")
+            return 1
+    
+    # Evaluation with comprehensive metrics (using util.py)
+    if args.mode == 'test' or (args.mode == 'train'):
+        print("🔍 Running comprehensive evaluation with gallery...")
+        try:
+            # Use the comprehensive evaluation from util.py
+            results = evaluate_model(model, test_data, args.output_dir)
+            
+            # ▼▼▼▼▼▼▼▼▼▼【ここから修正】▼▼▼▼▼▼▼▼▼▼
+            if results and 'overall' in results:
+                overall = results['overall']
+                print("\n\n==================================================")
+                print("✅ FINAL EVALUATION SUMMARY")
+                print("==================================================")
+                print(f"   R@1 : {overall.get('r_at_1', 0):.2%}")
+                print(f"   R@5 : {overall.get('r_at_5', 0):.2%}")
+                print(f"   R@10: {overall.get('r_at_10', 0):.2%}")
+                print(f"   MnR : {overall.get('mnr', 0):.2f}")
+                print(f"   MdR : {overall.get('mdr', 0):.2f}")
+                print(f"   MRR : {overall.get('mrr', 0):.4f}")
+                print("==================================================")
+                # ▲▲▲▲▲▲▲▲▲▲【ここまで修正】▲▲▲▲▲▲▲▲▲▲
             else:
-                logging.error("Training failed")
-                sys.exit(1)
+                print("⚠️ No evaluation results returned")
                 
-        elif args.mode == 'test':
-            success = test_model(model, test_gen, args, output_dir)
-            if not success:
-                sys.exit(1)
-        
-        logging.info(f"Execution completed successfully on {device_info}!")
-        
-    except KeyboardInterrupt:
-        logging.info("Interrupted by user")
-        gc.collect()
-        sys.exit(0)
-    except Exception as e:
-        logging.error(f"Execution failed: {e}")
-        gc.collect()
-        raise
-    finally:
-        gc.collect()
+        except Exception as e:
+            print(f"❌ Comprehensive evaluation failed: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Fallback to simple evaluation
+            try:
+                print("🔄 Trying simple evaluation...")
+                simple_loss = model.evaluate(test_data, verbose=0)
+                print(f"✅ Test Loss: {simple_loss:.4f}")
+            except Exception as e2:
+                print(f"❌ Simple evaluation also failed: {e2}")
+                return 1
+    
+    return 0
 
-if __name__ == '__main__':
-    main()
+
+if __name__ == "__main__":
+    exit(main())

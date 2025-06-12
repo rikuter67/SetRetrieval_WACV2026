@@ -1,682 +1,481 @@
-# models.py - GPU Strategy Fixed Version
-import os
-import logging
+"""
+models.py - Correct Set Retrieval Model Implementation
+======================================================
+Based on your actual problem setting: Query set → Target set prediction
+with category-wise cross-attention and contrastive learning.
+"""
+
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras.layers import Dense, Dropout, LayerNormalization
+from tensorflow.keras import layers, Model
+from typing import Dict, Any, Optional, Tuple
+import math
 
-# Environment setup - remove CUDA_VISIBLE_DEVICES to avoid conflicts
-tf.random.set_seed(42)
-os.environ.update({
-    'TF_CPP_MIN_LOG_LEVEL': '2',
-    'PYTHONWARNINGS': 'ignore',
-})
 
-# Configure GPU strategy at module level
-def setup_gpu_strategy():
-    """Setup GPU strategy properly"""
-    gpus = tf.config.list_physical_devices('GPU')
-    if gpus:
-        try:
-            # Enable memory growth
-            for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
-            
-            # Use the first available GPU
-            strategy = tf.distribute.OneDeviceStrategy("/gpu:0")
-            print(f"✅ GPU Strategy initialized: {gpus[0]}")
-            return strategy, True
-        except Exception as e:
-            print(f"⚠️ GPU Strategy setup failed: {e}")
-            return tf.distribute.get_strategy(), False
-    else:
-        print("❌ No GPU found, using CPU")
-        return tf.distribute.get_strategy(), False
-
-# Global strategy setup
-STRATEGY, GPU_AVAILABLE = setup_gpu_strategy()
-
-################################################################################
-# 1. Top-K accuracy and ranking metrics
-################################################################################
-@tf.function(experimental_relax_shapes=True)
-def compute_topk_metrics(predicted_vectors, ground_truth_vectors, category_labels, negative_samples=None, k_values=[1, 5, 10]):
+class SetRetrievalModel(Model):
     """
-    Top-K精度とランキングメトリック計算
+    Set Retrieval Model - Correct Implementation
+    
+    Query set → Category-wise Target set prediction
+    with cross-attention and contrastive learning
     """
-    batch_size = tf.shape(predicted_vectors)[0]
     
-    # Handle different input shapes
-    if len(predicted_vectors.shape) == 3 and predicted_vectors.shape[1] >= 7:
-        # (B, C, D) case - select appropriate category predictions
-        max_cat_idx = tf.shape(predicted_vectors)[1] - 1
-        cat_idx = tf.clip_by_value(category_labels - 1, 0, max_cat_idx)
-        batch_indices = tf.range(batch_size)[:, tf.newaxis]
-        pred_selected = tf.gather_nd(predicted_vectors, 
-                                   tf.stack([tf.broadcast_to(batch_indices, tf.shape(cat_idx)),
-                                           cat_idx], axis=-1))
-    else:
-        # (B, N, D) case
-        pred_selected = predicted_vectors
-    
-    # Normalize vectors
-    pred_norm = tf.nn.l2_normalize(pred_selected + 1e-8, axis=-1)
-    gt_norm = tf.nn.l2_normalize(ground_truth_vectors + 1e-8, axis=-1)
-    
-    # Calculate target similarities
-    target_similarities = tf.reduce_sum(pred_norm * gt_norm, axis=-1)  # (B, N)
-    
-    # Create gallery for ranking
-    if negative_samples is not None and tf.reduce_sum(tf.abs(negative_samples)) > 0:
-        # Use negative samples as gallery
-        neg_norm = tf.nn.l2_normalize(negative_samples + 1e-8, axis=-1)  # (B, N, neg_num, D)
-        gallery_similarities = tf.reduce_sum(
-            tf.expand_dims(pred_norm, axis=2) * neg_norm, axis=-1
-        )  # (B, N, neg_num)
+    def __init__(self, 
+                 feature_dim: int = 512,
+                 num_heads: int = 8,
+                 num_layers: int = 6,
+                 num_categories: int = 7,
+                 hidden_dim: int = 512,
+                 use_cycle_loss: bool = False,
+                 temperature: float = 1.0,
+                 dropout_rate: float = 0.1,
+                 **kwargs):
         
-        # Combine target and gallery similarities
-        all_similarities = tf.concat([
-            tf.expand_dims(target_similarities, axis=-1),  # (B, N, 1)
-            gallery_similarities  # (B, N, neg_num)
-        ], axis=-1)  # (B, N, neg_num+1)
-    else:
-        # Use batch items as gallery (exclude self)
-        batch_similarities = tf.matmul(pred_norm, gt_norm, transpose_b=True)  # (B, N, N)
+        super().__init__(**kwargs)
         
-        # Create mask to exclude self-similarities
-        diag_mask = tf.eye(tf.shape(batch_similarities)[-1], dtype=tf.bool)
-        diag_mask = tf.expand_dims(diag_mask, 0)
-        diag_mask = tf.tile(diag_mask, [batch_size, 1, 1])
-        
-        # Set self-similarities to very low value
-        batch_similarities = tf.where(
-            diag_mask, 
-            tf.fill(tf.shape(batch_similarities), -999.0),
-            batch_similarities
-        )
-        
-        # Target similarities are the diagonal elements (before masking)
-        target_sim_diag = tf.linalg.diag_part(tf.matmul(pred_norm, gt_norm, transpose_b=True))  # (B, N)
-        
-        # Combine target and batch similarities
-        all_similarities = tf.concat([
-            tf.expand_dims(target_sim_diag, axis=-1),  # (B, N, 1)
-            batch_similarities  # (B, N, N)
-        ], axis=-1)  # (B, N, N+1)
-        
-        # Update target similarities
-        target_similarities = target_sim_diag
-    
-    # Calculate ranks
-    target_sim_expanded = tf.expand_dims(target_similarities, axis=-1)
-    higher_count = tf.reduce_sum(
-        tf.cast(all_similarities > target_sim_expanded, tf.float32), 
-        axis=-1
-    )  # (B, N)
-    
-    ranks = higher_count + 1.0  # 1-based ranking
-    
-    # Calculate percentiles
-    total_candidates = tf.cast(tf.shape(all_similarities)[-1], tf.float32)
-    percentiles = (ranks / total_candidates) * 100.0
-    
-    # Calculate Top-K accuracies
-    valid_mask = tf.cast(tf.reduce_sum(tf.abs(ground_truth_vectors), axis=-1) > 0, tf.float32)
-    
-    results = {}
-    for k in k_values:
-        top_k_hits = tf.cast(ranks <= float(k), tf.float32) * valid_mask
-        valid_count = tf.maximum(tf.reduce_sum(valid_mask), 1.0)
-        top_k_acc = tf.reduce_sum(top_k_hits) / valid_count
-        results[f'top_{k}_acc'] = top_k_acc
-    
-    # Calculate mean percentile
-    masked_percentiles = percentiles * valid_mask
-    mean_percentile = tf.reduce_sum(masked_percentiles) / tf.maximum(tf.reduce_sum(valid_mask), 1.0)
-    results['mean_percentile'] = mean_percentile
-    
-    return results
-
-################################################################################
-# 2. Loss functions
-################################################################################
-@tf.function(experimental_relax_shapes=True)
-def compute_mixed_loss(
-    category_predictions: tf.Tensor,   # (B, C, D)
-    ground_truth_vectors: tf.Tensor,   # (B, N, D)
-    category_labels: tf.Tensor,        # (B, N) 1-based IDs
-    cluster_centers: tf.Tensor,        # (C, D)
-    margin: float = 1.0,
-    alpha: float = 0.5
-) -> tf.Tensor:
-    """
-    Mixed loss with cosine similarity and L2 loss
-    """
-    batch_size = tf.shape(category_predictions)[0]
-    num_items = tf.shape(ground_truth_vectors)[1]
-    max_cat_idx = tf.shape(cluster_centers)[0] - 1
-    
-    # 0-based category indices with safety check
-    cats_0based = tf.clip_by_value(category_labels - 1, 0, max_cat_idx)
-    
-    # Valid mask
-    valid_mask = category_labels > 0
-    
-    # Batch indices
-    batch_indices = tf.range(batch_size)[:, tf.newaxis]
-    batch_indices = tf.broadcast_to(batch_indices, [batch_size, num_items])
-    
-    # Select predicted vectors
-    gather_indices = tf.stack([batch_indices, cats_0based], axis=-1)
-    pred_selected = tf.gather_nd(category_predictions, gather_indices)
-    
-    # Get category centers
-    centers = tf.gather(cluster_centers, cats_0based)
-    
-    # Compute residuals
-    pred_res = pred_selected - centers
-    gt_res = ground_truth_vectors - centers
-    
-    # L2 normalize with stability
-    pred_norm = tf.nn.l2_normalize(pred_res + 1e-8, axis=-1)
-    gt_norm = tf.nn.l2_normalize(gt_res + 1e-8, axis=-1)
-    
-    # Cosine similarity
-    cos_pos = tf.reduce_sum(pred_norm * gt_norm, axis=-1)
-    
-    # Negative similarity (batch mean)
-    gt_mean = tf.reduce_mean(gt_norm, axis=1, keepdims=True)
-    cos_neg = tf.reduce_sum(gt_mean * pred_norm, axis=-1)
-    
-    # Losses
-    cos_loss = tf.nn.relu(margin + cos_neg - cos_pos)
-    l2_loss = tf.norm(pred_res - gt_res, axis=-1)
-    
-    # Mix losses
-    mix_loss = alpha * cos_loss + (1.0 - alpha) * l2_loss
-    
-    # Apply valid mask
-    valid_mask_float = tf.cast(valid_mask, tf.float32)
-    masked_loss = mix_loss * valid_mask_float
-    
-    # Calculate mean with proper normalization
-    valid_counts = tf.maximum(tf.reduce_sum(valid_mask_float, axis=1), 1.0)
-    batch_losses = tf.reduce_sum(masked_loss, axis=1) / valid_counts
-    
-    return tf.reduce_mean(batch_losses)
-
-################################################################################
-# 3. MLP and Pivot layers
-################################################################################
-class MLP(tf.keras.layers.Layer):
-    """Multi-layer perceptron"""
-    def __init__(self, hidden_dim=128, out_dim=64, dropout_rate=0.1, 
-                 name='mlp', **kwargs):
-        super().__init__(name=name, **kwargs)
-        self.hidden_dim = hidden_dim
-        self.out_dim = out_dim
-        self.dropout_rate = dropout_rate
-        
-        self.dense1 = Dense(hidden_dim, activation=None, name=f"{name}_dense1")
-        self.dense2 = Dense(out_dim, activation=None, name=f"{name}_dense2")
-        self.dropout = Dropout(dropout_rate, name=f"{name}_dropout")
-        self.norm = LayerNormalization(name=f"{name}_norm")
-    
-    @tf.function(experimental_relax_shapes=True)
-    def call(self, inputs, training=False):
-        x = self.dense1(inputs)
-        x = self.norm(x)
-        x = tf.nn.gelu(x)
-        x = self.dropout(x, training=training)
-        x = self.dense2(x)
-        return x
-
-class PivotLayer(tf.keras.layers.Layer):
-    """Pivot layer with self and cross attention"""
-    def __init__(self, dim, num_heads=8, ff_dim=512, dropout_rate=0.1, 
-                 layer_name="pivot", **kwargs):
-        super().__init__(name=layer_name, **kwargs)
-        self.dim = dim
+        # Configuration
+        self.feature_dim = feature_dim
         self.num_heads = num_heads
-        self.ff_dim = ff_dim
-        self.dropout_rate = dropout_rate
-        
-        # Multi-head attention layers
-        self.self_attn = tf.keras.layers.MultiHeadAttention(
-            num_heads=num_heads, 
-            key_dim=dim // num_heads,
-            name=f"{layer_name}_self_attn"
-        )
-        self.cross_attn = tf.keras.layers.MultiHeadAttention(
-            num_heads=num_heads, 
-            key_dim=dim // num_heads,
-            name=f"{layer_name}_cross_attn"
-        )
-        
-        # Normalization layers
-        self.norm1 = LayerNormalization(name=f"{layer_name}_norm1")
-        self.norm2 = LayerNormalization(name=f"{layer_name}_norm2")
-        self.norm3 = LayerNormalization(name=f"{layer_name}_norm3")
-        
-        # Dropout layers
-        self.dropout1 = Dropout(dropout_rate, name=f"{layer_name}_dropout1")
-        self.dropout2 = Dropout(dropout_rate, name=f"{layer_name}_dropout2")
-        self.dropout3 = Dropout(dropout_rate, name=f"{layer_name}_dropout3")
-        
-        # Feed-forward network
-        self.ffn = tf.keras.Sequential([
-            Dense(ff_dim, activation=tf.nn.gelu, name=f"{layer_name}_ffn1"),
-            Dropout(dropout_rate, name=f"{layer_name}_ffn_dropout"),
-            Dense(dim, name=f"{layer_name}_ffn2")
-        ], name=f"{layer_name}_ffn")
-    
-    @tf.function(experimental_relax_shapes=True)
-    def call(self, inputs, training=False):
-        input_set, cluster_center = inputs
-        
-        # Self-attention
-        attn1_out = self.self_attn(
-            query=input_set, key=input_set, value=input_set, training=training
-        )
-        attn1_out = self.dropout1(attn1_out, training=training)
-        out1 = self.norm1(input_set + attn1_out)
-        
-        # Cross-attention
-        attn2_out = self.cross_attn(
-            query=cluster_center, key=out1, value=out1, training=training
-        )
-        attn2_out = self.dropout2(attn2_out, training=training)
-        out2 = self.norm2(cluster_center + attn2_out)
-        
-        # Feed-forward
-        ffn_out = self.ffn(out2, training=training)
-        ffn_out = self.dropout3(ffn_out, training=training)
-        final_out = self.norm3(out2 + ffn_out)
-        
-        return final_out
-
-################################################################################
-# 4. SetRetrievalModel with Strategy-aware training
-################################################################################
-class SetRetrievalModel(tf.keras.Model):
-    """Set retrieval model with proper GPU strategy handling"""
-    
-    def __init__(
-        self, 
-        dim=512, 
-        num_layers=6, 
-        num_heads=8, 
-        ff_dim=512,
-        cycle_lambda=0.2, 
-        use_cycle_loss=False, 
-        use_CLNeg_loss=False, 
-        use_center_base=False,
-        num_categories=10,
-        dropout_rate=0.1,
-        name="SetRetrievalModel",
-        **kwargs
-    ):
-        super().__init__(name=name, **kwargs)
-        
-        # Model configuration
-        self.dim = dim
         self.num_layers = num_layers
-        self.num_heads = num_heads
-        self.ff_dim = ff_dim
-        self.cycle_lambda = cycle_lambda
-        self.use_cycle_loss = use_cycle_loss
-        self.use_CLNeg_loss = use_CLNeg_loss
-        self.use_center_base = use_center_base
         self.num_categories = num_categories
+        self.hidden_dim = hidden_dim
+        self.use_cycle_loss = use_cycle_loss
+        self.temperature = temperature
         self.dropout_rate = dropout_rate
+        
+        # Category centers (learnable)
+        self.category_centers = None
         
         # Build layers
-        self.pivot_layers = [
-            PivotLayer(
-                dim=dim, 
-                num_heads=num_heads, 
-                ff_dim=ff_dim, 
-                dropout_rate=dropout_rate,
-                layer_name=f"pivot_layer_{i}"
-            ) for i in range(num_layers)
-        ]
+        self._build_layers()
         
-        # Final layers
-        self.final_norm = LayerNormalization(name="final_norm")
-        self.final_dense = Dense(dim, name="final_dense")
-        
-        # MLP layers for various operations
-        self.feature_mlp = MLP(dim, dim, dropout_rate, "feature_mlp")
-        self.output_mlp = MLP(dim, dim, dropout_rate, "output_mlp")
-        
-        # Cluster centers
-        self._cluster_centers = None
-        
-        # Internal state
-        self._predicted_outputs = None
-        self._ground_truth_targets = None
-        self._category_buffer = None
-        
-        # Top-K accuracy metrics
-        self.train_top1_acc = tf.keras.metrics.Mean(name="train_top1_acc")
-        self.train_top5_acc = tf.keras.metrics.Mean(name="train_top5_acc")
-        self.train_percentile = tf.keras.metrics.Mean(name="train_percentile")
-        self.val_top1_acc = tf.keras.metrics.Mean(name="val_top1_acc")
-        self.val_top5_acc = tf.keras.metrics.Mean(name="val_top5_acc")
-        self.val_percentile = tf.keras.metrics.Mean(name="val_percentile")
-        
-        # Initialize metrics properly
-        self._initialize_metrics()
+        print(f"[INFO] SetRetrievalModel created (Correct):")
+        print(f"  - Feature dim: {feature_dim}")
+        print(f"  - Heads: {num_heads}, Layers: {num_layers}")
+        print(f"  - Categories: {num_categories}")
+        print(f"  - Cross-attention: Category centers as queries")
+        print(f"  - Temperature: {temperature}")
     
-    def _initialize_metrics(self):
-        """Initialize metrics with dummy values"""
-        dummy_acc = 0.1  # Low accuracy initially
-        dummy_percentile = 90.0  # High percentile initially (bad)
+    def _build_layers(self):
+        """Build model layers"""
         
-        for metric in [self.train_top1_acc, self.train_top5_acc, self.val_top1_acc, self.val_top5_acc]:
-            metric.update_state(dummy_acc)
-            metric.reset_state()
+        # Input projection for query set
+        self.input_projection = layers.Dense(
+            self.hidden_dim,
+            activation='relu',
+            name='input_projection'
+        )
         
-        for metric in [self.train_percentile, self.val_percentile]:
-            metric.update_state(dummy_percentile)
-            metric.reset_state()
-    
-    def count_parameters_detailed(self):
-        """パラメータカウンティング"""
-        param_breakdown = {
-            'attention_params': 0,
-            'ffn_params': 0, 
-            'norm_params': 0,
-            'dense_params': 0,
-            'other_params': 0
-        }
-        
-        total_params = 0
-        
-        for weight in self.trainable_weights:
-            weight_name = weight.name.lower()
-            weight_params = tf.size(weight).numpy()
-            total_params += weight_params
-            
-            if any(keyword in weight_name for keyword in ['multi_head_attention', 'self_attn', 'cross_attn']):
-                param_breakdown['attention_params'] += weight_params
-            elif 'ffn' in weight_name:
-                param_breakdown['ffn_params'] += weight_params
-            elif any(keyword in weight_name for keyword in ['layer_normalization', 'norm']):
-                param_breakdown['norm_params'] += weight_params
-            elif 'dense' in weight_name:
-                param_breakdown['dense_params'] += weight_params
-            else:
-                param_breakdown['other_params'] += weight_params
-        
-        return {'total_params': total_params, 'breakdown': param_breakdown}
-
-    def display_parameter_summary(self):
-        """パラメータサマリー表示"""
-        try:
-            param_info = self.count_parameters_detailed()
-            breakdown = param_info['breakdown']
-            total = param_info['total_params']
-            
-            print(f"\n{'='*60}")
-            print("MODEL PARAMETER SUMMARY")
-            print(f"{'='*60}")
-            print(f"Config: {self.dim}D, {self.num_layers}L, {self.num_heads}H, {self.num_categories}C")
-            print(f"Flags: CB={self.use_center_base}, Cycle={self.use_cycle_loss}, CLNeg={self.use_CLNeg_loss}")
-            print(f"{'-'*60}")
-            
-            category_names = {
-                'attention_params': 'Attention',
-                'ffn_params': 'Feed-Forward', 
-                'dense_params': 'Dense Layers',
-                'norm_params': 'Normalization',
-                'other_params': 'Other'
+        # Cross-attention layers (Category centers → Query set)
+        self.cross_attention_layers = []
+        for i in range(self.num_layers):
+            layer_dict = {
+                'cross_attention': layers.MultiHeadAttention(
+                    num_heads=self.num_heads,
+                    key_dim=self.hidden_dim // self.num_heads,
+                    dropout=self.dropout_rate,
+                    name=f'cross_attention_{i}'
+                ),
+                'self_attention': layers.MultiHeadAttention(
+                    num_heads=self.num_heads,
+                    key_dim=self.hidden_dim // self.num_heads,
+                    dropout=self.dropout_rate,
+                    name=f'self_attention_{i}'
+                ),
+                'norm1': layers.LayerNormalization(epsilon=1e-6, name=f'norm1_{i}'),
+                'norm2': layers.LayerNormalization(epsilon=1e-6, name=f'norm2_{i}'),
+                'norm3': layers.LayerNormalization(epsilon=1e-6, name=f'norm3_{i}'),
+                'ffn': tf.keras.Sequential([
+                    layers.Dense(self.hidden_dim * 2, activation='gelu'),
+                    layers.Dropout(self.dropout_rate),
+                    layers.Dense(self.hidden_dim)
+                ], name=f'ffn_{i}')
             }
-            
-            for key, count in breakdown.items():
-                if count > 0:
-                    percentage = (count / total) * 100
-                    name = category_names.get(key, key.replace('_', ' ').title())
-                    print(f"{name:<15}: {count:>8,} ({percentage:>5.1f}%)")
-            
-            print(f"{'-'*60}")
-            print(f"{'Total':<15}: {total:>8,}")
-            memory_mb = (total * 4) / (1024 * 1024)
-            print(f"{'Memory Est.':<15}: {memory_mb:>8.1f} MB")
-            print(f"{'='*60}")
-            
-            return param_info
-            
-        except Exception as e:
-            print(f"[ERROR] Parameter summary failed: {e}")
-            return {'total_params': 0, 'breakdown': {}}
-    
-    def set_cluster_center(self, cluster_centers):
-        """Set cluster centers with validation"""
-        if cluster_centers is None:
-            print(f"[WARN] No cluster centers provided, using random initialization")
-            self._cluster_centers = tf.Variable(
-                tf.random.normal((self.num_categories, self.dim), stddev=0.1),
-                trainable=False,
-                name="cluster_centers"
-            )
-            return
+            self.cross_attention_layers.append(layer_dict)
         
-        # Convert to proper tensor format
-        if isinstance(cluster_centers, dict):
-            center_array = np.zeros((self.num_categories, self.dim), dtype=np.float32)
-            for cat_id, center in cluster_centers.items():
-                if 1 <= cat_id <= self.num_categories:
-                    center_array[cat_id - 1] = np.array(center, dtype=np.float32)
+        # Final output projection to feature space
+        self.output_projection = layers.Dense(
+            self.feature_dim,
+            activation=None,
+            name='output_projection'
+        )
+        
+        # Output normalization
+        self.output_norm = layers.LayerNormalization(epsilon=1e-6, name='output_norm')
+    
+    def set_category_centers(self, centers: np.ndarray):
+        """Set category cluster centers"""
+        if centers.shape[0] != self.num_categories:
+            raise ValueError(f"Expected {self.num_categories} centers, got {centers.shape[0]}")
+        
+        # L2 normalize centers
+        centers = centers / (np.linalg.norm(centers, axis=1, keepdims=True) + 1e-8)
+        
+        # Create learnable category centers initialized with cluster centers
+        self.category_centers = self.add_weight(
+            name='category_centers',
+            shape=(self.num_categories, self.hidden_dim),
+            initializer='glorot_uniform',
+            trainable=True
+        )
+        
+        # Initialize with provided centers (project if needed)
+        if centers.shape[1] != self.hidden_dim:
+            # Simple projection if dimensions don't match
+            init_centers = np.random.normal(0, 0.02, (self.num_categories, self.hidden_dim)).astype(np.float32)
         else:
-            center_array = np.array(cluster_centers, dtype=np.float32)
-            if center_array.shape[0] != self.num_categories:
-                print(f"[WARN] Cluster center count mismatch: expected {self.num_categories}, got {center_array.shape[0]}")
-                new_array = np.zeros((self.num_categories, center_array.shape[1]), dtype=np.float32)
-                copy_count = min(self.num_categories, center_array.shape[0])
-                new_array[:copy_count] = center_array[:copy_count]
-                center_array = new_array
+            init_centers = centers.astype(np.float32)
         
-        self._cluster_centers = tf.constant(center_array, dtype=tf.float32)
-        print(f"[INFO] Set cluster centers: {center_array.shape}")
+        self.category_centers.assign(init_centers)
+        print(f"✅ Category centers initialized: {centers.shape}")
     
-    def get_cluster_center(self):
-        """Get cluster centers"""
-        if self._cluster_centers is None:
-            raise ValueError("Cluster centers not set. Call set_cluster_center() first.")
-        return self._cluster_centers
-    
-    @tf.function(experimental_relax_shapes=True)
-    def forward_pass(self, input_set, training=False):
-        """Forward pass through the model"""
-        batch_size = tf.shape(input_set)[0]
+    def call(self, inputs, training=None):
+        """Forward pass"""
         
-        # Get cluster centers and expand for batch
-        centers = self.get_cluster_center()  # (num_categories, dim)
-        centers = tf.expand_dims(centers, 0)  # (1, num_categories, dim)
-        centers = tf.tile(centers, [batch_size, 1, 1])  # (B, num_categories, dim)
+        # Parse inputs
+        if isinstance(inputs, dict):
+            query_features = inputs['query_features']  # [batch, seq_len, feature_dim]
+            query_categories = inputs.get('query_categories')  # Not used in cross-attention
+        else:
+            # Legacy support
+            query_features = inputs[0]
+            query_categories = inputs[1] if len(inputs) > 1 else None
         
-        # Process through pivot layers
-        features = centers
-        for layer in self.pivot_layers:
-            features = layer((input_set, features), training=training)
-        
-        # Final processing
-        features = self.final_norm(features)
-        output = self.final_dense(features)
-        
-        return output  # (B, num_categories, dim)
-    
-    def call(self, inputs, training=False):
-        """Model call method"""
-        (X_concat, _, _, catQ_batch, catP_batch, _, _, _) = inputs
-        
-        batch_size = tf.shape(X_concat)[0] // 2
-        input_features = X_concat[:batch_size]  # First half
-        target_features = X_concat[batch_size:]  # Second half
-        
-        # Forward pass
-        predictions = self.forward_pass(input_features, training=training)
-        
-        # Store for loss calculation
-        self._predicted_outputs = predictions
-        self._ground_truth_targets = target_features
-        self._category_buffer = catP_batch
+        # Process query set
+        predictions = self._forward_pass(query_features, training)
         
         return predictions
     
-    @tf.function(experimental_relax_shapes=True)
+    def _forward_pass(self, query_features, training=None):
+        """Forward pass through cross-attention layers"""
+        
+        batch_size = tf.shape(query_features)[0]
+        
+        # Project query features
+        query_projected = self.input_projection(query_features)  # [batch, seq_len, hidden_dim]
+        
+        # Get category centers and expand for batch
+        if self.category_centers is None:
+            raise ValueError("Category centers not set! Call set_category_centers() first.")
+        
+        # Category centers as queries: [batch, num_categories, hidden_dim]
+        category_queries = tf.expand_dims(self.category_centers, 0)
+        category_queries = tf.tile(category_queries, [batch_size, 1, 1])
+        
+        # Cross-attention: Category centers attend to query set
+        x = category_queries
+        
+        for layer_dict in self.cross_attention_layers:
+            # Cross-attention: categories (queries) attend to query set (keys, values)
+            cross_attn_out = layer_dict['cross_attention'](
+                query=x,                    # Category centers
+                key=query_projected,        # Query set
+                value=query_projected,      # Query set
+                training=training
+            )
+            x = layer_dict['norm1'](x + cross_attn_out, training=training)
+            
+            # Self-attention among categories
+            self_attn_out = layer_dict['self_attention'](
+                query=x,
+                key=x,
+                value=x,
+                training=training
+            )
+            x = layer_dict['norm2'](x + self_attn_out, training=training)
+            
+            # Feed-forward
+            ffn_out = layer_dict['ffn'](x, training=training)
+            x = layer_dict['norm3'](x + ffn_out, training=training)
+        
+        # Project to target feature space
+        predictions = self.output_projection(x)  # [batch, num_categories, feature_dim]
+        
+        # L2 normalize predictions
+        predictions = tf.nn.l2_normalize(predictions, axis=-1)
+        
+        return self.output_norm(predictions)
+    
+# models.py -> SetRetrievalModel 内のメソッドを修正
+
     def train_step(self, data):
-        """Training step without device forcing - let strategy handle it"""
-        (batch_data, _) = data
-        
+        """Custom training step with proper contrastive loss"""
+        batch_data = data
+
         with tf.GradientTape() as tape:
-            # XY direction
-            predictions_xy = self(batch_data, training=True)
-            pred_xy = self._predicted_outputs
-            gt_xy = self._ground_truth_targets
-            cat_xy = self._category_buffer
-            
-            # YX direction (swap inputs)
-            (X_concat, _, _, catQ_batch, catP_batch, _, _, negative_samples) = batch_data
-            batch_size = tf.shape(X_concat)[0] // 2
-            
-            X_concat_yx = tf.concat([X_concat[batch_size:], X_concat[:batch_size]], axis=0)
-            batch_data_yx = (X_concat_yx, _, _, catP_batch, catQ_batch, _, _, negative_samples)
-            
-            predictions_yx = self(batch_data_yx, training=True)
-            pred_yx = self._predicted_outputs
-            gt_yx = self._ground_truth_targets
-            cat_yx = self._category_buffer
-            
-            # Calculate losses
-            if self.use_center_base and self._cluster_centers is not None:
-                loss_xy = compute_mixed_loss(pred_xy, gt_xy, cat_xy, self.get_cluster_center(), margin=1.0, alpha=0.5)
-                loss_yx = compute_mixed_loss(pred_yx, gt_yx, cat_yx, self.get_cluster_center(), margin=1.0, alpha=0.5)
-            else:
-                loss_xy = tf.reduce_mean(tf.keras.losses.mse(gt_xy, pred_xy))
-                loss_yx = tf.reduce_mean(tf.keras.losses.mse(gt_yx, pred_yx))
-            
-            # Cycle loss
-            cycle_loss = tf.constant(0.0)
-            if self.use_cycle_loss:
-                cycle_loss = tf.reduce_mean(tf.abs(pred_xy - pred_yx)) * self.cycle_lambda
-            
-            total_loss = loss_xy + loss_yx + cycle_loss
-            
-            # Calculate Top-K metrics
-            neg_samples_xy = negative_samples[:batch_size] if self.use_CLNeg_loss else None
-            neg_samples_yx = negative_samples[batch_size:] if self.use_CLNeg_loss else None
-            
-            metrics_xy = compute_topk_metrics(pred_xy, gt_xy, cat_xy, neg_samples_xy, [1, 5])
-            metrics_yx = compute_topk_metrics(pred_yx, gt_yx, cat_yx, neg_samples_yx, [1, 5])
-            
-            # Average metrics
-            mean_top1 = (metrics_xy['top_1_acc'] + metrics_yx['top_1_acc']) / 2.0
-            mean_top5 = (metrics_xy['top_5_acc'] + metrics_yx['top_5_acc']) / 2.0
-            mean_percentile = (metrics_xy['mean_percentile'] + metrics_yx['mean_percentile']) / 2.0
-        
-        # Apply gradients - let strategy handle device placement
-        gradients = tape.gradient(total_loss, self.trainable_variables)
-        gradients = [tf.clip_by_norm(g, 1.0) if g is not None else g for g in gradients]
+            predictions = self(batch_data, training=True)
+            target_features = batch_data['target_features']
+            target_categories = batch_data['target_categories'] # カテゴリ情報を取得
+
+            # 新しい損失関数を呼び出す
+            loss = contrastive_loss_per_item(
+                predictions,
+                target_features,
+                target_categories, # カテゴリ情報を渡す
+                temperature=self.temperature
+            )
+
+            # Cycle Loss (オプション) は、同様に新しい損失関数を使うように修正が必要
+            # 今回は一旦主要な損失に焦点を当てるため、Cycle Lossのロジックは省略
+            # if self.use_cycle_loss: ...
+
+        gradients = tape.gradient(loss, self.trainable_variables)
         self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
         
-        # Update metrics
-        self.train_top1_acc.update_state(mean_top1)
-        self.train_top5_acc.update_state(mean_top5)
-        self.train_percentile.update_state(mean_percentile)
-        
-        # Clear internal state
-        self._predicted_outputs = None
-        self._ground_truth_targets = None
-        self._category_buffer = None
-        
-        return {
-            "loss": total_loss,
-            "train_top1_acc": self.train_top1_acc.result(),
-            "train_top5_acc": self.train_top5_acc.result(),
-            "train_percentile": self.train_percentile.result(),
-            "loss_xy": loss_xy,
-            "loss_yx": loss_yx,
-            "cycle_loss": cycle_loss
-        }
-    
-    @tf.function(experimental_relax_shapes=True)
+        # metricsを更新（必要であれば）
+        self.compiled_metrics.update_state(tf.zeros_like(loss), loss) # ダミーのyとy_pred
+        return {m.name: m.result() for m in self.metrics}
+
+
     def test_step(self, data):
-        """Test step with Top-K metrics"""
-        (batch_data, _) = data
+        """Test step"""
+        batch_data = data
         
         predictions = self(batch_data, training=False)
-        
-        # Get negative samples
-        (_, _, _, _, _, _, _, negative_samples) = batch_data
-        neg_samples = negative_samples if self.use_CLNeg_loss else None
-        
-        # Calculate metrics
-        metrics = compute_topk_metrics(
-            self._predicted_outputs,
-            self._ground_truth_targets,
-            self._category_buffer,
-            neg_samples,
-            [1, 5]
+        target_features = batch_data['target_features']
+        target_categories = batch_data['target_categories'] # カテゴリ情報を取得
+
+        # 新しい損失関数を呼び出す
+        test_loss = contrastive_loss_per_item(
+            predictions,
+            target_features,
+            target_categories, # カテゴリ情報を渡す
+            temperature=self.temperature
         )
         
-        # Update metrics
-        self.val_top1_acc.update_state(metrics['top_1_acc'])
-        self.val_top5_acc.update_state(metrics['top_5_acc'])
-        self.val_percentile.update_state(metrics['mean_percentile'])
-        
-        # Clear internal state
-        self._predicted_outputs = None
-        self._ground_truth_targets = None
-        self._category_buffer = None
-        
-        return {
-            "val_top1_acc": self.val_top1_acc.result(),
-            "val_top5_acc": self.val_top5_acc.result(),
-            "val_percentile": self.val_percentile.result()
-        }
+        self.compiled_metrics.update_state(tf.zeros_like(test_loss), test_loss)
+        return {m.name: m.result() for m in self.metrics}
+
+# models.py -> contrastive_loss_with_negatives (修正後)
+def contrastive_loss_with_negatives(predictions, targets, negative_samples=None, temperature=1.0):
+    """
+    Contrastive loss for set retrieval (Vectorized Version with dimension fix)
     
-    def predict_batch(self, batch_data, training=False):
-        """Predict a batch for evaluation purposes"""
-        try:
-            predictions = self(batch_data, training=training)
-            return {
-                'predictions': predictions,
-                'pred_outputs': self._predicted_outputs,
-                'gt_targets': self._ground_truth_targets,
-                'categories': self._category_buffer
-            }
-        except Exception as e:
-            logging.error(f"Prediction error: {e}")
-            return None
+    Args:
+        predictions: [batch, num_categories, feature_dim] - Predicted target sets
+        targets: [batch, seq_len, feature_dim] - Ground truth target items
+        negative_samples: [batch, seq_len, num_negatives, feature_dim] - Negative samples
+        temperature: Temperature for softmax
     
-    def build_model_completely(self, input_shape):
-        """Build model completely with all layers initialized"""
-        # Build with forward pass
-        dummy_input = tf.zeros(input_shape)
-        _ = self.forward_pass(dummy_input, training=False)
-        
-        # Build with full call method
-        batch_size = input_shape[0]
-        max_items = input_shape[1]
-        feature_dim = input_shape[2]
-        
-        # Create dummy batch data
-        X_concat = tf.zeros((batch_size * 2, max_items, feature_dim))
-        catQ_batch = tf.ones((batch_size, max_items), dtype=tf.int32)
-        catP_batch = tf.ones((batch_size, max_items), dtype=tf.int32)
-        negative_samples = tf.zeros((batch_size * 2, max_items, 1, feature_dim))
-        
-        dummy_batch_data = (X_concat, None, None, catQ_batch, catP_batch, None, None, negative_samples)
-        _ = self(dummy_batch_data, training=False)
-        
-        print("✅ Model built completely with all layers")
+    Returns:
+        Contrastive loss
+    """
+    # --- ターゲット集合の表現を計算 ---
+    target_mask = tf.reduce_sum(tf.abs(targets), axis=-1) > 0
+    target_mask = tf.cast(target_mask, tf.float32)
     
-    def infer_single_set(self, input_features):
-        """Single set inference"""
-        if len(input_features.shape) == 2:
-            input_features = tf.expand_dims(input_features, 0)
+    target_sum = tf.reduce_sum(targets * tf.expand_dims(target_mask, -1), axis=1)
+    target_count = tf.maximum(tf.reduce_sum(target_mask, axis=1, keepdims=True), 1.0)
+    target_repr = target_sum / target_count
+    
+    target_repr = tf.nn.l2_normalize(target_repr, axis=-1)
+
+    # --- ポジティブペアの類似度を計算 ---
+    pos_sim = tf.reduce_sum(predictions * tf.expand_dims(target_repr, 1), axis=-1)
+
+    # --- ネガティブペアの類似度を計算 (バッチ内ネガティブ) ---
+    # neg_sim_matrix: [batch, num_categories, batch]
+    neg_sim_matrix = tf.linalg.matmul(predictions, target_repr, transpose_b=True)
+    
+    batch_size = tf.shape(predictions)[0]
+    identity_mask = tf.eye(batch_size) # Shape: [batch, batch]
+    
+    # ▼▼▼▼▼▼▼▼▼▼【修正点】▼▼▼▼▼▼▼▼▼▼
+    # マスクの次元を [batch, batch] -> [batch, 1, batch] に拡張する
+    # これにより、[batch, num_categories, batch] とのブロードキャストが可能になる
+    expanded_mask = tf.expand_dims(identity_mask, axis=1)
+    # ▲▲▲▲▲▲▲▲▲▲【ここまで】▲▲▲▲▲▲▲▲▲▲
+
+    # 対角成分を非常に小さい値にして、max計算で選ばれないようにする
+    neg_sim_matrix = neg_sim_matrix * (1.0 - expanded_mask) + expanded_mask * (-1e9)
+    
+    # 各予測にとっての最も難しいネガティブ（最も似ている他のサンプル）を選択
+    neg_sim = tf.reduce_max(neg_sim_matrix, axis=-1)
+
+    # --- 損失計算 ---
+    logits = tf.stack([pos_sim, neg_sim], axis=-1) / temperature
+    labels = tf.zeros_like(pos_sim, dtype=tf.int32)
+    loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=labels, logits=logits)
+    
+    return tf.reduce_mean(loss)
+
+# models.py に追加または修正
+
+def contrastive_loss_per_item(predictions, target_features, target_categories, temperature=1.0):
+    """
+    Corrected Contrastive Loss - Compares predictions to individual items.
+
+    Args:
+        predictions: [B, C, D] - Predicted features for each category.
+        target_features: [B, S, D] - Ground truth item features.
+        target_categories: [B, S] - Ground truth item categories.
+        temperature: Temperature for softmax.
+
+    Returns:
+        The contrastive loss.
+    """
+    # --- 1. データの前処理 ---
+    # パディングされたアイテム（カテゴリID=0）をマスクするための準備
+    # target_features/categoriesをフラットなリストに変形
+    # [B, S, D] -> [B*S, D]
+    # [B, S]    -> [B*S]
+    B, S, D = tf.shape(target_features)[0], tf.shape(target_features)[1], tf.shape(target_features)[2]
+    C = tf.shape(predictions)[1]
+    
+    flat_target_features = tf.reshape(target_features, [B * S, D])
+    flat_target_categories = tf.reshape(target_categories, [B * S])
+
+    # パディングを除いた有効なアイテムのみを対象にするマスク
+    valid_target_mask = flat_target_categories > 0
+
+    # --- 2. 全ペアの類似度計算 ---
+    # 各カテゴリの予測 (B, C, D) と、バッチ内の全有効アイテム (B*S, D) との
+    # コサイン類似度を一括で計算する。
+    # tf.einsum は効率的な行列積計算機
+    # 結果の logits は [B, C, B*S] の形状を持つ
+    logits = tf.einsum('bcd,sd->bcs', predictions, flat_target_features) / temperature
+
+    # パディングされたターゲットアイテムに対応する類似度を計算から除外
+    # boolean_maskを適用すると次元が減ってしまうため、代わりに非常に小さい値を設定
+    logits = logits * tf.cast(tf.reshape(valid_target_mask, [1, 1, B*S]), tf.float32) + \
+             tf.cast(tf.reshape(~valid_target_mask, [1, 1, B*S]), tf.float32) * (-1e9)
+
+    # --- 3. 正解ラベルの作成 ---
+    # 各予測 (b, c) にとって、どのアイテム (s) が正解かを示すラベル行列を作成
+    
+    # a) カテゴリの一致を確認
+    # p_cats: [1, C, 1], t_cats: [1, 1, B*S]
+    p_cats = tf.reshape(tf.range(1, C + 1, dtype=tf.int32), [1, C, 1])
+    t_cats = tf.reshape(flat_target_categories, [1, 1, B*S])
+    category_match = tf.equal(p_cats, t_cats) # Shape: [1, C, B*S]
+
+    # b) 同じコーディネート/セットに属しているかを確認
+    # b_indices: [B, 1, 1]
+    # t_indices: [1, 1, B*S] (各アイテムがどのセットbに属しているかを示す)
+    b_indices = tf.reshape(tf.range(B), [B, 1, 1])
+    t_indices = tf.reshape(tf.repeat(tf.range(B), S), [1, 1, B*S])
+    instance_match = tf.equal(b_indices, t_indices) # Shape: [B, 1, B*S]
+
+    # a)とb)の両方を満たすものが正解ラベル
+    # labels: [B, C, B*S]
+    labels = tf.cast(tf.logical_and(category_match, instance_match), tf.float32)
+    
+    # 正解が存在しない予測は損失計算から除外するマスク
+    has_positives_mask = tf.reduce_sum(labels, axis=-1) > 0 # Shape: [B, C]
+
+    # --- 4. 損失の計算 ---
+    # softmax_cross_entropyを適用して損失を計算
+    # labelsを合計値で割ることで、複数の正解がある場合に対応
+    labels_normalized = tf.math.divide_no_nan(labels, tf.reduce_sum(labels, axis=-1, keepdims=True))
+    
+    loss = tf.nn.softmax_cross_entropy_with_logits(labels=labels_normalized, logits=logits)
+    
+    # マスクを適用して、有効な予測に関する損失のみを平均
+    masked_loss = loss * tf.cast(has_positives_mask, tf.float32)
+    
+    return tf.reduce_sum(masked_loss) / tf.reduce_sum(tf.cast(has_positives_mask, tf.float32))
+
+
+def create_model(config: Dict[str, Any]) -> SetRetrievalModel:
+    """Factory function to create SetRetrievalModel"""
+    
+    # Validate required keys
+    required_keys = ['feature_dim', 'num_heads', 'num_layers', 'num_categories']
+    for key in required_keys:
+        if key not in config:
+            raise ValueError(f"Missing required config key: {key}")
+    
+    # Set defaults
+    default_config = {
+        'temperature': 1.0,
+        'dropout_rate': 0.1,
+        'hidden_dim': config['feature_dim'],
+        'use_cycle_loss': False,
+    }
+    default_config.update(config)
+    
+    model = SetRetrievalModel(
+        feature_dim=default_config['feature_dim'],
+        num_heads=default_config['num_heads'],
+        num_layers=default_config['num_layers'],
+        num_categories=default_config['num_categories'],
+        hidden_dim=default_config['hidden_dim'],
+        use_cycle_loss=default_config['use_cycle_loss'],
+        temperature=default_config['temperature'],
+        dropout_rate=default_config['dropout_rate']
+    )
+    
+    return model
+
+
+def evaluate_with_gallery(model, test_dataset, all_test_items, k_values=[1, 5, 10]):
+    """
+    Evaluate model with full test gallery
+    
+    Args:
+        model: Trained model
+        test_dataset: Test dataset
+        all_test_items: All test items as gallery [num_items, feature_dim]
+        k_values: K values for Top-K accuracy
+    
+    Returns:
+        Evaluation metrics
+    """
+    all_ranks = []
+    all_scores = []
+    
+    print("🔍 Evaluating with full test gallery...")
+    
+    for batch_data, _ in test_dataset:
+        # Get predictions
+        predictions = model(batch_data, training=False)  # [batch, num_categories, feature_dim]
         
-        output = self.forward_pass(input_features, training=False)
-        return output[0]  # Remove batch dimension
+        # Extract target data
+        query_features = batch_data['query_features']
+        target_features = batch_data['target_features']
+        
+        batch_size = tf.shape(predictions)[0]
+        
+        for i in range(batch_size):
+            # Get target representation (average of target items)
+            target_items = target_features[i]  # [seq_len, feature_dim]
+            target_mask = tf.reduce_sum(tf.abs(target_items), axis=-1) > 0
+            valid_targets = tf.boolean_mask(target_items, target_mask)
+            
+            if tf.shape(valid_targets)[0] == 0:
+                continue
+                
+            target_repr = tf.reduce_mean(valid_targets, axis=0)  # [feature_dim]
+            target_repr = tf.nn.l2_normalize(target_repr, axis=-1)
+            
+            # Get best category prediction
+            pred_categories = predictions[i]  # [num_categories, feature_dim]
+            
+            # Compute similarities with all gallery items
+            gallery_similarities = tf.linalg.matmul(
+                tf.expand_dims(target_repr, 0), 
+                all_test_items, 
+                transpose_b=True
+            )  # [1, num_gallery_items]
+            gallery_similarities = tf.squeeze(gallery_similarities, 0)  # [num_gallery_items]
+            
+            # Find rank of target
+            target_sim = 1.0  # Perfect similarity with itself
+            better_count = tf.reduce_sum(tf.cast(gallery_similarities > target_sim, tf.float32))
+            rank = better_count + 1
+            
+            all_ranks.append(rank.numpy())
+    
+    # Calculate metrics
+    all_ranks = np.array(all_ranks)
+    
+    results = {}
+    for k in k_values:
+        top_k_acc = np.mean(all_ranks <= k)
+        results[f'top_{k}_acc'] = top_k_acc
+    
+    results['mrr'] = np.mean(1.0 / all_ranks)
+    results['mean_rank'] = np.mean(all_ranks)
+    results['median_rank'] = np.median(all_ranks)
+    
+    return results

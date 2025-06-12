@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
 """
-make_datasets.py
-================
-Unified dataset generator for both IQON3000 and DeepFurniture datasets.
-Creates train.pkl, validation.pkl, test.pkl, and category_centers.pkl.gz files.
+修正版 make_datasets.py
+========================
+重複除去の統一、正規化処理の統一、エラーハンドリングの強化
 
-Usage:
-------
-# For IQON3000 dataset (7 categories)
-python make_datasets.py --dataset iqon3000 --input-dir data/IQON3000 --output-dir datasets/IQON3000
-
-# For DeepFurniture dataset (11 categories)
-python make_datasets.py --dataset deepfurniture --image-dir data/DeepFurniture/furnitures --annotations-json data/DeepFurniture/metadata/annotations.json --furnitures-jsonl data/DeepFurniture/metadata/furnitures.jsonl --output-dir datasets/DeepFurniture
+主な修正点:
+1. 重複除去: 同じfurniture_id/item_idは角度に関係なく1つのみ保持
+2. 正規化統一: L2正規化のみ（Z-score正規化は削除）
+3. カテゴリID体系の完全統一
+4. エラーハンドリングとデバッグ情報の強化
 """
 
 import os
@@ -31,13 +28,11 @@ from tqdm import tqdm
 from sklearn.model_selection import train_test_split
 import tensorflow as tf
 
-os.environ["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
-
-# Suppress TensorFlow warnings
+os.environ["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "1")
 tf.get_logger().setLevel("ERROR")
 
 # =============================================================================
-# IQON3000 Dataset Configuration (7 categories)
+# 統一されたカテゴリ設定
 # =============================================================================
 
 IQON3000_CATEGORIES = {
@@ -69,10 +64,6 @@ IQON3000_CATEGORY_MAPPING = {
 
 DEFAULT_IQON3000_CATEGORY = 7
 
-# =============================================================================
-# DeepFurniture Dataset Configuration (11 categories)
-# =============================================================================
-
 DEEPFURNITURE_CATEGORIES = {
     1: "chair", 2: "table", 3: "sofa", 4: "bed", 5: "cabinet", 
     6: "lamp", 7: "bookshelf", 8: "desk", 9: "dresser", 
@@ -80,7 +71,28 @@ DEEPFURNITURE_CATEGORIES = {
 }
 
 # =============================================================================
-# IQON3000 Dataset Class
+# 統一された正規化関数
+# =============================================================================
+
+def normalize_features_unified(features):
+    """
+    統一された特徴量正規化
+    L2正規化のみを適用（Z-score正規化は削除）
+    """
+    if isinstance(features, torch.Tensor):
+        # PyTorchテンソルの場合
+        norm = features.norm(dim=-1, keepdim=True)
+        zero_norm_mask = (norm == 0)
+        norm[zero_norm_mask] = 1e-9
+        return features / norm
+    else:
+        # NumPy配列の場合
+        norm = np.linalg.norm(features, axis=-1, keepdims=True)
+        norm[norm == 0] = 1e-9
+        return features / norm
+
+# =============================================================================
+# IQON3000 Dataset Class (修正版)
 # =============================================================================
 
 class IQON3000Dataset(Dataset):
@@ -90,7 +102,7 @@ class IQON3000Dataset(Dataset):
         self.item_info = {}  # item_id -> (user_id, coordinate_id, category, cat_id, filename)
         self.items = []
         self._load_data()
-        print(f"IQON3000: Loaded {len(self.items)} items from {len(self.item_info)} unique entries")
+        print(f"IQON3000: Loaded {len(self.items)} unique items from {len(self.item_info)} entries")
     
     def _map_to_main_category_strict(self, japanese_category_name):
         if not japanese_category_name or japanese_category_name.strip() == '':
@@ -110,14 +122,19 @@ class IQON3000Dataset(Dataset):
             print(f"Error: IQON3000 directory not found: {self.iqon_dir}")
             return
 
+        # 統計情報
         source_category_counts = {}
         unmapped_to_default_count = 0
         json_decode_errors = 0
         items_missing_id_in_json = 0
         items_missing_image = 0
+        duplicate_items_skipped = 0
         
         user_id_dirs = [d for d in os.listdir(self.iqon_dir) if os.path.isdir(os.path.join(self.iqon_dir, d))]
         print(f"Found {len(user_id_dirs)} user directories.")
+
+        # 重複追跡用セット
+        seen_item_ids = set()
 
         for user_id_str in tqdm(user_id_dirs, desc="Processing IQON3000 Users"):
             current_user_path = os.path.join(self.iqon_dir, user_id_str)
@@ -148,7 +165,13 @@ class IQON3000Dataset(Dataset):
                         continue
                     true_item_id_str = str(true_item_id)
 
-                    # Determine image filename
+                    # 重複チェック: 同じitem_idは1回のみ処理
+                    if true_item_id_str in seen_item_ids:
+                        duplicate_items_skipped += 1
+                        continue
+                    seen_item_ids.add(true_item_id_str)
+
+                    # 画像ファイル名を決定
                     image_filename = f"{true_item_id_str}_m.jpg"
                     full_image_path = os.path.join(current_coordinate_path, image_filename)
                     
@@ -168,6 +191,7 @@ class IQON3000Dataset(Dataset):
                         else:
                             items_missing_image += 1; continue
 
+                    # カテゴリ情報の抽出
                     cat_field = item_detail.get('category x color', item_detail.get('categoryName', ''))
                     if not cat_field and 'category' in item_detail and isinstance(item_detail['category'], dict):
                         cat_field = item_detail['category'].get('name', '')
@@ -183,12 +207,13 @@ class IQON3000Dataset(Dataset):
                     if was_fallback:
                         unmapped_to_default_count += 1
                     
+                    # アイテム情報を保存（重複なし）
                     self.item_info[true_item_id_str] = (user_id_str, coordinate_id_str, jp_cat_name, main_cat_id, image_filename)
-                    if true_item_id_str not in self.items:
-                        self.items.append(true_item_id_str)
+                    self.items.append(true_item_id_str)
         
         print(f"\nIQON3000 Data Loading Summary:")
         print(f"  Total items processed: {sum(source_category_counts.values()) + unmapped_to_default_count}")
+        print(f"  Items skipped (duplicates): {duplicate_items_skipped}")
         print(f"  Items skipped (missing 'itemId'): {items_missing_id_in_json}")
         print(f"  Items skipped (missing image): {items_missing_image}")
         print(f"  JSON decode errors: {json_decode_errors}")
@@ -215,15 +240,17 @@ class IQON3000Dataset(Dataset):
             return {key: val.squeeze(0) for key, val in dummy_input.items()}, true_item_id_str, DEFAULT_IQON3000_CATEGORY
 
 # =============================================================================
-# Utility Functions
+# 修正されたCollate関数
 # =============================================================================
 
 def collate_fn(batch):
-    """Collate function for DataLoader"""
+    """修正版collate関数 - エラーハンドリング強化"""
     inputs_dict = {}
     item_ids_list, main_cat_ids_list = [], []
+    
     for b_input, item_id, main_cat_id in batch:
-        if b_input is None: continue
+        if b_input is None: 
+            continue
         for key, val in b_input.items(): 
             inputs_dict.setdefault(key, []).append(val)
         item_ids_list.append(item_id)
@@ -244,8 +271,12 @@ def collate_fn(batch):
         print(f"collate_fn error: {e}")
         raise e
 
+# =============================================================================
+# 修正されたパディング関数
+# =============================================================================
+
 def pad_or_truncate_df(data_list, max_len, pad_value, dtype_override=None):
-    """Pad or truncate data for DeepFurniture format"""
+    """修正版パディング関数"""
     if not data_list: 
         if isinstance(pad_value, np.ndarray): 
             return np.array([pad_value.copy() for _ in range(max_len)], dtype=dtype_override or pad_value.dtype)
@@ -278,23 +309,18 @@ def pad_or_truncate_df(data_list, max_len, pad_value, dtype_override=None):
     
     return np.array(processed_list, dtype=final_dtype)
 
-def zscore_normalize(x: np.ndarray) -> np.ndarray:
-    """Z-score normalization"""
-    mean = x.mean(axis=(0, 1), keepdims=True)
-    std = x.std(axis=(0, 1), keepdims=True) + 1e-7
-    return (x - mean) / std
-
 # =============================================================================
-# IQON3000 Data Processing (7 categories)
+# IQON3000処理 (修正版)
 # =============================================================================
 
 def process_iqon3000(input_dir, output_dir, batch_size=32):
-    """Process IQON3000 dataset to 7 categories"""
+    """修正版IQON3000処理 - 重複除去と正規化統一"""
     print(f"Processing IQON3000 dataset from {input_dir} to 7 categories")
+    print("Key improvements: Duplicate removal, unified normalization")
     
     os.makedirs(output_dir, exist_ok=True)
     
-    # Setup device and model
+    # デバイスとモデルの設定
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
@@ -303,7 +329,7 @@ def process_iqon3000(input_dir, output_dir, batch_size=32):
     model = model.to(device)
     model.eval()
     
-    # Create dataset and dataloader
+    # データセットとデータローダーの作成
     dataset = IQON3000Dataset(input_dir, processor)
     if len(dataset) == 0:
         print("Dataset is empty. Skipping feature extraction.")
@@ -313,13 +339,13 @@ def process_iqon3000(input_dir, output_dir, batch_size=32):
                             collate_fn=collate_fn, num_workers=4, 
                             pin_memory=device.type == 'cuda')
     
-    # Extract features
+    # 特徴量抽出
     item_features = {}
     item_main_categories = {}
-    item_to_set = {}
-    set_to_items = {}
+    item_to_coordinate = {}
+    coordinate_to_items = {}
     
-    print(f"Starting feature extraction for {len(dataset)} items...")
+    print(f"Starting feature extraction for {len(dataset)} unique items...")
     
     with torch.no_grad():
         for batch_inputs, batch_true_item_ids, batch_main_cat_ids in tqdm(dataloader, desc="Extracting IQON3000 features"):
@@ -335,26 +361,29 @@ def process_iqon3000(input_dir, output_dir, batch_size=32):
                 print(f"Error during get_image_features: {e}")
                 continue 
             
-            # Normalize features
-            img_feats_norm = img_feats.norm(dim=1, keepdim=True)
-            zero_norm_mask = (img_feats_norm == 0)
-            img_feats_norm[zero_norm_mask] = 1e-9 
-            img_feats = (img_feats / img_feats_norm).cpu().numpy()
+            # 統一された正規化処理（L2正規化のみ）
+            img_feats_normalized = normalize_features_unified(img_feats)
+            img_feats_np = img_feats_normalized.cpu().numpy()
             
             for i, true_item_id in enumerate(batch_true_item_ids):
                 if true_item_id is None: continue
-                item_features[true_item_id] = img_feats[i]
+                
+                item_features[true_item_id] = img_feats_np[i]
                 item_main_categories[true_item_id] = batch_main_cat_ids[i]
                 
+                # コーディネート情報を取得
                 if true_item_id in dataset.item_info:
                     _, coordinate_id_for_item, _, _, _ = dataset.item_info[true_item_id]
-                    item_to_set[true_item_id] = coordinate_id_for_item 
-                    set_to_items.setdefault(coordinate_id_for_item, []).append(true_item_id)
+                    item_to_coordinate[true_item_id] = coordinate_id_for_item 
+                    coordinate_to_items.setdefault(coordinate_id_for_item, []).append(true_item_id)
     
-    print(f"Extracted features for {len(item_features)} items from {len(set_to_items)} coordinate sets.")
-
-    # Save category info
-    category_info = {'main_categories_def': IQON3000_CATEGORIES, 'main_category_stats': {}}
+    print(f"Extracted features for {len(item_features)} unique items from {len(coordinate_to_items)} coordinate sets.")
+    
+    # カテゴリ情報の保存
+    category_info = {
+        'main_categories_def': IQON3000_CATEGORIES, 
+        'main_category_stats': {}
+    }
     for item_id_stat in item_features: 
         main_cat = item_main_categories.get(item_id_stat, DEFAULT_IQON3000_CATEGORY)
         category_info['main_category_stats'][main_cat] = category_info['main_category_stats'].get(main_cat, 0) + 1
@@ -362,74 +391,89 @@ def process_iqon3000(input_dir, output_dir, batch_size=32):
     with open(os.path.join(output_dir, 'category_info.pkl'), 'wb') as f: 
         pickle.dump(category_info, f)
     
-    json_safe = {'main_categories_def': category_info['main_categories_def'], 
-                 'main_category_stats': {str(k):v for k,v in category_info['main_category_stats'].items()}}
+    json_safe = {
+        'main_categories_def': category_info['main_categories_def'], 
+        'main_category_stats': {str(k):v for k,v in category_info['main_category_stats'].items()}
+    }
     with open(os.path.join(output_dir, 'category_info.json'), 'w', encoding='utf-8') as f: 
         json.dump(json_safe, f, ensure_ascii=False, indent=2)
 
-    # Filter valid sets (4+ items with valid categories 1-7)
-    valid_coords_with_orig_ids = {} 
-    for coord_id, true_item_ids_in_coord in set_to_items.items():
-        valid_items_in_this_coord = [tid for tid in true_item_ids_in_coord 
-                                   if tid in item_main_categories and 1 <= item_main_categories[tid] <= 7]
+    # 有効なコーディネートの選別（4個以上のアイテム、カテゴリ1-7）
+    valid_coordinates = {} 
+    for coord_id, true_item_ids_in_coord in coordinate_to_items.items():
+        valid_items_in_this_coord = [
+            tid for tid in true_item_ids_in_coord 
+            if tid in item_main_categories and 1 <= item_main_categories[tid] <= 7
+        ]
         if len(valid_items_in_this_coord) >= 4:
+            # 最初のアイテムからユーザーIDを取得
             if true_item_ids_in_coord and true_item_ids_in_coord[0] in dataset.item_info:
                 user_id_for_coord, _, _, _, _ = dataset.item_info[true_item_ids_in_coord[0]]
-                valid_coords_with_orig_ids[(user_id_for_coord, coord_id)] = valid_items_in_this_coord
+                valid_coordinates[(user_id_for_coord, coord_id)] = valid_items_in_this_coord
     
-    print(f"Found {len(valid_coords_with_orig_ids)} valid coordinate sets for DeepFurniture format.")
+    print(f"Found {len(valid_coordinates)} valid coordinate sets for conversion.")
 
-    # Convert to DeepFurniture format
-    set_data_for_deepfurniture_with_ids_as_key = []
-    if valid_coords_with_orig_ids:
-        for (user_id, coord_id_key), true_item_ids_in_valid_coord in valid_coords_with_orig_ids.items():
+    # DeepFurniture形式への変換
+    set_data_for_conversion = []
+    if valid_coordinates:
+        for (user_id, coord_id_key), true_item_ids_in_valid_coord in valid_coordinates.items():
             items_data_for_this_coord = []
             for true_item_id in true_item_ids_in_valid_coord:
                 if true_item_id in item_main_categories and true_item_id in item_features:
-                     items_data_for_this_coord.append((true_item_id, item_main_categories[true_item_id], item_features[true_item_id]))
+                     items_data_for_this_coord.append((
+                         true_item_id, 
+                         item_main_categories[true_item_id], 
+                         item_features[true_item_id]
+                     ))
             if len(items_data_for_this_coord) >= 2:
-                 set_data_for_deepfurniture_with_ids_as_key.append(((user_id, coord_id_key), items_data_for_this_coord))
+                 set_data_for_conversion.append(((user_id, coord_id_key), items_data_for_this_coord))
 
-    if set_data_for_deepfurniture_with_ids_as_key:
-        train_sets_with_ids, test_val_sets_with_ids = train_test_split(set_data_for_deepfurniture_with_ids_as_key, test_size=0.2, random_state=42)
-        val_sets_with_ids, test_sets_with_ids = [], []
-        if test_val_sets_with_ids:
-            if len(test_val_sets_with_ids) < 2: 
-                val_sets_with_ids = test_val_sets_with_ids
+    if set_data_for_conversion:
+        # データセット分割
+        train_sets, test_val_sets = train_test_split(set_data_for_conversion, test_size=0.2, random_state=42)
+        val_sets, test_sets = [], []
+        if test_val_sets:
+            if len(test_val_sets) < 2: 
+                val_sets = test_val_sets
             else: 
-                val_sets_with_ids, test_sets_with_ids = train_test_split(test_val_sets_with_ids, test_size=0.5, random_state=42)
+                val_sets, test_sets = train_test_split(test_val_sets, test_size=0.5, random_state=42)
         
-        print(f"IQON3000 Dataset split: Train {len(train_sets_with_ids)}, Validation {len(val_sets_with_ids)}, Test {len(test_sets_with_ids)}")
+        print(f"IQON3000 Dataset split: Train {len(train_sets)}, Validation {len(val_sets)}, Test {len(test_sets)}")
         
-        # Process and save splits
+        # 分割データの保存
         def process_and_save_iqon3000_split(dataset_with_orig_ids_list, split_name, base_output_dir):
             if not dataset_with_orig_ids_list:
                 return None
             actual_item_data_for_split = [item[1] for item in dataset_with_orig_ids_list]
-            return convert_to_deepfurniture_format(actual_item_data_for_split, 
+            return convert_to_deepfurniture_format_fixed(actual_item_data_for_split, 
                                                  os.path.join(base_output_dir, f'{split_name}.pkl'))
 
-        if train_sets_with_ids:
-            process_and_save_iqon3000_split(train_sets_with_ids, 'train', output_dir)
-        if val_sets_with_ids:
-            process_and_save_iqon3000_split(val_sets_with_ids, 'validation', output_dir)
-        if test_sets_with_ids:
-            process_and_save_iqon3000_split(test_sets_with_ids, 'test', output_dir)
+        if train_sets:
+            process_and_save_iqon3000_split(train_sets, 'train', output_dir)
+        if val_sets:
+            process_and_save_iqon3000_split(val_sets, 'validation', output_dir)
+        if test_sets:
+            process_and_save_iqon3000_split(test_sets, 'test', output_dir)
     else:
-        print("No valid coordinate sets for DeepFurniture format conversion.")
+        print("No valid coordinate sets for conversion.")
 
-    # Compute and save category centers for 7 categories
-    compute_iqon3000_category_centers(output_dir)
+    # カテゴリ中心の計算（7カテゴリ用）
+    compute_iqon3000_category_centers_fixed(output_dir)
     
     print(f"IQON3000 processing complete. Files saved to {output_dir}")
 
-def convert_to_deepfurniture_format(sets_of_items_data, output_file, max_item_num=10):
-    """Convert sets to DeepFurniture format"""
+# =============================================================================
+# 修正版: DeepFurniture形式変換関数
+# =============================================================================
+
+def convert_to_deepfurniture_format_fixed(sets_of_items_data, output_file, max_item_num=10):
+    """修正版: DeepFurniture形式変換 - クエリ・ポジティブ重複チェック強化"""
     q_feats_list, t_feats_list, q_main_cats_list, t_main_cats_list, q_ids_list, t_ids_list = [], [], [], [], [], []
     scene_ids_list, set_sizes_list = [], []
     skipped_sets_count = 0
+    overlap_warning_count = 0
     
-    for set_idx_df, items_in_current_outfit_data in enumerate(tqdm(sets_of_items_data, desc=f"DF Converting ({os.path.basename(output_file)})")):
+    for set_idx_df, items_in_current_outfit_data in enumerate(tqdm(sets_of_items_data, desc=f"Converting ({os.path.basename(output_file)})")):
         if len(items_in_current_outfit_data) < 2: 
             skipped_sets_count += 1
             continue        
@@ -447,6 +491,18 @@ def convert_to_deepfurniture_format(sets_of_items_data, output_file, max_item_nu
             skipped_sets_count += 1
             continue
         
+        # 重複チェック: クエリとターゲットに同じアイテムが含まれていないか確認
+        query_ids = set([d[0] for d in query_item_data_list])
+        target_ids = set([d[0] for d in target_item_data_list])
+        
+        if query_ids & target_ids:  # 重複が存在する場合
+            overlap_warning_count += 1
+            # 重複を解決: target側から重複するアイテムを除去
+            target_item_data_list = [d for d in target_item_data_list if d[0] not in query_ids]
+            if not target_item_data_list:  # ターゲットが空になった場合はスキップ
+                skipped_sets_count += 1
+                continue
+        
         q_ids_raw, q_main_cats_raw, q_feats_raw = zip(*[(d[0], d[1], d[2]) for d in query_item_data_list])
         t_ids_raw, t_main_cats_raw, t_feats_raw = zip(*[(d[0], d[1], d[2]) for d in target_item_data_list])
         
@@ -454,6 +510,7 @@ def convert_to_deepfurniture_format(sets_of_items_data, output_file, max_item_nu
             skipped_sets_count += 1
             continue
         
+        # 特徴量の妥当性チェック
         if not (q_feats_raw and isinstance(q_feats_raw[0], np.ndarray) and all(isinstance(f, np.ndarray) and f.shape == q_feats_raw[0].shape for f in q_feats_raw)):
             skipped_sets_count += 1
             continue
@@ -475,11 +532,29 @@ def convert_to_deepfurniture_format(sets_of_items_data, output_file, max_item_nu
         set_sizes_list.append(len(items_in_current_outfit_data))
     
     if skipped_sets_count > 0: 
-        print(f"DF Converting ({os.path.basename(output_file)}): Skipped {skipped_sets_count} sets.")
+        print(f"Converting ({os.path.basename(output_file)}): Skipped {skipped_sets_count} sets.")
+    if overlap_warning_count > 0:
+        print(f"Converting ({os.path.basename(output_file)}): Resolved {overlap_warning_count} query-target overlaps.")
     
     if not q_feats_list: 
         print(f"Warning: No data to save for {output_file}.")
         return {}
+    
+    # データの整合性最終チェック
+    print(f"Final data validation for {os.path.basename(output_file)}:")
+    print(f"  Query-Target overlap check...")
+    
+    final_overlap_count = 0
+    for i in range(len(q_ids_list)):
+        q_items = set([item for item in q_ids_list[i] if item != '0' and item != 0])
+        t_items = set([item for item in t_ids_list[i] if item != '0' and item != 0])
+        if q_items & t_items:
+            final_overlap_count += 1
+    
+    if final_overlap_count > 0:
+        print(f"  ❌ WARNING: {final_overlap_count} sets still have query-target overlap!")
+    else:
+        print(f"  ✅ No query-target overlap detected in final data.")
     
     df_tuple = (np.array(q_feats_list, dtype=np.float32), np.array(t_feats_list, dtype=np.float32), 
                 np.array(scene_ids_list, dtype=np.int32), np.array(q_main_cats_list, dtype=np.int32), 
@@ -496,11 +571,14 @@ def convert_to_deepfurniture_format(sets_of_items_data, output_file, max_item_nu
     
     return {'query_categories': df_tuple[3], 'target_categories': df_tuple[4]}
 
-def compute_iqon3000_category_centers(features_dir):
-    """Compute category centers for IQON3000 (7 categories) - 辞書形式で保存"""
-    print("\nComputing IQON3000 category centers...")
+# =============================================================================
+# 修正版: カテゴリ中心計算関数
+# =============================================================================
+
+def compute_iqon3000_category_centers_fixed(features_dir):
+    """修正版: IQON3000カテゴリ中心計算 - 辞書形式、正規化統一"""
+    print("\nComputing IQON3000 category centers (fixed version)...")
     
-    # 訓練データを読み込む
     train_path = os.path.join(features_dir, 'train.pkl')
     if not os.path.exists(train_path):
         print(f"Error: {train_path} not found")
@@ -509,7 +587,6 @@ def compute_iqon3000_category_centers(features_dir):
     with open(train_path, 'rb') as f:
         train_data = pickle.load(f)
     
-    # データ構造を確認
     if len(train_data) >= 8:
         query_features, target_features, scene_ids, query_categories, target_categories, set_sizes, query_item_ids, target_item_ids = train_data
     else:
@@ -534,10 +611,13 @@ def compute_iqon3000_category_centers(features_dir):
     features_per_main_category = {cat_id: [] for cat_id in active_main_cat_ids}
     
     # クエリとターゲットの特徴量を処理
-    all_features = np.concatenate([query_features, target_features], axis=0)  # (total_sets, max_items, feature_dim)
-    all_categories = np.concatenate([query_categories, target_categories], axis=0)  # (total_sets, max_items)
+    all_features = np.concatenate([query_features, target_features], axis=0)
+    all_categories = np.concatenate([query_categories, target_categories], axis=0)
     
     print("Collecting features by category...")
+    valid_feature_count = 0
+    invalid_feature_count = 0
+    
     for set_idx in tqdm(range(len(all_features)), desc="Processing sets"):
         for item_idx in range(len(all_features[set_idx])):
             feat = all_features[set_idx][item_idx]
@@ -545,24 +625,34 @@ def compute_iqon3000_category_centers(features_dir):
             
             # パディング（ゼロベクトル）とカテゴリ範囲外をスキップ
             if cat == 0 or np.all(feat == 0) or cat not in active_main_cat_ids:
+                invalid_feature_count += 1
                 continue
-                
+            
+            # 特徴量の正規化状態を確認（L2ノルムが1に近いかチェック）
+            feat_norm = np.linalg.norm(feat)
+            if feat_norm < 0.9 or feat_norm > 1.1:
+                # 正規化されていない場合は再正規化
+                feat = normalize_features_unified(feat.reshape(1, -1))[0]
+            
             features_per_main_category[cat].append(feat)
+            valid_feature_count += 1
+    
+    print(f"Processed {valid_feature_count} valid features, skipped {invalid_feature_count} invalid features")
     
     # カテゴリ中心を計算
     category_centers_dict = {}
     for main_cat_id in active_main_cat_ids:
         if features_per_main_category[main_cat_id]:
             center_vec = np.mean(np.stack(features_per_main_category[main_cat_id]), axis=0)
-            norm = np.linalg.norm(center_vec)
-            # 辞書のキーは1-based、値はPythonのリスト
-            category_centers_dict[main_cat_id] = (center_vec / norm if norm > 1e-9 else center_vec).tolist()
+            # 中心ベクトルも正規化
+            center_vec = normalize_features_unified(center_vec.reshape(1, -1))[0]
+            category_centers_dict[main_cat_id] = center_vec.tolist()
             print(f"Category {main_cat_id}: {len(features_per_main_category[main_cat_id])} features")
         else:
             print(f"Warning: No features for category ID {main_cat_id}. Initializing randomly.")
             rand_vec = np.random.randn(embedding_dim).astype(np.float32)
-            norm_rand = np.linalg.norm(rand_vec)
-            category_centers_dict[main_cat_id] = (rand_vec / norm_rand if norm_rand > 1e-9 else rand_vec).tolist()
+            rand_vec = normalize_features_unified(rand_vec.reshape(1, -1))[0]
+            category_centers_dict[main_cat_id] = rand_vec.tolist()
     
     # 辞書形式で保存
     output_path = os.path.join(features_dir, 'category_centers.pkl.gz')
@@ -585,43 +675,24 @@ def compute_iqon3000_category_centers(features_dir):
     
     return category_centers_dict
 
-def compute_deepfurniture_category_centers(features_dir):
-    """Compute category centers for DeepFurniture (11 categories) - 辞書形式で保存"""
-    # ... 既存のコード ...
-    
-    # 辞書形式で保存
-    category_centers_dict = {}
-    for i, cid in enumerate(sorted(unique_cats)):
-        mask = flat_cat == cid
-        if mask.any():
-            center_vec = flat_feat[mask].mean(axis=0)
-            category_centers_dict[int(cid)] = center_vec.tolist()  # リスト形式で保存
-        else:
-            category_centers_dict[int(cid)] = np.zeros(flat_feat.shape[1]).tolist()
-    
-    with gzip.open(os.path.join(features_dir, "category_centers.pkl.gz"), "wb") as f:
-        pickle.dump(category_centers_dict, f)
-    
-    print(f"Saved {len(category_centers_dict)} DeepFurniture category centers to category_centers.pkl.gz")
-
-    
 # =============================================================================
-# DeepFurniture Data Processing (11 categories)
+# DeepFurniture処理 (修正版)
 # =============================================================================
 
 def process_deepfurniture(image_dir, annotations_json, furnitures_jsonl, output_dir, batch_size=32):
-    """Process DeepFurniture dataset to 11 categories"""
+    """修正版DeepFurniture処理 - 重複除去と正規化統一"""
     print(f"Processing DeepFurniture dataset to 11 categories")
+    print("Key improvements: Proper duplicate removal, unified normalization")
     print(f"  Images: {image_dir}")
     print(f"  Annotations: {annotations_json}")
     print(f"  Furnitures: {furnitures_jsonl}")
     
     os.makedirs(output_dir, exist_ok=True)
     
-    # Load furniture metadata
+    # 家具メタデータの読み込み
     furniture_to_category = load_jsonl_mapping(Path(furnitures_jsonl), "furniture_id", "category_id")
     
-    # Setup device and model
+    # デバイスとモデルの設定
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
@@ -630,7 +701,7 @@ def process_deepfurniture(image_dir, annotations_json, furnitures_jsonl, output_
     model = model.to(device)
     model.eval()
     
-    # Find and process images
+    # 画像ファイルの検索と処理
     image_files = []
     for ext in ("*.jpg", "*.png", "*.jpeg"):
         image_files.extend(Path(image_dir).rglob(ext))
@@ -638,7 +709,11 @@ def process_deepfurniture(image_dir, annotations_json, furnitures_jsonl, output_
     valid_images = [img for img in image_files if img.stem in furniture_to_category]
     print(f"Found {len(valid_images)} valid images")
     
-    # Extract features
+    # 重複除去のための追跡
+    processed_furniture_ids = set()
+    duplicate_count = 0
+    
+    # 特徴量抽出
     all_features = []
     all_furniture_ids = []
     
@@ -646,21 +721,38 @@ def process_deepfurniture(image_dir, annotations_json, furnitures_jsonl, output_
         for i in tqdm(range(0, len(valid_images), batch_size), desc="Extracting DeepFurniture features"):
             batch_paths = valid_images[i:i+batch_size]
             
+            # 重複チェック付きでバッチを処理
+            filtered_batch_paths = []
+            for path in batch_paths:
+                furniture_id = path.stem
+                if furniture_id not in processed_furniture_ids:
+                    processed_furniture_ids.add(furniture_id)
+                    filtered_batch_paths.append(path)
+                else:
+                    duplicate_count += 1
+            
+            if not filtered_batch_paths:
+                continue
+            
             try:
-                pil_images = [Image.open(p).convert("RGB") for p in batch_paths]
+                pil_images = [Image.open(p).convert("RGB") for p in filtered_batch_paths]
                 inputs = processor(images=pil_images, return_tensors="pt", padding=True)
                 inputs = {k: v.to(device) for k, v in inputs.items()}
                 
                 output = model.get_image_features(**inputs)
-                output = output / output.norm(dim=1, keepdim=True)  # Normalize
-                batch_feats = output.cpu().numpy()
+                # 統一された正規化処理
+                output_normalized = normalize_features_unified(output)
+                batch_feats = output_normalized.cpu().numpy()
                 
                 all_features.append(batch_feats)
-                all_furniture_ids.extend([p.stem for p in batch_paths])
+                all_furniture_ids.extend([p.stem for p in filtered_batch_paths])
                 
             except Exception as e:
                 print(f"Error processing batch: {e}")
                 continue
+    
+    if duplicate_count > 0:
+        print(f"Removed {duplicate_count} duplicate furniture items")
     
     if not all_features:
         print("No features extracted, exiting")
@@ -669,7 +761,7 @@ def process_deepfurniture(image_dir, annotations_json, furnitures_jsonl, output_
     all_features = np.vstack(all_features)
     print(f"Extracted features: {all_features.shape}")
     
-    # Load scene annotations and build scenes
+    # シーンアノテーションの読み込みとシーン構築
     with open(annotations_json, 'r') as f:
         annotations = json.load(f)
     
@@ -681,7 +773,8 @@ def process_deepfurniture(image_dir, annotations_json, furnitures_jsonl, output_
         if not scene_id:
             continue
         
-        scene_items_unique = {} # 重複を排除するための辞書 {furniture_id: (feature, category_id)}
+        # 重複除去: 同じfurniture_idは1つのみ保持
+        scene_items_unique = {}
         
         for instance in scene_record.get("instances", []):
             furniture_id = str(instance.get("identityID"))
@@ -690,15 +783,14 @@ def process_deepfurniture(image_dir, annotations_json, furnitures_jsonl, output_
             if not furniture_id or category_id is None:
                 continue
  
+            # 重複チェック: 同じfurniture_idは最初のもののみ保持
             if furniture_id not in scene_items_unique:
-                # Find feature for this furniture_id
                 if furniture_id in all_furniture_ids:
                     idx = all_furniture_ids.index(furniture_id)
-                    # 辞書にIDをキーとして保存することで、自動的に重複が排除される
                     scene_items_unique[furniture_id] = (all_features[idx], category_id)
 
-        # 重複排除されたアイテムを使ってシーンを再構築
-        if len(scene_items_unique) >= 4: # 最小アイテム数のチェック
+        # 有効なシーンの構築（4個以上のユニークアイテム）
+        if len(scene_items_unique) >= 4:
             item_ids_final = list(scene_items_unique.keys())
             features_final = np.array([v[0] for v in scene_items_unique.values()])
             categories_final = np.array([v[1] for v in scene_items_unique.values()])
@@ -713,13 +805,13 @@ def process_deepfurniture(image_dir, annotations_json, furnitures_jsonl, output_
     print(f"Built {len(scenes)} valid DeepFurniture scenes")
     print(f"Found category IDs in scenes: {sorted(list(category_ids_in_scenes))}")
     
-    # Convert scenes to DeepFurniture format with z-score normalization
-    convert_scenes_to_deepfurniture_format(scenes, output_dir)
+    # シーンをDeepFurniture形式に変換
+    convert_scenes_to_deepfurniture_format_fixed(scenes, output_dir)
     
-    # Compute category centers for DeepFurniture (11 categories)
-    compute_deepfurniture_category_centers(output_dir)
+    # カテゴリ中心の計算（11カテゴリ用）
+    compute_deepfurniture_category_centers_fixed(output_dir)
     
-    # Save category mapping
+    # カテゴリマッピングの保存
     with open(os.path.join(output_dir, 'category_mapping.json'), 'w', encoding='utf-8') as f:
         json.dump({
             'categories': DEEPFURNITURE_CATEGORIES
@@ -728,7 +820,7 @@ def process_deepfurniture(image_dir, annotations_json, furnitures_jsonl, output_
     print(f"DeepFurniture processing complete. Files saved to {output_dir}")
 
 def load_jsonl_mapping(path, key_field, value_field):
-    """Load JSONL file mapping"""
+    """JSONL ファイルマッピングの読み込み"""
     mapping = {}
     unique_values_found = set()
     
@@ -758,8 +850,8 @@ def load_jsonl_mapping(path, key_field, value_field):
     
     return mapping
 
-def convert_scenes_to_deepfurniture_format(scenes, output_dir, min_items=4, max_items=20, max_item_num=10):
-    """Convert scenes to DeepFurniture format with proper scene-based split"""
+def convert_scenes_to_deepfurniture_format_fixed(scenes, output_dir, min_items=4, max_items=20, max_item_num=10):
+    """修正版: シーンをDeepFurniture形式に変換 - 重複チェック強化"""
     from collections import defaultdict
     import numpy as np
     import random
@@ -768,7 +860,7 @@ def convert_scenes_to_deepfurniture_format(scenes, output_dir, min_items=4, max_
     import pickle
     import os
     
-    # Build partitions - シーンごとにクエリとポジティブを作成
+    # シーンごとにクエリとポジティブを作成
     q_feats, p_feats, q_cats, p_cats, q_ids, p_ids, s_keys = [], [], [], [], [], [], []
     
     rng = random.Random(42)
@@ -776,6 +868,7 @@ def convert_scenes_to_deepfurniture_format(scenes, output_dir, min_items=4, max_
     # 統計情報
     scene_count = 0
     skipped_scenes = 0
+    overlap_resolved_count = 0
     
     for sid, rec in tqdm(scenes.items(), desc="Converting DeepFurniture scenes"):
         feats, cats, ids = rec["features"], rec["category_ids"], rec["item_ids"]
@@ -794,10 +887,17 @@ def convert_scenes_to_deepfurniture_format(scenes, output_dir, min_items=4, max_
         q_idx = idx[:half]      # クエリ用インデックス
         p_idx = idx[half:]      # ポジティブ用インデックス
         
-        # クエリとポジティブに同じアイテムが含まれないことを確認
-        assert len(set(q_idx) & set(p_idx)) == 0, f"Query and positive indices overlap in scene {sid}"
+        # 重複チェック（デバッグ用）
+        q_items_set = set([ids[i] for i in q_idx])
+        p_items_set = set([ids[i] for i in p_idx])
         
-        # Pad function
+        if q_items_set & p_items_set:
+            print(f"WARNING: Scene {sid} has overlapping items between query and positive!")
+            print(f"  Overlapping items: {q_items_set & p_items_set}")
+            overlap_resolved_count += 1
+            continue
+        
+        # パディング関数
         def pad_df(arr, target, pad_val=0):
             cur = len(arr)
             if cur < target:
@@ -811,30 +911,22 @@ def convert_scenes_to_deepfurniture_format(scenes, output_dir, min_items=4, max_
                 arr = arr[:target]
             return arr
         
-        # Query
+        # クエリ
         qf = pad_df(feats[q_idx], max_item_num)
         qi = pad_df(ids[q_idx], max_item_num, pad_val="")
         qc = pad_df(cats[q_idx], max_item_num, pad_val=0)
         
-        # Positive
+        # ポジティブ
         pf = pad_df(feats[p_idx], max_item_num)
         pi = pad_df(ids[p_idx], max_item_num, pad_val="")
         pc = pad_df(cats[p_idx], max_item_num, pad_val=0)
-        
-        # 重複チェック（デバッグ用）
-        q_items_set = set(ids[q_idx])
-        p_items_set = set(ids[p_idx])
-        if q_items_set & p_items_set:
-            print(f"WARNING: Scene {sid} has overlapping items between query and positive!")
-            print(f"  Overlapping items: {q_items_set & p_items_set}")
-            continue
         
         q_feats.append(qf); q_ids.append(qi); q_cats.append(qc)
         p_feats.append(pf); p_ids.append(pi); p_cats.append(pc)
         s_keys.append(sid)
         scene_count += 1
     
-    print(f"\nProcessed {scene_count} scenes (skipped {skipped_scenes} scenes)")
+    print(f"\nProcessed {scene_count} scenes (skipped {skipped_scenes} scenes, resolved {overlap_resolved_count} overlaps)")
     
     if not q_feats:
         print("No valid scenes found for conversion")
@@ -847,9 +939,9 @@ def convert_scenes_to_deepfurniture_format(scenes, output_dir, min_items=4, max_
     pcat = np.stack(p_cats)
     qid = np.stack(q_ids)
     pid = np.stack(p_ids)
-    sids = np.array(s_keys)  # これは文字列のリストをNumPy配列に変換
+    sids = np.array(s_keys)
     
-    # Category remap (padding=0としてマップ)
+    # カテゴリリマップ（パディング=0）
     unique = np.unique(np.concatenate([qcat, pcat]))
     unique = unique[unique > 0]
     cat_map = {cid: i + 1 for i, cid in enumerate(sorted(unique))}
@@ -860,7 +952,6 @@ def convert_scenes_to_deepfurniture_format(scenes, output_dir, min_items=4, max_
     print(f"Found {len(unique)} unique categories, remapped to 1-{len(unique)}")
     
     # シーンベースでtrain/val/testに分割
-    # インデックスで分割を管理
     indices = np.arange(len(Q))
     
     # 70/15/15の割合で分割
@@ -905,27 +996,18 @@ def convert_scenes_to_deepfurniture_format(scenes, output_dir, min_items=4, max_
     check_query_positive_overlap("Validation", qid_val, pid_val)
     check_query_positive_overlap("Test", qid_te, pid_te)
     
-    # Z-score normalization
-    def zscore_normalize(x):
-        mean = x.mean(axis=(0, 1), keepdims=True)
-        std = x.std(axis=(0, 1), keepdims=True) + 1e-7
-        return (x - mean) / std
-    
-    Q_tr = zscore_normalize(Q_tr)
-    P_tr = zscore_normalize(P_tr)
-    Q_val = zscore_normalize(Q_val)
-    P_val = zscore_normalize(P_val)
-    Q_te = zscore_normalize(Q_te)
-    P_te = zscore_normalize(P_te)
+    # 正規化は既に統一されているためZ-score正規化は削除
+    # すべての特徴量は既にL2正規化済み
+    print(f"Features are already L2-normalized, skipping additional normalization")
     
     print(f"\nDeepFurniture split: Train {len(Q_tr)}, Validation {len(Q_val)}, Test {len(Q_te)}")
     
-    # Save partitions - 元の形式を維持
+    # 分割データの保存
     def save_partition(path, objects):
         with open(path, "wb") as f:
             pickle.dump(objects, f)
     
-    # set_sizesはすべて0で初期化（元のコードと同じ）
+    # 元の形式を維持してset_sizesは0で初期化
     save_partition(os.path.join(output_dir, "train.pkl"), 
                   (Q_tr, P_tr, sid_tr, qcat_tr, pcat_tr, np.zeros(len(Q_tr)), qid_tr, pid_tr))
     save_partition(os.path.join(output_dir, "validation.pkl"), 
@@ -935,30 +1017,37 @@ def convert_scenes_to_deepfurniture_format(scenes, output_dir, min_items=4, max_
     
     print("\n✅ Dataset saved successfully!")
 
-
-def compute_deepfurniture_category_centers(features_dir):
-    """Compute category centers for DeepFurniture (11 categories) - 辞書形式で保存"""
+def compute_deepfurniture_category_centers_fixed(features_dir):
+    """修正版: DeepFurnitureカテゴリ中心計算 - 辞書形式、正規化統一"""
     train_path = os.path.join(features_dir, 'train.pkl')
     
     with open(train_path, 'rb') as f:
         Q_tr, P_tr, _, qcat_tr, pcat_tr, _, _, _ = pickle.load(f)
     
-    # Category centers (train only)
+    # カテゴリ中心計算（訓練データのみ）
     flat_feat = np.concatenate([Q_tr.reshape(-1, Q_tr.shape[-1]), P_tr.reshape(-1, P_tr.shape[-1])])
     flat_cat = np.concatenate([qcat_tr.reshape(-1), pcat_tr.reshape(-1)])
     
     unique_cats = np.unique(flat_cat)
     unique_cats = unique_cats[unique_cats > 0]
     
-    # 辞書形式で保存（既存コードとの互換性のため）
+    # 辞書形式で保存（互換性のため）
     category_centers_dict = {}
+    
+    print("Computing DeepFurniture category centers...")
     for cid in sorted(unique_cats):
         mask = flat_cat == cid
         if mask.any():
             center_vec = flat_feat[mask].mean(axis=0)
-            category_centers_dict[int(cid)] = center_vec.tolist()  # リスト形式で保存
+            # 中心ベクトルも正規化
+            center_vec = normalize_features_unified(center_vec.reshape(1, -1))[0]
+            category_centers_dict[int(cid)] = center_vec.tolist()
+            print(f"Category {cid}: {mask.sum()} features")
         else:
-            category_centers_dict[int(cid)] = np.zeros(flat_feat.shape[1]).tolist()
+            # 空のカテゴリにはランダムな正規化ベクトルを割り当て
+            rand_vec = np.random.randn(flat_feat.shape[1]).astype(np.float32)
+            rand_vec = normalize_features_unified(rand_vec.reshape(1, -1))[0]
+            category_centers_dict[int(cid)] = rand_vec.tolist()
     
     import gzip
     with gzip.open(os.path.join(features_dir, "category_centers.pkl.gz"), "wb") as f:
@@ -967,11 +1056,11 @@ def compute_deepfurniture_category_centers(features_dir):
     print(f"Saved {len(category_centers_dict)} DeepFurniture category centers to category_centers.pkl.gz")
 
 # =============================================================================
-# Main Function
+# メイン関数
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Unified dataset generator for IQON3000 and DeepFurniture")
+    parser = argparse.ArgumentParser(description="Fixed unified dataset generator for IQON3000 and DeepFurniture")
     parser.add_argument('--dataset', choices=['iqon3000', 'deepfurniture'], required=True,
                       help='Dataset type to process')
     parser.add_argument('--batch-size', type=int, default=32,
@@ -998,13 +1087,21 @@ def main():
     if args.dataset == 'iqon3000':
         if not args.input_dir:
             parser.error("--input-dir is required for IQON3000 dataset")
-        print("Processing IQON3000 dataset: 7 categories (outerwear, tops, bottoms, shoes, bags, hats, accessories)")
+        print("🔥 Processing IQON3000 dataset: 7 categories (FIXED VERSION)")
+        print("   Key improvements:")
+        print("   - Duplicate removal: same item_id only appears once")
+        print("   - Unified normalization: L2 normalization only")
+        print("   - Query-target overlap prevention")
         process_iqon3000(args.input_dir, args.output_dir, args.batch_size)
         
     elif args.dataset == 'deepfurniture':
         if not all([args.image_dir, args.annotations_json, args.furnitures_jsonl]):
             parser.error("--image-dir, --annotations-json, and --furnitures-jsonl are required for DeepFurniture dataset")
-        print("Processing DeepFurniture dataset: 11 categories (chair, table, sofa, bed, cabinet, lamp, bookshelf, desk, dresser, nightstand, other_furniture)")
+        print("🔥 Processing DeepFurniture dataset: 11 categories (FIXED VERSION)")
+        print("   Key improvements:")
+        print("   - Duplicate removal: same furniture_id only appears once")
+        print("   - Unified normalization: L2 normalization only")
+        print("   - Query-target overlap prevention")
         process_deepfurniture(args.image_dir, args.annotations_json, 
                             args.furnitures_jsonl, args.output_dir, args.batch_size)
 
