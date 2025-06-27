@@ -824,19 +824,31 @@ def evaluate_model_comprehensive(model, test_items, gallery_by_category, dataset
         if ranks:
             all_ranks.extend(ranks)
             ranks_np = np.array(ranks)
-            category_results[str(cat_id)] = {'count': len(ranks_np), 'gallery_size': len(gallery['ids']),
-                'mrr': np.mean(1.0 / ranks_np), 'r_at_1': np.mean(ranks_np <= 1),
-                'r_at_5': np.mean(ranks_np <= 5), 'r_at_10': np.mean(ranks_np <= 10),
-                'mnr': np.mean(ranks_np), 'mdr': np.median(ranks_np),
+            category_results[str(cat_id)] = {
+                'count': len(ranks_np), 
+                'gallery_size': len(gallery['ids']),
+                'mrr': np.mean(1.0 / ranks_np), 
+                'r_at_1': np.mean(ranks_np <= 1),
+                'r_at_5': np.mean(ranks_np <= 5), 
+                'r_at_10': np.mean(ranks_np <= 10),
+                'r_at_20': np.mean(ranks_np <= 20),
+                'mnr': np.mean(ranks_np), 
+                'mdr': np.median(ranks_np),
                 'rsum': np.sum(ranks_np)}
     
     overall_results = {}
     if all_ranks:
         all_ranks_np = np.array(all_ranks)
-        overall_results = {'total_queries': len(all_ranks_np), 'successful_predictions': len(all_ranks_np),
-            'mrr': np.mean(1.0 / all_ranks_np), 'r_at_1': np.mean(all_ranks_np <= 1),
-            'r_at_5': np.mean(all_ranks_np <= 5), 'r_at_10': np.mean(all_ranks_np <= 10),
-            'mnr': np.mean(all_ranks_np), 'mdr': np.median(all_ranks_np),
+        overall_results = {
+            'total_queries': len(all_ranks_np), 
+            'successful_predictions': len(all_ranks_np),
+            'mrr': np.mean(1.0 / all_ranks_np), 
+            'r_at_1': np.mean(all_ranks_np <= 1),
+            'r_at_5': np.mean(all_ranks_np <= 5), 
+            'r_at_10': np.mean(all_ranks_np <= 10),
+            'r_at_20': np.mean(ranks_np <= 20),
+            'mnr': np.mean(all_ranks_np), 
+            'mdr': np.median(all_ranks_np),
             'rsum': np.sum(all_ranks_np)}
     return {'dataset': dataset_type, 'overall': overall_results, 'categories': category_results}
 
@@ -863,3 +875,5 @@ def evaluate_model(model, test_data, output_dir: str, data_dir: str):
         import traceback
         traceback.print_exc()
         return None
+
+

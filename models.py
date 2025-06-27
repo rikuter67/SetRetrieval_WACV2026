@@ -1,23 +1,83 @@
 """
-models.py - Correct Set Retrieval Model Implementation
-======================================================
-Based on your actual problem setting: Query set → Target set prediction
-with category-wise cross-attention and contrastive learning.
+models.py - Fixed Set Retrieval Model Implementation with Correct TopK Metrics
+============================================================================
 """
 
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers, Model
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 import math
+import pdb
 
+class BatchTopKAccuracy(tf.keras.metrics.Metric):
+    """動作する型安全なバッチ内TopK正解率メトリック"""
+    
+    def __init__(self, k=1, name='top1_accuracy', **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.k = tf.constant(float(k), dtype=tf.float32)
+        self.total_correct = self.add_weight(name='total_correct', initializer='zeros', dtype=tf.float32)
+        self.total_count = self.add_weight(name='total_count', initializer='zeros', dtype=tf.float32)
+    
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        """
+        Return文なしの安全な実装
+        """
+        similarities = tf.cast(y_pred, tf.float32)
+        batch_size = tf.cast(tf.shape(similarities)[0], tf.float32)
+        
+        def compute_metrics():
+            """メトリック計算"""
+            # 対角線要素
+            diagonal = tf.linalg.diag_part(similarities)
+            
+            # 各行で対角線要素より大きい要素の数
+            expanded_diag = tf.expand_dims(diagonal, axis=1)
+            better_mask = similarities > expanded_diag
+            
+            # 対角線位置を除外
+            batch_size_int = tf.cast(batch_size, tf.int32)
+            eye_mask = tf.eye(batch_size_int, dtype=tf.bool)
+            better_mask = tf.logical_and(better_mask, tf.logical_not(eye_mask))
+            
+            # ランク計算（すべてfloat32）
+            num_better = tf.reduce_sum(tf.cast(better_mask, tf.float32), axis=1)
+            ranks = num_better + tf.constant(1.0, dtype=tf.float32)
+            
+            # Top-K判定
+            k_threshold = tf.minimum(self.k, batch_size - tf.constant(1.0, dtype=tf.float32))
+            k_threshold = tf.maximum(k_threshold, tf.constant(1.0, dtype=tf.float32))
+            
+            correct = tf.reduce_sum(tf.cast(ranks <= k_threshold, tf.float32))
+            
+            return correct, batch_size
+        
+        def skip_metrics():
+            """スキップ時"""
+            return tf.constant(0.0, dtype=tf.float32), tf.constant(0.0, dtype=tf.float32)
+        
+        # 条件分岐でメトリック計算
+        correct_count, valid_count = tf.cond(
+            tf.greater(batch_size, tf.constant(1.0, dtype=tf.float32)),
+            compute_metrics,
+            skip_metrics
+        )
+        
+        # 統計更新
+        self.total_correct.assign_add(correct_count)
+        self.total_count.assign_add(valid_count)
+    
+    def result(self):
+        accuracy = tf.math.divide_no_nan(self.total_correct, self.total_count)
+        return accuracy * 100.0  # パーセント変換
+    
+    def reset_state(self):
+        self.total_correct.assign(0.0)
+        self.total_count.assign(0.0)
 
 class SetRetrievalModel(Model):
     """
-    Set Retrieval Model - Correct Implementation
-    
-    Query set → Category-wise Target set prediction
-    with cross-attention and contrastive learning
+    Set Retrieval Model - Fixed Implementation with Proper TopK Metrics
     """
     
     def __init__(self, 
@@ -29,8 +89,12 @@ class SetRetrievalModel(Model):
                  use_cycle_loss: bool = False,
                  temperature: float = 1.0,
                  dropout_rate: float = 0.1,
+                 k_values: List[int] = None,
+                 cycle_lambda: float= 0.1,
                  **kwargs):
-        
+
+        # Remove k_values from kwargs to avoid conflicts
+        kwargs.pop('k_values', None)        
         super().__init__(**kwargs)
         
         # Configuration
@@ -42,6 +106,8 @@ class SetRetrievalModel(Model):
         self.use_cycle_loss = use_cycle_loss
         self.temperature = temperature
         self.dropout_rate = dropout_rate
+        self.k_values = k_values if k_values is not None else [1, 5, 10, 20]
+        self.cycle_lambda = cycle_lambda
         
         # Category centers (learnable)
         self.category_centers = None
@@ -49,24 +115,27 @@ class SetRetrievalModel(Model):
         # Build layers
         self._build_layers()
         
-        print(f"[INFO] SetRetrievalModel created (Correct):")
+        # Build TopK metrics - 修正版
+        self._build_topk_metrics()
+        
+        print(f"[INFO] SetRetrievalModel created (Fixed TopK):")
         print(f"  - Feature dim: {feature_dim}")
         print(f"  - Heads: {num_heads}, Layers: {num_layers}")
         print(f"  - Categories: {num_categories}")
-        print(f"  - Cross-attention: Category centers as queries")
         print(f"  - Temperature: {temperature}")
+        print(f"  - TopK values: {self.k_values}")
     
     def _build_layers(self):
         """Build model layers"""
         
-        # Input projection for query set
+        # Input projection
         self.input_projection = layers.Dense(
             self.hidden_dim,
             activation='relu',
             name='input_projection'
         )
         
-        # Cross-attention layers (Category centers → Query set)
+        # Cross-attention layers
         self.cross_attention_layers = []
         for i in range(self.num_layers):
             layer_dict = {
@@ -93,7 +162,7 @@ class SetRetrievalModel(Model):
             }
             self.cross_attention_layers.append(layer_dict)
         
-        # Final output projection to feature space
+        # Output projection
         self.output_projection = layers.Dense(
             self.feature_dim,
             activation=None,
@@ -102,6 +171,24 @@ class SetRetrievalModel(Model):
         
         # Output normalization
         self.output_norm = layers.LayerNormalization(epsilon=1e-6, name='output_norm')
+
+    def _build_topk_metrics(self):
+        self.topk_metrics = {}
+        
+        # Training metrics
+        for k in sorted(self.k_values): 
+            metric = BatchTopKAccuracy(k=k, name=f'top{k}_accuracy')
+            self.topk_metrics[f'top{k}_accuracy'] = metric
+        
+        # Validation metrics - 名前とキーを一致させる
+        for k in sorted(self.k_values): 
+            val_metric = BatchTopKAccuracy(k=k, name=f'val_top{k}_accuracy')  # 名前にval_を含める
+            self.topk_metrics[f'val_top{k}_accuracy'] = val_metric
+
+    @property
+    def metrics(self):
+        """Return list of all metrics"""
+        return list(self.topk_metrics.values())
     
     def set_category_centers(self, centers: np.ndarray):
         """Set category cluster centers"""
@@ -111,7 +198,7 @@ class SetRetrievalModel(Model):
         # L2 normalize centers
         centers = centers / (np.linalg.norm(centers, axis=1, keepdims=True) + 1e-8)
         
-        # Create learnable category centers initialized with cluster centers
+        # Create learnable category centers
         self.category_centers = self.add_weight(
             name='category_centers',
             shape=(self.num_categories, self.hidden_dim),
@@ -119,9 +206,9 @@ class SetRetrievalModel(Model):
             trainable=True
         )
         
-        # Initialize with provided centers (project if needed)
+        # Initialize with provided centers
         if centers.shape[1] != self.hidden_dim:
-            # Simple projection if dimensions don't match
+            # Project if dimensions don't match
             init_centers = np.random.normal(0, 0.02, (self.num_categories, self.hidden_dim)).astype(np.float32)
         else:
             init_centers = centers.astype(np.float32)
@@ -134,14 +221,11 @@ class SetRetrievalModel(Model):
         
         # Parse inputs
         if isinstance(inputs, dict):
-            query_features = inputs['query_features']  # [batch, seq_len, feature_dim]
-            query_categories = inputs.get('query_categories')  # Not used in cross-attention
+            query_features = inputs['query_features']
         else:
-            # Legacy support
             query_features = inputs[0]
-            query_categories = inputs[1] if len(inputs) > 1 else None
         
-        # Process query set
+        # Forward pass
         predictions = self._forward_pass(query_features, training)
         
         return predictions
@@ -152,25 +236,25 @@ class SetRetrievalModel(Model):
         batch_size = tf.shape(query_features)[0]
         
         # Project query features
-        query_projected = self.input_projection(query_features)  # [batch, seq_len, hidden_dim]
+        query_projected = self.input_projection(query_features)
         
-        # Get category centers and expand for batch
+        # Get category centers
         if self.category_centers is None:
             raise ValueError("Category centers not set! Call set_category_centers() first.")
         
-        # Category centers as queries: [batch, num_categories, hidden_dim]
+        # Expand category centers for batch
         category_queries = tf.expand_dims(self.category_centers, 0)
         category_queries = tf.tile(category_queries, [batch_size, 1, 1])
         
-        # Cross-attention: Category centers attend to query set
+        # Cross-attention layers
         x = category_queries
         
         for layer_dict in self.cross_attention_layers:
-            # Cross-attention: categories (queries) attend to query set (keys, values)
+            # Cross-attention: categories attend to query set
             cross_attn_out = layer_dict['cross_attention'](
-                query=x,                    # Category centers
-                key=query_projected,        # Query set
-                value=query_projected,      # Query set
+                query=x,
+                key=query_projected,
+                value=query_projected,
                 training=training
             )
             x = layer_dict['norm1'](x + cross_attn_out, training=training)
@@ -188,227 +272,457 @@ class SetRetrievalModel(Model):
             ffn_out = layer_dict['ffn'](x, training=training)
             x = layer_dict['norm3'](x + ffn_out, training=training)
         
-        # Project to target feature space
-        predictions = self.output_projection(x)  # [batch, num_categories, feature_dim]
-        
-        # L2 normalize predictions
+        predictions = self.output_projection(x)
         predictions = tf.nn.l2_normalize(predictions, axis=-1)
         
-        return self.output_norm(predictions)
-    
-# models.py -> SetRetrievalModel 内のメソッドを修正
+        return self.output_norm(predictions) 
 
+    def _compute_set_similarities_fixed(self, predictions, target_features):
+        """
+        セット類似度計算の修正版 - カテゴリ情報を保持
+        
+        Args:
+            predictions: [batch, num_categories, feature_dim]
+            target_features: [batch, seq_len, feature_dim]
+            
+        Returns:
+            similarities: [batch, batch] - Set similarity matrix
+        """
+        batch_size = tf.shape(predictions)[0]
+        
+        # ターゲット表現を計算（平均）
+        target_mask = tf.reduce_sum(tf.abs(target_features), axis=-1) > 0
+        target_mask_expanded = tf.expand_dims(target_mask, -1)
+        
+        masked_targets = target_features * tf.cast(target_mask_expanded, tf.float32)
+        target_sum = tf.reduce_sum(masked_targets, axis=1)
+        target_count = tf.maximum(tf.reduce_sum(tf.cast(target_mask, tf.float32), axis=1, keepdims=True), 1.0)
+        target_repr = target_sum / target_count  # [batch, feature_dim]
+        
+        similarities = tf.zeros([batch_size, batch_size])
+        
+        for cat in range(self.num_categories):
+            cat_pred = predictions[:, cat, :]  # [B, D]
+            cat_similarities = tf.matmul(cat_pred, target_repr, transpose_b=True)
+            similarities = tf.maximum(similarities, cat_similarities)
+        
+        return similarities
+    
     def train_step(self, data):
-        """Custom training step with proper contrastive loss"""
+        """Custom training step with fixed TopK metrics"""
         batch_data = data
 
         with tf.GradientTape() as tape:
-            predictions = self(batch_data, training=True)
+            query_features = batch_data['query_features']
+            query_categories = batch_data['query_categories']
             target_features = batch_data['target_features']
-            target_categories = batch_data['target_categories'] # カテゴリ情報を取得
+            target_categories = batch_data['target_categories']
 
-            # 新しい損失関数を呼び出す
-            loss = contrastive_loss_per_item(
-                predictions,
+            predictions_Y = self(batch_data, training=True) #Y'
+
+            # Compute contrastive loss
+            loss_query_to_target  = contrastive_loss_per_item(
+                predictions_Y,
                 target_features,
-                target_categories, # カテゴリ情報を渡す
+                target_categories,
                 temperature=self.temperature
             )
 
-            # Cycle Loss (オプション) は、同様に新しい損失関数を使うように修正が必要
-            # 今回は一旦主要な損失に焦点を当てるため、Cycle Lossのロジックは省略
-            # if self.use_cycle_loss: ...
+            if self.use_cycle_loss:
+                cycle_batch_data = {
+                    'query_features': predictions_Y,
+                    'query_categories': target_categories,
+                    'target_features': query_features,
+                    'target_categories': query_categories
+                }
+                predictions_X = self(cycle_batch_data, training=True) #X'
 
-        gradients = tape.gradient(loss, self.trainable_variables)
+                loss_target_to_query = contrastive_loss_per_item(
+                    predictions_X,
+                    query_features,
+                    query_categories,
+                    temperature=self.temperature
+                )
+
+                total_loss = loss_query_to_target + self.cycle_lambda * loss_target_to_query
+
+            else:
+                loss_target_to_query = tf.constant(0.0)
+                total_loss = loss_query_to_target
+
+        # Apply gradients
+        gradients = tape.gradient(total_loss, self.trainable_variables)
         self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
+
+        # Compute set similarities for TopK metrics - 修正版を使用
+        similarities = self._compute_set_similarities_fixed(predictions_Y, target_features)
         
-        # metricsを更新（必要であれば）
-        self.compiled_metrics.update_state(tf.zeros_like(loss), loss) # ダミーのyとy_pred
-        return {m.name: m.result() for m in self.metrics}
+        # Update TopK metrics
+        dummy_y_true = tf.zeros_like(similarities)
+        for k in sorted(self.k_values):
+            metric_name = f'top{k}_accuracy'
+            if metric_name in self.topk_metrics:
+                self.topk_metrics[metric_name].update_state(dummy_y_true, similarities)
+        
+        # Compile results
+        results = {
+            'loss': total_loss,
+            "X->Y' Loss": loss_query_to_target, 
+            "Y'->X' Loss": loss_target_to_query                 
+        }
+        for k in sorted(self.k_values):
+            metric_name = f'top{k}_accuracy'
+            if metric_name in self.topk_metrics:
+                results[metric_name] = self.topk_metrics[metric_name].result()
+        
+        return results
+
 
 
     def test_step(self, data):
-        """Test step"""
+        """Test step with true cycle consistency loss using predictions as input"""
         batch_data = data
         
-        predictions = self(batch_data, training=False)
+        query_features = batch_data['query_features']
         target_features = batch_data['target_features']
-        target_categories = batch_data['target_categories'] # カテゴリ情報を取得
+        query_categories = batch_data['query_categories']
+        target_categories = batch_data['target_categories']
 
-        # 新しい損失関数を呼び出す
-        test_loss = contrastive_loss_per_item(
-            predictions,
+        # Forward direction: Query → Target prediction
+        predictions_Y = self(batch_data, training=False)
+        loss_query_to_target = contrastive_loss_per_item(
+            predictions_Y,
             target_features,
-            target_categories, # カテゴリ情報を渡す
+            target_categories,
             temperature=self.temperature
         )
-        
-        self.compiled_metrics.update_state(tf.zeros_like(test_loss), test_loss)
-        return {m.name: m.result() for m in self.metrics}
 
-# models.py -> contrastive_loss_with_negatives (修正後)
-def contrastive_loss_with_negatives(predictions, targets, negative_samples=None, temperature=1.0):
+        # Cycle consistency (if enabled)
+        if self.use_cycle_loss:
+            cycle_batch_data = {
+                'query_features': predictions_Y,
+                'query_categories': target_categories,  # train_stepと同じ
+                'target_features': query_features,
+                'target_categories': query_categories
+            }
+            predictions_X = self(cycle_batch_data, training=False) #X'
+
+            # ✅ 正しい：cycle_lossではなく、loss_target_to_queryを計算
+            loss_target_to_query = contrastive_loss_per_item(
+                predictions_X,
+                query_features,
+                query_categories,
+                temperature=self.temperature
+            )
+
+            total_loss = loss_query_to_target + self.cycle_lambda * loss_target_to_query
+        else:
+            loss_target_to_query = tf.constant(0.0)
+            total_loss = loss_query_to_target
+        
+        similarities = self._compute_set_similarities_fixed(predictions_Y, target_features)
+        
+        dummy_y_true = tf.zeros_like(similarities)
+        for k in sorted(self.k_values):
+            val_metric_name = f'val_top{k}_accuracy'
+            if val_metric_name in self.topk_metrics:
+                self.topk_metrics[val_metric_name].update_state(dummy_y_true, similarities)
+        
+        results = {
+            'loss': total_loss,
+            "X->Y' Loss": loss_query_to_target, 
+            "Y'->X' Loss": loss_target_to_query                 
+        }
+        for k in sorted(self.k_values):
+            val_metric_name = f'val_top{k}_accuracy'
+            if val_metric_name in self.topk_metrics:
+                results[f'top{k}_accuracy'] = self.topk_metrics[val_metric_name].result()
+        
+        return results
+
+
+def contrastive_loss_per_item(predictions, target_features, target_categories, temperature=1.0):
     """
-    Contrastive loss for set retrieval (Vectorized Version with dimension fix)
+    Contrastive Loss - Compares predictions to individual items
     
     Args:
-        predictions: [batch, num_categories, feature_dim] - Predicted target sets
-        targets: [batch, seq_len, feature_dim] - Ground truth target items
-        negative_samples: [batch, seq_len, num_negatives, feature_dim] - Negative samples
+        predictions: [B, C, D] - Predicted features for each category
+        target_features: [B, S, D] - Ground truth item features
+        target_categories: [B, S] - Ground truth item categories
         temperature: Temperature for softmax
     
     Returns:
         Contrastive loss
     """
-    # --- ターゲット集合の表現を計算 ---
-    target_mask = tf.reduce_sum(tf.abs(targets), axis=-1) > 0
-    target_mask = tf.cast(target_mask, tf.float32)
-    
-    target_sum = tf.reduce_sum(targets * tf.expand_dims(target_mask, -1), axis=1)
-    target_count = tf.maximum(tf.reduce_sum(target_mask, axis=1, keepdims=True), 1.0)
-    target_repr = target_sum / target_count
-    
-    target_repr = tf.nn.l2_normalize(target_repr, axis=-1)
-
-    # --- ポジティブペアの類似度を計算 ---
-    pos_sim = tf.reduce_sum(predictions * tf.expand_dims(target_repr, 1), axis=-1)
-
-    # --- ネガティブペアの類似度を計算 (バッチ内ネガティブ) ---
-    # neg_sim_matrix: [batch, num_categories, batch]
-    neg_sim_matrix = tf.linalg.matmul(predictions, target_repr, transpose_b=True)
-    
-    batch_size = tf.shape(predictions)[0]
-    identity_mask = tf.eye(batch_size) # Shape: [batch, batch]
-    
-    # ▼▼▼▼▼▼▼▼▼▼【修正点】▼▼▼▼▼▼▼▼▼▼
-    # マスクの次元を [batch, batch] -> [batch, 1, batch] に拡張する
-    # これにより、[batch, num_categories, batch] とのブロードキャストが可能になる
-    expanded_mask = tf.expand_dims(identity_mask, axis=1)
-    # ▲▲▲▲▲▲▲▲▲▲【ここまで】▲▲▲▲▲▲▲▲▲▲
-
-    # 対角成分を非常に小さい値にして、max計算で選ばれないようにする
-    neg_sim_matrix = neg_sim_matrix * (1.0 - expanded_mask) + expanded_mask * (-1e9)
-    
-    # 各予測にとっての最も難しいネガティブ（最も似ている他のサンプル）を選択
-    neg_sim = tf.reduce_max(neg_sim_matrix, axis=-1)
-
-    # --- 損失計算 ---
-    logits = tf.stack([pos_sim, neg_sim], axis=-1) / temperature
-    labels = tf.zeros_like(pos_sim, dtype=tf.int32)
-    loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=labels, logits=logits)
-    
-    return tf.reduce_mean(loss)
-
-# models.py に追加または修正
-
-def contrastive_loss_per_item(predictions, target_features, target_categories, temperature=1.0):
-    """
-    Corrected Contrastive Loss - Compares predictions to individual items.
-
-    Args:
-        predictions: [B, C, D] - Predicted features for each category.
-        target_features: [B, S, D] - Ground truth item features.
-        target_categories: [B, S] - Ground truth item categories.
-        temperature: Temperature for softmax.
-
-    Returns:
-        The contrastive loss.
-    """
-    # --- 1. データの前処理 ---
-    # パディングされたアイテム（カテゴリID=0）をマスクするための準備
-    # target_features/categoriesをフラットなリストに変形
-    # [B, S, D] -> [B*S, D]
-    # [B, S]    -> [B*S]
+    # Get dimensions
     B, S, D = tf.shape(target_features)[0], tf.shape(target_features)[1], tf.shape(target_features)[2]
     C = tf.shape(predictions)[1]
     
+    # Flatten target data
     flat_target_features = tf.reshape(target_features, [B * S, D])
     flat_target_categories = tf.reshape(target_categories, [B * S])
-
-    # パディングを除いた有効なアイテムのみを対象にするマスク
+    
+    # Valid target mask (exclude padding)
     valid_target_mask = flat_target_categories > 0
-
-    # --- 2. 全ペアの類似度計算 ---
-    # 各カテゴリの予測 (B, C, D) と、バッチ内の全有効アイテム (B*S, D) との
-    # コサイン類似度を一括で計算する。
-    # tf.einsum は効率的な行列積計算機
-    # 結果の logits は [B, C, B*S] の形状を持つ
+    
+    # Compute all similarities [B, C, B*S]
     logits = tf.einsum('bcd,sd->bcs', predictions, flat_target_features) / temperature
-
-    # パディングされたターゲットアイテムに対応する類似度を計算から除外
-    # boolean_maskを適用すると次元が減ってしまうため、代わりに非常に小さい値を設定
+    
+    # Mask invalid targets
     logits = logits * tf.cast(tf.reshape(valid_target_mask, [1, 1, B*S]), tf.float32) + \
              tf.cast(tf.reshape(~valid_target_mask, [1, 1, B*S]), tf.float32) * (-1e9)
-
-    # --- 3. 正解ラベルの作成 ---
-    # 各予測 (b, c) にとって、どのアイテム (s) が正解かを示すラベル行列を作成
     
-    # a) カテゴリの一致を確認
-    # p_cats: [1, C, 1], t_cats: [1, 1, B*S]
+    # Create positive labels
+    # Category match
     p_cats = tf.reshape(tf.range(1, C + 1, dtype=tf.int32), [1, C, 1])
     t_cats = tf.reshape(flat_target_categories, [1, 1, B*S])
-    category_match = tf.equal(p_cats, t_cats) # Shape: [1, C, B*S]
-
-    # b) 同じコーディネート/セットに属しているかを確認
-    # b_indices: [B, 1, 1]
-    # t_indices: [1, 1, B*S] (各アイテムがどのセットbに属しているかを示す)
+    category_match = tf.equal(p_cats, t_cats)
+    
+    # Instance match (same batch item)
     b_indices = tf.reshape(tf.range(B), [B, 1, 1])
     t_indices = tf.reshape(tf.repeat(tf.range(B), S), [1, 1, B*S])
-    instance_match = tf.equal(b_indices, t_indices) # Shape: [B, 1, B*S]
-
-    # a)とb)の両方を満たすものが正解ラベル
-    # labels: [B, C, B*S]
+    instance_match = tf.equal(b_indices, t_indices)
+    
+    # Positive labels
     labels = tf.cast(tf.logical_and(category_match, instance_match), tf.float32)
     
-    # 正解が存在しない予測は損失計算から除外するマスク
-    has_positives_mask = tf.reduce_sum(labels, axis=-1) > 0 # Shape: [B, C]
-
-    # --- 4. 損失の計算 ---
-    # softmax_cross_entropyを適用して損失を計算
-    # labelsを合計値で割ることで、複数の正解がある場合に対応
+    # Mask for valid predictions (those with positive examples)
+    has_positives_mask = tf.reduce_sum(labels, axis=-1) > 0
+    
+    # Normalize labels
     labels_normalized = tf.math.divide_no_nan(labels, tf.reduce_sum(labels, axis=-1, keepdims=True))
     
+    # Compute loss
     loss = tf.nn.softmax_cross_entropy_with_logits(labels=labels_normalized, logits=logits)
     
-    # マスクを適用して、有効な予測に関する損失のみを平均
+    # Apply mask and compute mean
     masked_loss = loss * tf.cast(has_positives_mask, tf.float32)
     
     return tf.reduce_sum(masked_loss) / tf.reduce_sum(tf.cast(has_positives_mask, tf.float32))
 
 
-def create_model(config: Dict[str, Any]) -> SetRetrievalModel:
-    """Factory function to create SetRetrievalModel"""
+
+def debug_similarities(model, sample_batch):
+    """
+    デバッグ用：類似度行列を詳細に分析（Eager execution対応）
     
-    # Validate required keys
-    required_keys = ['feature_dim', 'num_heads', 'num_layers', 'num_categories']
-    for key in required_keys:
-        if key not in config:
-            raise ValueError(f"Missing required config key: {key}")
+    Args:
+        model: 訓練されたモデル
+        sample_batch: サンプルバッチ
     
-    # Set defaults
-    default_config = {
-        'temperature': 1.0,
-        'dropout_rate': 0.1,
-        'hidden_dim': config['feature_dim'],
-        'use_cycle_loss': False,
+    Returns:
+        分析結果の辞書
+    """
+    # Eager executionを確実に有効にする
+    original_eager = tf.executing_eagerly()
+    if not original_eager:
+        tf.config.run_functions_eagerly(True)
+    
+    try:
+        predictions = model(sample_batch, training=False)
+        target_features = sample_batch['target_features']
+        
+        # 類似度行列を計算
+        similarities = model._compute_set_similarities_fixed(predictions, target_features)
+        
+        # NumPy配列に変換して分析
+        sim_np = similarities.numpy()
+        pred_np = predictions.numpy()
+        target_np = target_features.numpy()
+        
+        results = {
+            'batch_size': sim_np.shape[0],
+            'similarities_shape': sim_np.shape,
+            'similarities_matrix': sim_np,
+            'diagonal_values': np.diag(sim_np),
+            'max_per_row': np.max(sim_np, axis=1),
+            'argmax_per_row': np.argmax(sim_np, axis=1),
+            'diagonal_ranks': [],
+            'mean_similarity': np.mean(sim_np),
+            'std_similarity': np.std(sim_np),
+            'predictions_shape': pred_np.shape,
+            'predictions_mean': np.mean(pred_np),
+            'predictions_std': np.std(pred_np),
+            'target_shape': target_np.shape,
+            'target_mean': np.mean(target_np),
+            'target_std': np.std(target_np),
+        }
+        
+        # 各行で対角線要素のランクを計算
+        for i in range(sim_np.shape[0]):
+            row = sim_np[i]
+            diagonal_val = row[i]
+            rank = np.sum(row > diagonal_val) + 1
+            results['diagonal_ranks'].append(rank)
+        
+        # 手動TopK計算
+        mask = 1.0 - np.eye(sim_np.shape[0])
+        masked_sim = sim_np * mask + np.eye(sim_np.shape[0]) * (-1e9)
+        
+        if sim_np.shape[0] > 1:
+            top_indices = np.argsort(masked_sim, axis=1)[:, ::-1]
+            correct_indices = np.arange(sim_np.shape[0])
+            
+            top1_acc = np.mean(top_indices[:, 0] == correct_indices) if top_indices.shape[1] > 0 else 0
+            top5_acc = np.mean([correct_indices[i] in top_indices[i, :5] for i in range(len(correct_indices))]) if top_indices.shape[1] >= 5 else 0
+            
+            results['manual_top1_accuracy'] = top1_acc
+            results['manual_top5_accuracy'] = top5_acc
+            results['top_indices'] = top_indices
+        else:
+            results['manual_top1_accuracy'] = 0.0
+            results['manual_top5_accuracy'] = 0.0
+        
+        return results
+        
+    except Exception as e:
+        print(f"Error in debug_similarities: {e}")
+        import traceback
+        traceback.print_exc()
+        return {'error': str(e)}
+    
+    finally:
+        # 元のeager execution設定を復元
+        if not original_eager:
+            tf.config.run_functions_eagerly(False)
+
+
+# class DebugCallback(tf.keras.callbacks.Callback):
+#     """デバッグ用コールバック"""
+    
+#     def __init__(self, sample_batch):
+#         super().__init__()
+#         self.sample_batch = sample_batch
+#         self.debug_run = False
+    
+#     def on_epoch_end(self, epoch, logs=None):
+#         if epoch == 0 and not self.debug_run:  # 最初のエポック後にのみ実行
+#             print("\n" + "="*50)
+#             print("🔍 DEBUGGING SIMILARITIES")
+#             print("="*50)
+            
+#             debug_results = debug_similarities(self.model, self.sample_batch)
+            
+#             if 'error' in debug_results:
+#                 print(f"❌ Debug failed: {debug_results['error']}")
+#                 return
+            
+#             print(f"✅ Batch size: {debug_results['batch_size']}")
+#             print(f"✅ Similarities shape: {debug_results['similarities_shape']}")
+#             print(f"✅ Similarities matrix:")
+#             print(debug_results['similarities_matrix'])
+#             print(f"✅ Diagonal values: {debug_results['diagonal_values']}")
+#             print(f"✅ Max per row: {debug_results['max_per_row']}")
+#             print(f"✅ Argmax per row: {debug_results['argmax_per_row']}")
+#             print(f"✅ Diagonal ranks: {debug_results['diagonal_ranks']}")
+#             print(f"✅ Mean similarity: {debug_results['mean_similarity']:.4f}")
+#             print(f"✅ Std similarity: {debug_results['std_similarity']:.4f}")
+#             print(f"✅ Manual Top1 accuracy: {debug_results['manual_top1_accuracy']:.4f}")
+#             print(f"✅ Manual Top5 accuracy: {debug_results['manual_top5_accuracy']:.4f}")
+            
+#             # 問題診断
+#             if debug_results['batch_size'] <= 1:
+#                 print("❌ PROBLEM: Batch size too small for TopK calculation!")
+#             elif np.max(debug_results['diagonal_ranks']) > 1:
+#                 print("❌ PROBLEM: Diagonal elements are not the maximum in their rows!")
+#                 print("   This means predictions are not learning correctly.")
+#             elif debug_results['std_similarity'] < 0.01:
+#                 print("❌ PROBLEM: All similarities are too similar!")
+#                 print("   This means feature representations are not distinctive.")
+#             else:
+#                 print("✅ Similarities look reasonable!")
+            
+#             print("="*50)
+#             self.debug_run = True
+
+
+# 追加の分析関数
+def analyze_training_progress(model, train_batch, epoch):
+    """
+    学習の進捗を分析する関数
+    
+    Args:
+        model: 学習中のモデル
+        train_batch: 訓練バッチサンプル
+        epoch: 現在のエポック
+    
+    Returns:
+        分析結果
+    """
+    print(f"\n=== Epoch {epoch} Training Analysis ===")
+    
+    # 予測を取得
+    predictions = model(train_batch, training=False)
+    target_features = train_batch['target_features']
+    
+    # 特徴量の統計
+    pred_np = predictions.numpy()
+    target_np = target_features.numpy()
+    
+    print(f"Predictions stats:")
+    print(f"  Mean: {np.mean(pred_np):.4f}, Std: {np.std(pred_np):.4f}")
+    print(f"  Min: {np.min(pred_np):.4f}, Max: {np.max(pred_np):.4f}")
+    
+    print(f"Target stats:")
+    print(f"  Mean: {np.mean(target_np):.4f}, Std: {np.std(target_np):.4f}")
+    print(f"  Min: {np.min(target_np):.4f}, Max: {np.max(target_np):.4f}")
+    
+    # 類似度分析
+    similarities = model._compute_set_similarities_fixed(predictions, target_features)
+    sim_np = similarities.numpy()
+    
+    print(f"Similarities stats:")
+    print(f"  Mean: {np.mean(sim_np):.4f}, Std: {np.std(sim_np):.4f}")
+    print(f"  Diagonal mean: {np.mean(np.diag(sim_np)):.4f}")
+    print(f"  Off-diagonal mean: {np.mean(sim_np - np.diag(np.diag(sim_np))):.4f}")
+    
+    # 各行での対角線要素のランク
+    ranks = []
+    for i in range(sim_np.shape[0]):
+        rank = np.sum(sim_np[i] > sim_np[i, i]) + 1
+        ranks.append(rank)
+    
+    print(f"Diagonal ranks: {ranks}")
+    print(f"Average rank: {np.mean(ranks):.2f}")
+    
+    return {
+        'predictions_std': np.std(pred_np),
+        'similarities_std': np.std(sim_np),
+        'average_rank': np.mean(ranks),
+        'diagonal_mean': np.mean(np.diag(sim_np))
     }
-    default_config.update(config)
-    
-    model = SetRetrievalModel(
-        feature_dim=default_config['feature_dim'],
-        num_heads=default_config['num_heads'],
-        num_layers=default_config['num_layers'],
-        num_categories=default_config['num_categories'],
-        hidden_dim=default_config['hidden_dim'],
-        use_cycle_loss=default_config['use_cycle_loss'],
-        temperature=default_config['temperature'],
-        dropout_rate=default_config['dropout_rate']
-    )
-    
-    return model
 
 
-def evaluate_with_gallery(model, test_dataset, all_test_items, k_values=[1, 5, 10]):
+class ProgressTrackingCallback(tf.keras.callbacks.Callback):
+    """学習進捗を追跡するコールバック"""
+    
+    def __init__(self, sample_batch, track_every=10):
+        super().__init__()
+        self.sample_batch = sample_batch
+        self.track_every = track_every
+        self.progress_log = []
+    
+    def on_epoch_end(self, epoch, logs=None):
+        if epoch % self.track_every == 0:
+            progress = analyze_training_progress(self.model, self.sample_batch, epoch)
+            self.progress_log.append({
+                'epoch': epoch,
+                'logs': logs,
+                'analysis': progress
+            })
+            
+            # 学習が停滞していないかチェック
+            if len(self.progress_log) >= 2:
+                prev_rank = self.progress_log[-2]['analysis']['average_rank']
+                curr_rank = self.progress_log[-1]['analysis']['average_rank']
+                
+                if curr_rank > prev_rank * 0.9:  # ランクが改善していない
+                    print(f"⚠️  Warning: Average rank not improving ({prev_rank:.2f} → {curr_rank:.2f})")
+                else:
+                    print(f"✅ Rank improving: {prev_rank:.2f} → {curr_rank:.2f}")
+
+
+def evaluate_with_gallery(model, test_dataset, all_test_items, k_values=[1, 5, 10, 20]):
     """
     Evaluate model with full test gallery
     
@@ -422,44 +736,39 @@ def evaluate_with_gallery(model, test_dataset, all_test_items, k_values=[1, 5, 1
         Evaluation metrics
     """
     all_ranks = []
-    all_scores = []
     
     print("🔍 Evaluating with full test gallery...")
     
     for batch_data, _ in test_dataset:
         # Get predictions
-        predictions = model(batch_data, training=False)  # [batch, num_categories, feature_dim]
+        predictions = model(batch_data, training=False)
         
         # Extract target data
-        query_features = batch_data['query_features']
         target_features = batch_data['target_features']
         
         batch_size = tf.shape(predictions)[0]
         
         for i in range(batch_size):
-            # Get target representation (average of target items)
-            target_items = target_features[i]  # [seq_len, feature_dim]
+            # Get target representation
+            target_items = target_features[i]
             target_mask = tf.reduce_sum(tf.abs(target_items), axis=-1) > 0
             valid_targets = tf.boolean_mask(target_items, target_mask)
             
             if tf.shape(valid_targets)[0] == 0:
                 continue
                 
-            target_repr = tf.reduce_mean(valid_targets, axis=0)  # [feature_dim]
+            target_repr = tf.reduce_mean(valid_targets, axis=0)
             target_repr = tf.nn.l2_normalize(target_repr, axis=-1)
             
-            # Get best category prediction
-            pred_categories = predictions[i]  # [num_categories, feature_dim]
-            
-            # Compute similarities with all gallery items
+            # Compute similarities with gallery
             gallery_similarities = tf.linalg.matmul(
                 tf.expand_dims(target_repr, 0), 
                 all_test_items, 
                 transpose_b=True
-            )  # [1, num_gallery_items]
-            gallery_similarities = tf.squeeze(gallery_similarities, 0)  # [num_gallery_items]
+            )
+            gallery_similarities = tf.squeeze(gallery_similarities, 0)
             
-            # Find rank of target
+            # Find rank
             target_sim = 1.0  # Perfect similarity with itself
             better_count = tf.reduce_sum(tf.cast(gallery_similarities > target_sim, tf.float32))
             rank = better_count + 1
@@ -470,7 +779,7 @@ def evaluate_with_gallery(model, test_dataset, all_test_items, k_values=[1, 5, 1
     all_ranks = np.array(all_ranks)
     
     results = {}
-    for k in k_values:
+    for k in sorted(self.k_values):
         top_k_acc = np.mean(all_ranks <= k)
         results[f'top_{k}_acc'] = top_k_acc
     
