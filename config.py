@@ -5,12 +5,26 @@ from typing import Dict, Any
 
 DATASET_CONFIGS = {
     'IQON3000': {
-        'num_categories': 7,
-        'category_range': (1, 7),
+        'num_categories': 17,
+        'category_range': (1, 17),
         'category_names': {
-            1: "トップス系", 2: "アウター系", 3: "ボトムス系",
-            4: "ワンピース・ドレス系", 5: "シューズ系",
-            6: "バッグ系", 7: "アクセサリー・小物系"
+            1: "outerwear",      # アウター（和服・ルームウェア含む）
+            2: "tops",           # トップス
+            3: "dresses",        # ワンピース・ドレス
+            4: "pants",          # パンツ
+            5: "skirts",         # スカート
+            6: "shoes",          # シューズ
+            7: "bags",           # バッグ
+            8: "hats",           # 帽子
+            9: "watches",        # 時計
+            10: "accessories",   # ジュエリー・アクセサリー
+            11: "fashion_goods", # ファッション雑貨（インテリア含む）
+            12: "wallets",       # 財布・小物
+            13: "legwear",       # レッグウェア
+            14: "underwear",     # アンダーウェア・水着
+            15: "beauty",        # ビューティー
+            16: "glasses",       # 眼鏡
+            17: "others"         # その他
         }
     },
     'DeepFurniture': {

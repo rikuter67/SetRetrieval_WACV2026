@@ -1,6 +1,3 @@
-"""
-run.py CUDA_VISIBLE_DEVICES=0 python run.py --dataset DeepFurniture --mode train --batch_size 128 --epochs 100 --num_layers 2 --num_heads 2 --learning_rate 1e-4  --use_cycle_loss  --cycle_lambda 0.2
-"""
 import os
 import argparse
 import json
@@ -8,126 +5,291 @@ import pickle
 import gzip
 import numpy as np
 import random
+import time
 import tensorflow as tf
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 
-# from models import create_model, DebugCallback, ProgressTrackingCallback
-from util import evaluate_model, setup_gpu_memory
+from data_generator import DataGenerator
+from helpers import build_image_path_map
+from util import evaluate_model, setup_gpu_memory, collect_test_data, save_whitening_params, load_whitening_params, compute_input_whitening_stats, HardNegativeMiner, save_hard_negative_cache, load_hard_negative_cache
 from config import get_dataset_config
-from plot import plot_training_curves  # 既存の可視化関数を使用
-from models import SetRetrievalModel
+from plot import plot_training_curves, generate_qualitative_examples
+from models import TPaNegModel
+from precompute_negatives import precompute_negatives_gpu 
 
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+
+tf.config.optimizer.set_jit(False)
+tf.config.experimental.enable_op_determinism()
+
+class TimeHistory(tf.keras.callbacks.Callback):
+    """学習時間（エポックごと）を計測し、最後に平均を出力するコールバック"""
+    def on_train_begin(self, logs={}):
+        # 学習開始時に時間のリストを初期化
+        self.epoch_times = []
+        print("⏱️  Training time measurement started.")
+
+    def on_epoch_begin(self, epoch, logs={}):
+        # エポック開始時に時刻を記録
+        self.epoch_start_time = time.perf_counter()
+
+    def on_epoch_end(self, epoch, logs={}):
+        # エポック終了時に経過時間を計算してリストに追加
+        elapsed_seconds = time.perf_counter() - self.epoch_start_time
+        # 最初の1エポックはデータ準備などで遅いことがあるため、平均計算からは除外
+        if epoch > 0:
+            self.epoch_times.append(elapsed_seconds)
+        print(f"Epoch {epoch+1} Time: {elapsed_seconds:.2f} seconds")
+
+    def on_train_end(self, logs={}):
+        # 全学習終了後に平均時間を計算して表示
+        if not self.epoch_times:
+            print("⚠️ No epoch times were recorded (training might have been too short).")
+            return
+
+        avg_seconds = np.mean(self.epoch_times)
+        avg_minutes = avg_seconds / 60
+        print("\n" + "="*40)
+        print("✅ Training Time Summary")
+        print(f"   Average time per epoch: {avg_seconds:.2f} seconds")
+        print(f"   Average time per epoch: {avg_minutes:.4f} minutes")
+        print("="*40)
+
+        
+class EpochUpdateCallback(tf.keras.callbacks.Callback):
+    """エポック開始時にDataGeneratorのepochを更新するためのコールバック"""
+    def __init__(self, data_generator, model=None):  # modelパラメータを追加
+        super().__init__()
+        self.data_generator = data_generator
+        self.tpaneg_model = model  # modelを保存
+
+    def on_epoch_begin(self, epoch, logs=None):
+        if hasattr(self.data_generator, 'set_epoch'):
+            self.data_generator.set_epoch(epoch)
+        
+        # モデルにも現在のエポックを設定
+        if self.tpaneg_model and hasattr(self.tpaneg_model, 'set_current_epoch'):
+            self.tpaneg_model.set_current_epoch(epoch)
 
 def create_output_dir(args: argparse.Namespace) -> str:
-    """Creates an informative output directory path based on experiment parameters."""
+    """実験設定に基づいて出力ディレクトリのパスを生成する"""
     if args.output_dir:
         return args.output_dir
-
+        
+    # 基本的なパラメータ
     components = [
-        f"B{args.batch_size}",
+        f"Epoch{args.epochs}"
+        f"batch{args.batch_size}",
         f"L{args.num_layers}",
         f"H{args.num_heads}",
-        f"LR{args.learning_rate:.0e}",
-        f"Cycle{args.cycle_lambda}"
+        f"LR{args.learning_rate}"
     ]
+    
+    # 条件に応じたフラグを追加
+    if args.use_whitening:
+        components.append("use_whitening")
+    if args.use_tpaneg:
+        components.append("use_tpaneg")
+    if args.use_cycle_loss:
+        components.append("use_cycle_loss")
+        components.append(f"lambda{args.cycle_lambda}")
+    
+    # TPaNeg関連のパラメータを実験名に追加
+    if args.use_tpaneg:
+        components.append(f"TaNegInit{args.taneg_t_gamma_init}")
+        components.append(f"TaNegFinal{args.taneg_t_gamma_final}")
+        components.append(f"TaNegEps{args.taneg_curriculum_epochs}")
+        components.append(f"PaNegEps{args.paneg_epsilon}")
+
+
+    # シード値は常に含める
+    components.append(f"seed{args.seed}")
+    
+    # ★ output_dir をここで定義して返す
     experiment_name = "_".join(components)
-    return os.path.join("experiments", args.dataset, experiment_name)
+    output_dir = os.path.join("experiments", args.dataset, experiment_name)
+    return output_dir
+
 
 def detect_num_categories(dataset_path: str) -> int:
-    """Detects the number of categories from the dataset configuration."""
     config = get_dataset_config(os.path.basename(dataset_path))
-    return config.get('num_categories', 7)
+    return config.get('num_categories', 16)
 
-def load_data(dataset_path: str, split: str, batch_size: int) -> tf.data.Dataset:
-    """Loads data from .pkl file and creates a tf.data.Dataset."""
-    file_path = os.path.join(dataset_path, f'{split}.pkl')
-    print(f"Loading data from: {file_path}")
-    with open(file_path, 'rb') as f:
-        data_tuple = pickle.load(f)
+# <--- 修正点: データセット作成ロジックをクリーンな形に再構成 --->
+def create_data_generators(dataset_path: str, batch_size: int,
+                           use_negatives: bool = False, candidate_neg_num: int = 50,
+                           seed: int = 42, random_split: bool = True,
+                           whitening_params: dict = None,
+                           negative_cache_path: str = None) -> tuple:
+    
+    print(f"🔧 DataGenerator Configuration:")
+    print(f"   - TPaNeg (use_negatives): {use_negatives}")
+    print(f"   - Random Split: {random_split}")
+    print(f"   - Negative Cache Path: {negative_cache_path if use_negatives else 'N/A'}")
+    
+    train_gen = DataGenerator(
+        split_path=os.path.join(dataset_path, 'train.pkl'),
+        batch_size=batch_size, shuffle=True, seed=seed,
+        use_negatives=use_negatives, negative_cache_path=negative_cache_path,
+        candidate_neg_num=candidate_neg_num, random_split=random_split,
+        whitening_params=whitening_params
+    )
+    
+    val_gen = DataGenerator(
+        split_path=os.path.join(dataset_path, 'validation.pkl'),
+        batch_size=batch_size, shuffle=False, seed=seed,
+        use_negatives=False,  # ✅ 検証時はTPaNeg無効
+        random_split=False,
+        whitening_params=whitening_params
+    )
+    
+    test_gen = DataGenerator(
+        split_path=os.path.join(dataset_path, 'test.pkl'),
+        batch_size=batch_size, shuffle=False, seed=seed,
+        use_negatives=False, random_split=False, # テスト時は通常、フルギャラリー検索のためネガティブは不要
+        whitening_params=whitening_params,
+        include_set_ids=True
+    )
 
-    data_dict = {
-        'query_features': np.array(data_tuple[0], dtype=np.float32),
-        'target_features': np.array(data_tuple[1], dtype=np.float32),
-        'query_categories': np.array(data_tuple[3], dtype=np.int32),
-        'target_categories': np.array(data_tuple[4], dtype=np.int32),
-    }
+    def create_tf_dataset(data_gen: DataGenerator, is_training: bool) -> tf.data.Dataset:
+        def generator_fn():
+            for i in range(len(data_gen)):
+                yield data_gen[i]
 
-    if split == 'test':
-        data_dict['query_item_ids'] = np.array(data_tuple[6], dtype=str)
-        data_dict['target_item_ids'] = np.array(data_tuple[7], dtype=str)
+        output_signature = {
+            'query_features': tf.TensorSpec(shape=(None, data_gen.max_item_num, data_gen.feature_dim), dtype=tf.float32),
+            'target_features': tf.TensorSpec(shape=(None, data_gen.max_item_num, data_gen.feature_dim), dtype=tf.float32),
+            'query_categories': tf.TensorSpec(shape=(None, data_gen.max_item_num), dtype=tf.int32),
+            'target_categories': tf.TensorSpec(shape=(None, data_gen.max_item_num), dtype=tf.int32),
+            'query_item_ids': tf.TensorSpec(shape=(None, data_gen.max_item_num), dtype=tf.int32),
+            'target_item_ids': tf.TensorSpec(shape=(None, data_gen.max_item_num), dtype=tf.int32),
+        }
+        
+        if is_training and data_gen.use_negatives:
+            # 論文準拠のダブル双方向損失のため、クエリ用のネガティブも定義
+            output_signature['candidate_negative_features'] = tf.TensorSpec(
+                shape=(None, data_gen.max_item_num, data_gen.candidate_neg_num, data_gen.feature_dim), dtype=tf.float32)
+            output_signature['candidate_negative_masks'] = tf.TensorSpec(
+                shape=(None, data_gen.max_item_num, data_gen.candidate_neg_num), dtype=tf.bool)
+            output_signature['query_candidate_negative_features'] = tf.TensorSpec(
+                shape=(None, data_gen.max_item_num, data_gen.candidate_neg_num, data_gen.feature_dim), dtype=tf.float32)
+            output_signature['query_candidate_negative_masks'] = tf.TensorSpec(
+                shape=(None, data_gen.max_item_num, data_gen.candidate_neg_num), dtype=tf.bool)
 
-    dataset = tf.data.Dataset.from_tensor_slices(data_dict)
+        if not is_training and data_gen.include_SetIDs:
+            output_signature['set_ids'] = tf.TensorSpec(shape=(None,), dtype=tf.string)
 
-    if split == 'train':
-        dataset = dataset.shuffle(buffer_size=1000, seed=42)
+        dataset = tf.data.Dataset.from_generator(generator_fn, output_signature=output_signature)
+        return dataset.prefetch(tf.data.AUTOTUNE)
+    
+    train_dataset = create_tf_dataset(train_gen, is_training=True)
+    val_dataset = create_tf_dataset(val_gen, is_training=False)
+    test_dataset = create_tf_dataset(test_gen, is_training=False)
+    
+    train_steps = len(train_gen)
+    val_steps = len(val_gen)
+    
+    return train_dataset, val_dataset, test_dataset, train_gen, val_gen, train_steps, val_steps
 
-    is_training = (split == 'train')
-    dataset = dataset.batch(batch_size, drop_remainder=is_training)
-    dataset = dataset.prefetch(tf.data.AUTOTUNE)
 
-    return dataset
 
 def main():
-    parser = argparse.ArgumentParser(description="Set Retrieval Training with Built-in TopK Metrics")
+    parser = argparse.ArgumentParser(description="Set Retrieval Training with DataGenerator")
     parser.add_argument('--dataset', default='IQON3000', choices=['IQON3000', 'DeepFurniture'], help="Dataset to use.")
     parser.add_argument('--mode', default='train', choices=['train', 'test'], help="Mode to run: 'train' or 'test'.")
-    parser.add_argument('--data_dir', default='datasets', help="Root directory for datasets.")
+    parser.add_argument('--data_dir', default='data', help="Root directory for data")
+    parser.add_argument('--dataset_dir', default='datasets', help="Root directory for datasets.")
     parser.add_argument('--output_dir', default=None, help="Specify a custom output directory.")
-    # Model and training hyperparameters
     parser.add_argument('--model_path', default=None, help="Path to pre-trained model weights for testing.")
     parser.add_argument('--feature_dim', type=int, default=512)
-    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--num_heads', type=int, default=2)
     parser.add_argument('--num_layers', type=int, default=2)
-    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--epochs', type=int, default=300)
+    parser.add_argument('--early_stop', type=int, default=50)
     parser.add_argument('--learning_rate', type=float, default=1e-4)
-    parser.add_argument('--temperature', type=float, default=0.2, help="Temperature for contrastive loss")
+    parser.add_argument('--temperature', type=float, default=0.8, help="Temperature for contrastive loss")
     parser.add_argument('--dropout_rate', type=float, default=0.1, help="Dropout rate for regularization")
     parser.add_argument('--seed', type=int, default=42, help="Random seed for reproducibility.")
-    parser.add_argument('--topk_values', type=int, nargs='+', default=[1, 5, 10, 20], help="TopK values to track.")
-    # Optional loss components
+    parser.add_argument('--topk_values', type=int, nargs='+', default=[5, 10, 20], help="TopK values to track.")
     parser.add_argument('--use_cycle_loss', action='store_true', help='Include cycle consistency loss')
-    parser.add_argument('--cycle_lambda',   type=float,        default=0.0,  help='Weight for cycle consistency loss')
-    parser.add_argument('--use_clneg_loss', action='store_true', help='Include contrastive negative loss')
+    parser.add_argument('--cycle_lambda', type=float, default=0.2, help='Weight for cycle consistency loss')
+    parser.add_argument('--use_cluster_centering', action='store_true', help='Cluster center base loss')
+    parser.add_argument('--use_whitening', action='store_true', help='Enable whitening transformation during evaluation')
+    parser.add_argument('--use_weighted_topk', action='store_true', help='Enable weighted TopK accuracy metrics during evaluation')
+    parser.add_argument('--use_tpaneg', action='store_true', help='Enable TPaNeg dynamic hard negative learning')
+    parser.add_argument('--candidate_neg_num', type=int, default=50, help='Number of candidate negatives for TPaNeg')
+    
+    # 論文のT_gamma (TaNegの類似度閾値) に対応するパラメータ
+    parser.add_argument('--taneg_t_gamma_init', type=float, default=0.2, help='Initial T_gamma (TaNeg similarity threshold). Used for precomputing and as start of curriculum.')
+    parser.add_argument('--taneg_t_gamma_final', type=float, default=0.4, help='Final T_gamma (TaNeg similarity threshold). End point of curriculum learning.')
+    parser.add_argument('--taneg_curriculum_epochs', type=int, default=100, help='Number of epochs over which TaNeg T_gamma linearly increases.')
 
+    # 論文のepsilon (PaNegのマージン) に対応するパラメータ
+    parser.add_argument('--paneg_epsilon', type=float, default=0.2, help='Epsilon (ε) margin for Prediction-Aware Negative selection (PaNeg). Fixed during training.')
+    
     args = parser.parse_args()
 
-    # シード設定
+    model_path_for_testing = args.model_path
+
     np.random.seed(args.seed)
     tf.random.set_seed(args.seed)
     random.seed(args.seed)
+    tf.config.optimizer.set_jit(False)
 
-    # 出力ディレクトリ作成
     output_dir = create_output_dir(args)
     os.makedirs(output_dir, exist_ok=True)
     print(f"📦 Output will be saved to: {output_dir}")
 
-    # 引数保存
     with open(os.path.join(output_dir, 'args.json'), 'w') as f:
         json.dump(vars(args), f, indent=4)
 
     setup_gpu_memory()
 
-    # データセット設定
-    dataset_path = os.path.join(args.data_dir, args.dataset)
+    dataset_path = os.path.join(args.dataset_dir, args.dataset)
     num_categories = detect_num_categories(dataset_path)
     
-    model = SetRetrievalModel(
-        feature_dim=args.feature_dim,
-        num_heads=args.num_heads,
-        num_layers=args.num_layers,
-        num_categories=num_categories,
-        temperature=args.temperature,
-        dropout_rate=args.dropout_rate,
-        use_cycle_loss=args.use_cycle_loss,
-        cycle_lambda=args.cycle_lambda,
-        k_values=args.topk_values
+    whitening_params = None
+    if args.use_whitening:
+        whitening_params_path = os.path.join(output_dir, 'input_whitening_params.pkl')
+        if os.path.exists(whitening_params_path):
+            whitening_params = load_whitening_params(whitening_params_path)
+            print("[INFO] ✅ Loaded existing input whitening parameters.")
+        else:
+            whitening_params = compute_input_whitening_stats(dataset_path, args.feature_dim)
+            if whitening_params:
+                save_whitening_params(whitening_params, whitening_params_path)
+                print(f"✅ Input whitening parameters computed and saved to: {whitening_params_path}")
+
+    if args.use_tpaneg:
+        cache_path = os.path.join(args.dataset_dir, args.dataset, 'hard_negative_cache.pkl')
+        print("Checking for TPaNeg negative cache...")
+        
+        if not os.path.exists(cache_path):
+            print(f"❌ Cache not found. Generating new cache at: {cache_path}")
+            # TaNegのT_gamma初期値でハードネガティブを事前計算
+            precompute_negatives_gpu(
+                dataset_path=os.path.join(args.dataset_dir, args.dataset),
+                output_path=cache_path,
+                similarity_threshold=args.taneg_t_gamma_init, # <-- TaNegの初期T_gammaで事前計算
+                candidate_neg_num=args.candidate_neg_num
+            )
+        else:
+            print(f"✅ Found existing cache: {cache_path}")
+
+    model = TPaNegModel(
+        feature_dim=args.feature_dim, num_heads=args.num_heads, num_layers=args.num_layers,
+        num_categories=num_categories, temperature=args.temperature, dropout_rate=args.dropout_rate,
+        use_cycle_loss=args.use_cycle_loss, cycle_lambda=args.cycle_lambda, k_values=args.topk_values,
+        cluster_centering=args.use_cluster_centering, use_tpaneg=args.use_tpaneg,
+        # TPaNeg関連のパラメータをモデルに渡す
+        taneg_t_gamma_init=args.taneg_t_gamma_init, 
+        taneg_t_gamma_final=args.taneg_t_gamma_final,
+        taneg_curriculum_epochs=args.taneg_curriculum_epochs,
+        paneg_epsilon=args.paneg_epsilon 
     )
 
-
-    # カテゴリ中心設定
     centers_path = os.path.join(dataset_path, 'category_centers.pkl.gz')
     if os.path.exists(centers_path):
         with gzip.open(centers_path, 'rb') as f: 
@@ -136,95 +298,85 @@ def main():
         for cat_id, center in centers_dict.items():
             if 1 <= int(cat_id) <= num_categories: 
                 centers_array[int(cat_id) - 1] = center
-        model.set_category_centers(centers_array)
+        model.set_category_centers(centers_array, whitening_params=whitening_params)
 
-    # モデル初期化
     dummy_input = {'query_features': tf.random.normal((2, 10, 512))}
     _ = model(dummy_input)
     model.summary()
 
-    model_path_for_testing = args.model_path
+    print("🚀 Using DataGenerator for all data loading")
+    train_data, val_data, test_data, train_gen, val_gen, steps_per_epoch, validation_steps = create_data_generators(
+        dataset_path,
+        args.batch_size, 
+        use_negatives=args.use_tpaneg,
+        candidate_neg_num=args.candidate_neg_num,
+        seed=args.seed,
+        random_split=True,
+        whitening_params=whitening_params,
+        negative_cache_path=cache_path if args.use_tpaneg else None # minerの代わりにcache_pathを渡す
+    )
 
     if args.mode == 'train':
         print(f"\n--- 🚂 Starting Training with TopK={args.topk_values} ---")
-        train_data = load_data(dataset_path, 'train', args.batch_size)
-        val_data = load_data(dataset_path, 'validation', args.batch_size)
-        
-        # オプティマイザ設定
-        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=args.learning_rate), loss=None, run_eagerly=False)
-        
-        # サンプルバッチを取得
-        sample_batch = next(iter(train_data))
 
-        # デバッグコールバックを追加
-        # debug_callback = DebugCallback(sample_batch)
-        # progress_callback = ProgressTrackingCallback(sample_batch, track_every=5)
-
-        # コールバック設定（シンプル）
+        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=args.learning_rate), 
+                         loss=None, 
+                         metrics=model.metrics)
+        
         callbacks = [
-            # debug_callback,
-            # progress_callback,
-            EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True, verbose=1),
-            ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=7, min_lr=1e-6, verbose=1)
+            EarlyStopping(monitor='val_val_top10_accuracy', patience=args.early_stop, mode='max', verbose=1, restore_best_weights=True),
+            ReduceLROnPlateau(monitor='val_val_top10_accuracy', factor=0.8, patience=15, min_lr=1e-5, mode='min'),
+            EpochUpdateCallback(train_gen, model),
+            TimeHistory()
         ]
         
         print(f"[INFO] TopK metrics will be tracked automatically: {args.topk_values}")
         
-        # 学習実行（TopKメトリックは自動で計算される）
         history = model.fit(
-            train_data, 
-            validation_data=val_data, 
-            epochs=args.epochs, 
+            train_data.repeat(), 
+            validation_data=val_data.repeat(), 
+            epochs=args.epochs,
+            steps_per_epoch=steps_per_epoch,
+            validation_steps=validation_steps,
             callbacks=callbacks,
-            verbose=1  # TopK正解率がリアルタイムで表示される
+            verbose=1
         )
 
-        # モデル保存
         model_path_for_testing = os.path.join(output_dir, 'final_model.weights.h5')
         model.save_weights(model_path_for_testing)
         print(f"\n💾 Model saved to: {model_path_for_testing}")
 
-        # 可視化（既存のplot_training_curvesを使用）
         print("\n--- 📊 Creating Training Visualization ---")
-        
         try:
-            # 元の関数の代わりに修正版を使用
             plot_training_curves(history.history, output_dir, args.dataset)
             print("✅ Training visualization complete!")
         except Exception as e:
             print(f"⚠️ Visualization failed: {e}")
-            # デバッグ情報
             print(f"Available keys: {list(history.history.keys())}")
+            
 
-    # モデルパス設定
     if not model_path_for_testing:
         model_path_for_testing = os.path.join(output_dir, 'final_model.weights.h5')
 
-    # 評価実行
     print("\n--- 🧪 Starting Evaluation ---")
     if os.path.exists(model_path_for_testing):
         model.load_weights(model_path_for_testing)
-        test_data = load_data(dataset_path, 'test', args.batch_size)
+    
+        results_eval, test_items, gallery, dataset_type = evaluate_model(model, test_data, output_dir, args.dataset_dir, use_weighted_topk=args.use_weighted_topk, category_centers=centers_array)
 
-        # 評価実行
-        evaluate_model(model, test_data, output_dir, args.data_dir)
-        
+        print("\n--- 🖼️ Creating Image Collages ---")
+        collage_dir = os.path.join(output_dir, "collages")
+        os.makedirs(collage_dir, exist_ok=True)
+        generate_qualitative_examples(
+            model=model, test_items=test_items, gallery=gallery,
+            image_path_map=build_image_path_map(args.data_dir, args.dataset),
+            config=get_dataset_config(args.dataset), output_dir=collage_dir,
+            num_examples=30, top_k=10,
+            min_target_items=4 
+        )
+        print(f"✅ Image collages saved to: {collage_dir}")
         print(f"\n🎉 Training and evaluation completed!")
         print(f"📁 All results saved to: {output_dir}")
-        
-        # 最終結果の表示
-        if args.mode == 'train':
-            print(f"\n📈 Final TopK Results:")
-            for k in args.topk_values:
-                if f'top{k}_accuracy' in history.history and f'val_top{k}_accuracy' in history.history:
-                    final_train = history.history[f'top{k}_accuracy'][-1] * 100
-                    final_val = history.history[f'val_top{k}_accuracy'][-1] * 100
-                    best_train = max(history.history[f'top{k}_accuracy']) * 100
-                    best_val = max(history.history[f'val_top{k}_accuracy']) * 100
-                    print(f"   Top-{k}: Train={final_train:.1f}% (best={best_train:.1f}%), "
-                          f"Val={final_val:.1f}% (best={best_val:.1f}%)")
-                else:
-                    print(f"   Top-{k}: データが見つかりませんでした")
     else:
         print(f"❌ Model weights not found: {model_path_for_testing}")
 
