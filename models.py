@@ -451,24 +451,6 @@ class TPaNegModel(SetRetrievalBaseModel):
         gradients = tape.gradient(total_loss, self.trainable_variables)
 
 
-    # # 🔍 勾配デバッグコード追加
-    #     if tf.equal(tf.cast(self.optimizer.iterations, tf.int32) % 10, 0):  # 10ステップごと
-    #         tf.print("=== Gradient Debug ===")
-    #         tf.print("Total Loss:", total_loss)
-    #         tf.print("Loss X->Y:", loss_X_to_Y)
-    #         tf.print("Loss Y->X:", loss_Y_to_X)
-            
-    #         # 勾配の統計
-    #         grad_norms = [tf.norm(g) for g in gradients if g is not None]
-    #         if grad_norms:
-    #             tf.print("Gradient norms (first 5):", grad_norms[:5])
-    #             tf.print("Max gradient norm:", tf.reduce_max(grad_norms))
-    #             tf.print("Mean gradient norm:", tf.reduce_mean(grad_norms))
-    #             tf.print("Num None gradients:", tf.reduce_sum([1 for g in gradients if g is None]))
-    #         else:
-    #             tf.print("⚠️ ALL GRADIENTS ARE NONE!")
-
-
         self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
 
         self.loss_tracker.update_state(total_loss)
@@ -781,36 +763,6 @@ class TPaNegModel(SetRetrievalBaseModel):
         # 基本の候補ネガティブマスク (パディングされた候補を除外)
         base_cand_neg_mask = cand_neg_masks_flat # DataGeneratorから来るマスク
 
-        # --- 新しいロジック: 同じセット内のネガティブを除外 ---
-        # candidate_neg_feats は DataGenerator で B*S の各アイテムに対して N_cand 個のネガティブが与えられる。
-        # ここで N_cand は、DataGenerator が「元のターゲットアイテムと同じセットに属する」ものをネガティブ候補として
-        # 選んでいないという前提に立つのが自然。
-        # もし DataGenerator の中で、同じセット内の他のアイテムも candidate_neg_feats に含まれてしまっている場合、
-        # ここでそれを除外するマスクを追加する必要がある。
-
-        # DataGeneratorがどのように candidate_negatives を収集しているかによるが、
-        # 通常、HardNegativeMinerは「異なるセット」から負例を選ぶため、
-        # 同じバッチ内の同じセットに属するアイテムが candidate_neg_feats に含まれることは稀です。
-        # もし含まれる可能性があるなら、以下のマスクを追加します。
-
-        # 候補ネガティブが元のバッチと同じかどうかを判定するための情報が必要。
-        # 現在の DataGenerator からは candidate_neg_feats の元のバッチ・セットIDは直接得られない。
-        # もし candidate_neg_feats の各候補がどのセットに由来するかを DataGenerator が提供しない限り、
-        # この関数内での厳密な「同じセット内ネガティブ除外」は難しい。
-        # (DataGeneratorから 'candidate_negative_original_set_ids' のようなものを渡す必要がある)
-
-        # 仮に `candidate_neg_feats` には「同じセット内の他のアイテム」は含まれていないと仮定し、
-        # TPaNegの意図通りに動くものとします。
-        # もし、precompute_negatives_gpu や HardNegativeMiner が、同じセット内の他のアイテムを
-        # 候補ネガティブとして含んでしまっているなら、DataGeneratorの出力にその情報を追加し、
-        # ここでその情報を使ってマスクを適用する必要があります。
-
-        # 現状のコードの範囲内でできるのは、あくまで渡された candidate_neg_masks_flat の範囲内での処理。
-        
-        # TPaNeg論文の意図通り、最終的にネガティブとして採用する条件
-        # 1. 元々候補として有効 (cand_neg_masks_flat)
-        # 2. TaNeg基準を満たす (taneg_mask)
-        # 3. PaNeg基準を満たす (paneg_mask)
         final_neg_mask = tf.logical_and(tf.logical_and(base_cand_neg_mask, taneg_mask), paneg_mask)
 
         # 4. InfoNCE損失計算
@@ -846,8 +798,30 @@ class TPaNegModel(SetRetrievalBaseModel):
         final_loss = tf.math.divide_no_nan(tf.reduce_sum(masked_loss), num_items_for_loss)
 
         # デバッグコード追加
-        # effective_negatives_per_item = tf.reduce_sum(tf.cast(final_neg_mask, tf.float32), axis=1)
-        # avg_effective_negatives = tf.reduce_mean(effective_negatives_per_item)
+        effective_negatives_per_item = tf.reduce_sum(tf.cast(final_neg_mask, tf.float32), axis=1)
+        avg_effective_negatives = tf.reduce_mean(effective_negatives_per_item)
+
+
+
+        # デバッグ: 詳細な値の確認
+        # if tf.equal(tf.cast(self.optimizer.iterations, tf.int32) % 50, 0):
+        #     tf.print("=== TPaNeg Debug Values ===")
+        #     tf.print("current_taneg_t_gamma:", current_taneg_t_gamma)
+        #     tf.print("paneg_epsilon:", paneg_epsilon)
+        #     tf.print("sim_target_neg range:", tf.reduce_min(sim_target_neg), "to", tf.reduce_max(sim_target_neg))
+        #     tf.print("sim_pred_pos range:", tf.reduce_min(sim_pred_pos), "to", tf.reduce_max(sim_pred_pos))
+        #     tf.print("sim_pred_neg range:", tf.reduce_min(sim_pred_neg), "to", tf.reduce_max(sim_pred_neg))
+            
+        #     # マスクの通過率
+        #     taneg_pass_rate = tf.reduce_mean(tf.cast(taneg_mask, tf.float32))
+        #     paneg_pass_rate = tf.reduce_mean(tf.cast(paneg_mask, tf.float32))
+        #     base_pass_rate = tf.reduce_mean(tf.cast(base_cand_neg_mask, tf.float32))
+        #     final_pass_rate = tf.reduce_mean(tf.cast(final_neg_mask, tf.float32))
+            
+        #     tf.print("TaNeg mask pass rate:", taneg_pass_rate * 100.0, "%")
+        #     tf.print("PaNeg mask pass rate:", paneg_pass_rate * 100.0, "%") 
+        #     tf.print("Base mask pass rate:", base_pass_rate * 100.0, "%")
+        #     tf.print("Final mask pass rate:", final_pass_rate * 100.0, "%")
 
         # tf.print("Avg effective negatives per item:", avg_effective_negatives)
         # tf.print("Max effective negatives:", tf.reduce_max(effective_negatives_per_item))
