@@ -10,7 +10,7 @@
 
 ---
 
-## 📋 Table of Contents
+## Table of Contents
 
 <!-- 1. [Quick Start](#-quick-start) -->
 2. [Project Structure](#-project-structure)
@@ -26,7 +26,7 @@
 
 <!-- ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Prerequisites
 - Ubuntu 20.04+ or similar Linux distribution
@@ -67,7 +67,7 @@ python run.py \
 
 --- -->
 
-## 🗂️ Project Structure
+## Project Structure
 
 ```
 SetRetrieval_WACV2026/
@@ -118,7 +118,7 @@ SetRetrieval_WACV2026/
 
 ---
 
-## 🔧 Installation
+## Installation
 
 ### Option 1: Step-by-Step Installation (Recommended)
 ```bash
@@ -154,7 +154,7 @@ conda activate setretrieval
 
 ---
 
-## 📊 Dataset Preparation
+## Dataset Preparation
 
 ### DeepFurniture Dataset (11 categories)
 
