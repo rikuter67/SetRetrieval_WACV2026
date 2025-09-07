@@ -13,16 +13,16 @@
 ## Table of Contents
 
 <!-- 1. [Quick Start](#-quick-start) -->
-2. [Project Structure](#-project-structure)
-3. [Installation](#-installation)
-4. [Dataset Preparation](#-dataset-preparation)
-5. [Training](#-training)
-6. [Evaluation](#-evaluation)
-7. [Visualization](#-visualization)
-8. [Automated Experiments](#-automated-experiments)
-9. [Results](#-results)
-10. [Troubleshooting](#-troubleshooting)
-11. [Citation](#-citation)
+1. [Project Structure](#-project-structure)
+2. [Installation](#-installation)
+3. [Dataset Preparation](#-dataset-preparation)
+4. [Training](#-training)
+5. [Evaluation](#-evaluation)
+6. [Visualization](#-visualization)
+7. [Automated Experiments](#-automated-experiments)
+8. [Results](#-results)
+9. [Troubleshooting](#-troubleshooting)
+10. [Citation](#-citation)
 
 <!-- ---
 
