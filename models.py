@@ -3,7 +3,7 @@ import tensorflow as tf
 from tensorflow.keras import layers, Model
 from typing import List
 import pdb
-# tf.config.run_functions_eagerly(True) 
+tf.config.run_functions_eagerly(True) 
 
 
 # ============================================================================
@@ -54,6 +54,94 @@ import pdb
 #         self.total_correct.assign(0.0)
 #         self.total_count.assign(0.0)
 
+def simple_percentile(values, q):
+    """tensorflow-probability不要のpercentile計算"""
+    sorted_values = tf.sort(values)
+    n = tf.cast(tf.shape(sorted_values)[0], tf.float32)
+    index = (q / 100.0) * (n - 1)
+    lower_idx = tf.cast(tf.floor(index), tf.int32)
+    upper_idx = tf.minimum(lower_idx + 1, tf.cast(n - 1, tf.int32))
+    
+    lower_val = sorted_values[lower_idx]
+    upper_val = sorted_values[upper_idx]
+    weight = index - tf.cast(lower_idx, tf.float32)
+    
+    return lower_val + weight * (upper_val - lower_val)
+
+class DynamicCycleRatioWeighter:
+    """
+    予測品質に基づいてcycle損失の割合を動的に調整
+    基本構造: total_loss = contrastive_loss + (cycle_ratio * cycle_loss)
+    """
+    
+    def __init__(self, base_cycle_ratio=0.05, total_epochs=1000, 
+                 quality_sensitivity=2.0, epoch_progression_factor=1.5):
+        self.base_cycle_ratio = base_cycle_ratio
+        self.total_epochs = total_epochs
+        self.quality_sensitivity = quality_sensitivity
+        self.epoch_progression_factor = epoch_progression_factor
+    
+    def _normalize_losses(self, losses):
+        """損失を0-1範囲に正規化"""
+        q25 = simple_percentile(losses, 25.0)
+        q75 = simple_percentile(losses, 75.0)
+        iqr = q75 - q25 + 1e-6
+        normalized = (losses - q25) / iqr
+        return tf.clip_by_value(normalized, 0.0, 1.0)
+    
+    def compute_prediction_quality_scores(self, forward_losses, cycle_losses):
+        """予測品質スコアを計算"""
+        forward_norm = self._normalize_losses(forward_losses)
+        cycle_norm = self._normalize_losses(cycle_losses)
+        
+        # forward重視の品質スコア (低損失=高品質)
+        quality_scores = 1.0 - (0.7 * forward_norm + 0.3 * cycle_norm)
+        quality_scores = tf.pow(quality_scores, self.quality_sensitivity)
+        
+        return tf.clip_by_value(quality_scores, 0.0, 1.0)
+    
+    def get_epoch_progression_multiplier(self, epoch):
+        """学習進捗倍率"""
+        progress = tf.minimum(tf.cast(epoch, tf.float32) / self.total_epochs, 1.0)
+        multiplier = 0.5 + (self.epoch_progression_factor - 0.5) * tf.pow(progress, 0.7)
+        return multiplier
+    
+    def compute_dynamic_cycle_ratios(self, forward_losses, cycle_losses, epoch):
+        """動的cycle損失割合を計算"""
+        quality_scores = self.compute_prediction_quality_scores(forward_losses, cycle_losses)
+        epoch_multiplier = self.get_epoch_progression_multiplier(epoch)
+        
+        # 品質に基づく倍率 (0.2〜3.0倍)
+        quality_multiplier = 0.2 + 2.8 * quality_scores
+        
+        cycle_ratios = self.base_cycle_ratio * quality_multiplier * epoch_multiplier
+        
+        return tf.clip_by_value(cycle_ratios, 0.01, 0.20)
+    
+    def apply_dynamic_weighting(self, contrastive_loss, cycle_losses, 
+                              forward_losses, epoch, reduction='mean'):
+        """動的重み付きで損失を結合"""
+        cycle_ratios = self.compute_dynamic_cycle_ratios(forward_losses, cycle_losses, epoch)
+        weighted_cycle_losses = cycle_ratios * cycle_losses
+        
+        if reduction == 'mean':
+            aggregated_cycle_loss = tf.reduce_mean(weighted_cycle_losses)
+        else:
+            aggregated_cycle_loss = tf.reduce_sum(weighted_cycle_losses)
+        
+        total_loss = contrastive_loss + aggregated_cycle_loss
+        
+        debug_info = {
+            'avg_cycle_ratio': tf.reduce_mean(cycle_ratios),
+            'cycle_ratio_range': (tf.reduce_min(cycle_ratios), tf.reduce_max(cycle_ratios)),
+            'contrastive_loss': contrastive_loss,
+            'weighted_cycle_loss': aggregated_cycle_loss,
+            'epoch': epoch
+        }
+        
+        return total_loss, debug_info
+
+        
 class PerCategoryItemTopKAccuracy(tf.keras.metrics.Metric):
    """
    最小限の修正でエラーを解決した版
@@ -690,6 +778,9 @@ class TPaNegModel(SetRetrievalBaseModel):
         
         # 勾配パス保持
         final_loss += 0.0 * tf.reduce_sum(predictions)
+
+        import pdb
+        pdb.set_trace()
         
         return final_loss
 
