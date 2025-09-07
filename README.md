@@ -184,14 +184,16 @@ ls data/DeepFurniture/metadata/
 #### Step 3: Aggregate Scene Annotations
 Before processing the dataset, you must first aggregate all individual scene annotations into a single file:
 
-# Aggregate all scene annotation.json files into one annotations.json
+Aggregate all scene annotation.json files into one annotations.json
+```
 python scripts/aggregate_annotations.py \
   --scenes_dir data/DeepFurniture/scenes \
   --output_path data/DeepFurniture/metadata/annotations.json
+```
 
 
 #### Step 4: Process Dataset
-```bash
+```
 # Extract features and create train/val/test splits
 python make_datasets.py \
   --dataset deepfurniture \
