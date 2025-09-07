@@ -274,10 +274,9 @@ The evaluation system provides comprehensive metrics:
 - **Percentage-based Accuracy**: Top-5%, 10%, 20% of gallery
 - **Mean Reciprocal Rank (MRR)**: Average of 1/rank
 - **Category-wise Performance**: Individual metrics per furniture type
-- **Average Percentile Rank**: Overall ranking performance
 
 ### Expected Output
-```
+```bash
 ### Expected Performance (Table 3 Results)
 | Method | Dataset | Top-5% | Top-10% | Top-20% |
 |--------|---------|--------|---------|---------|
