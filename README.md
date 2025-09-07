@@ -234,130 +234,89 @@ python make_datasets.py \
 
 ---
 
-## 🏋️ Training
+## Training
 
-### Simplest Training (Minimal Model)
+### Method Comparison (Paper Reproduction)
+
+#### Baseline (CST)
 ```bash
-# 2 layers, 2 heads - fastest training
-CUDA_VISIBLE_DEVICES=0 python run.py \
-  --dataset DeepFurniture \
-  --mode train \
-  --batch-size 128 \
-  --epochs 100 \
-  --num-layers 2 \
-  --num-heads 2 \
-  --learning-rate 1e-4 \
-  --patience 10 \
-  --use-center-base
+CUDA_VISIBLE_DEVICES=0 python run.py --dataset DeepFurniture --mode train --data_dir ./data --dataset_dir ./datasets --epochs 500 --batch_size 64 --learning_rate 1e-4 --num_layers 2 --num_heads 2
 ```
 
-### Standard Training (Baseline)
+## CST + Cycle (w/o TPaNeg)
 ```bash
-# 4 layers, 4 heads - recommended baseline
-CUDA_VISIBLE_DEVICES=0 python run.py \
-  --dataset DeepFurniture \
-  --mode train \
-  --batch-size 128 \
-  --epochs 100 \
-  --num-layers 4 \
-  --num-heads 4 \
-  --learning-rate 1e-4 \
-  --patience 10 \
-  --use-center-base
+CUDA_VISIBLE_DEVICES=0 python run.py --dataset DeepFurniture --mode train --data_dir ./data --dataset_dir ./datasets --epochs 500 --batch_size 64 --learning_rate 1e-4 --num_layers 2 --num_heads 2 --use_cycle_loss --cycle_lambda 0.2
 ```
 
-### Full Method (Our Approach)
+## CST + TPaNeg (w/o Cycle)
 ```bash
-# Complete method with all components
-CUDA_VISIBLE_DEVICES=0 python run.py \
-  --dataset DeepFurniture \
-  --mode train \
-  --batch-size 128 \
-  --epochs 100 \
-  --num-layers 4 \
-  --num-heads 4 \
-  --learning-rate 1e-4 \
-  --patience 10 \
-  --use-center-base \
-  --use-cycle-loss \
-  --cycle-lambda 0.2 \
-  --use-clneg-loss \
-  --neg-num 10
+CUDA_VISIBLE_DEVICES=0 python run.py --dataset DeepFurniture --mode train --data_dir ./data --dataset_dir ./datasets --epochs 500 --batch_size 64 --learning_rate 1e-4 --num_layers 2 --num_heads 2 --use_tpaneg --candidate_neg_num 100 --pa_neg_epsilon 0.2
 ```
 
-### Training Options
-| Parameter | Description | Default | Options |
-|-----------|-------------|---------|---------|
-| `--dataset` | Dataset name | - | DeepFurniture, IQON3000 |
-| `--batch-size` | Batch size | 64 | 32, 64, 128 |
-| `--num-layers` | Transformer layers | 4 | 2, 4, 6 |
-| `--num-heads` | Attention heads | 4 | 2, 4, 8 |
-| `--learning-rate` | Learning rate | 1e-4 | 1e-5 to 1e-3 |
-| `--use-center-base` | Enable center-base loss | False | Add flag to enable |
-| `--use-cycle-loss` | Enable cycle consistency | False | Add flag to enable |
-| `--cycle-lambda` | Cycle loss weight | 0.2 | 0.1, 0.2, 0.5 |
-| `--use-clneg-loss` | Enable CLNeg mining | False | Add flag to enable |
-| `--neg-num` | Negative samples | 10 | 10, 20, 30 |
-
-### Training Output
-```
-experiments/DeepFurniture/B128_L2_H2_CB_GPU_20240115_143022/
-├── checkpoints/
-│   └── best_model.weights.h5    # Best model weights
-├── training.log                 # Training history
-├── args.txt                     # Configuration
-└── visualizations/              # (Created during evaluation)
+## Integrated (Ours)
+```bash
+CUDA_VISIBLE_DEVICES=0 python run.py --dataset DeepFurniture --mode train --data_dir ./data --dataset_dir ./datasets --epochs 500 --batch_size 64 --learning_rate 1e-4 --num_layers 2 --num_heads 2 --use_cycle_loss --cycle_lambda 0.2 --use_tpaneg --candidate_neg_num 100 --pa_neg_epsilon 0.2
 ```
 
 ---
 
-## 📈 Evaluation
+## Evaluation
 
 ### Standard Evaluation
 ```bash
-# Evaluate trained model
-python run.py \
-  --dataset DeepFurniture \
-  --mode test \
-  --batch-size 128 \
-  --num-layers 2 \
-  --num-heads 2 \
-  --use-center-base \
-  --weights-path experiments/DeepFurniture/[experiment_name]/checkpoints/best_model.weights.h5
+# Evaluate trained model (simply change --mode to test)
+python run.py --mode test (same parameters as training)
 ```
 
 ### Evaluation Metrics
 The evaluation system provides comprehensive metrics:
 
-- **Percentage-based Accuracy**: Top-1%, 3%, 5%, 10%, 20% of gallery
+- **Percentage-based Accuracy**: Top-5%, 10%, 20% of gallery
 - **Mean Reciprocal Rank (MRR)**: Average of 1/rank
 - **Category-wise Performance**: Individual metrics per furniture type
 - **Average Percentile Rank**: Overall ranking performance
 
 ### Expected Output
 ```
-📊 PERCENTAGE-BASED EVALUATION REPORT - DeepFurniture
-================================================================
-Overall Performance (Center-Corrected):
-  Top-1% Accuracy: 0.127 (12.7%)
-  Top-3% Accuracy: 0.245 (24.5%)
-  Top-5% Accuracy: 0.318 (31.8%)
-  Top-10% Accuracy: 0.456 (45.6%)
-  Top-20% Accuracy: 0.623 (62.3%)
-  Average Percentile Rank: 12.7%
+### Expected Performance (Table 3 Results)
+| Method | Dataset | Top-5% | Top-10% | Top-20% |
+|--------|---------|--------|---------|---------|
+| CST | DeepFurniture | 45.79% | 54.79% | 63.71% |
+| CST + Cycle | DeepFurniture | 45.83% | 54.71% | 64.55% |
+| CST + TPaNeg | DeepFurniture | 49.75% | 57.88% | 66.48% |
+| **Integrated (Ours)** | **DeepFurniture** | **48.68%** | **57.26%** | **66.50%** |
+| CST | IQON3000 | 19.12% | 29.93% | 45.08% |
+| **Integrated (Ours)** | **IQON3000** | **20.68%** | **32.10%** | **47.50%** |
 
-Category Breakdown:
-  1: Chairs     - Top-5%: 35.1%, MRR: 0.152
-  2: Tables     - Top-5%: 29.4%, MRR: 0.118
-  3: Storage    - Top-5%: 33.2%, MRR: 0.135
-  [... detailed results for all 11 categories]
-
-📁 Results saved to: experiments/DeepFurniture/[experiment_name]/
-   - 🎨 Scene visualizations: visualizations/
-   - 📊 CSV results: deepfurniture_percentage_results.csv
-   - 📋 Summary table: deepfurniture_percentage_table.txt
-================================================================
+### Training Parameters
+| Parameter | Description | DeepFurniture | IQON3000 |
+|-----------|-------------|---------------|----------|
+| `--cycle_lambda` | Cycle consistency weight α | 0.2 | 0.5 |
+| `--candidate_neg_num` | Number of negative samples | 100 | 300 |
+| `--pa_neg_epsilon` | Margin parameter ε | 0.2 | 0.2 |
+| `--epochs` | Training epochs | 500 | 100 |
+| `--batch_size` | Batch size | 64 | 64 |
 ```
+
+
+### Output
+```
+experiments/DeepFurniture/[experiment_name]/
+├── args.json                                    # Training configuration
+├── final_model.weights.h5                       # Final model weights
+├── results_log.csv                             # Detailed training logs
+├── results_summary.csv                         # Summary metrics
+├── weighted_metrics_summary.csv                # Category-weighted metrics
+├── training_curves_deepfurniture.png           # Training/validation curves
+├── performance_by_category.png                 # Per-category performance
+├── pca_embedding_space.png                     # Feature space visualization
+├── visualization_summary_deepfurniture.txt     # Text summary of results
+└── collages/                                   # Scene visualizations
+├── scene_L3D187S8ENDI2MZOKYUG5TL46AF3P3WE888_retrieval.jpg
+├── scene_L3D187S8ENDI3TMJYAUI5MJEXXM3P3XU888_retrieval.jpg
+└── [more_scene_visualizations].jpg
+```
+
 
 ---
 
@@ -401,132 +360,6 @@ Each visualization includes:
 # Run architecture comparison
 ./run_exp.sh --gpu 1 architecture --mode train
 ```
-
-### Experiment Types
-| Command | Description | Experiments |
-|---------|-------------|-------------|
-| `ablation` | Compare methods (baseline/cycle/clneg/full) | 4 |
-| `architecture` | Compare architectures (2L2H/4L4H/6L6H) | 3 |
-| `hyperparameter` | Batch size optimization | Variable |
-| `cycle-sweep` | Cycle lambda tuning (0.1/0.2/0.5) | 6 |
-| `clneg-sweep` | Negative samples tuning (10/20/30) | 6 |
-| `all` | Complete factorial design | Up to 216 |
-
-### Custom Experiments
-```bash
-# Custom parameters
-./run_exp.sh \
-  --gpu 0 \
-  --arch "2L2H,4L4H" \
-  --methods "baseline,full" \
-  --batch "64,128" \
-  --lambdas "0.1,0.2" \
-  --negs "10,20" \
-  custom \
-  --mode train
-```
-
-
-
----
-
-## 📊 Results
-
-### DeepFurniture Benchmark (11 categories)
-| Method | Layers | Top-1% | Top-5% | Top-10% | Top-20% | MRR | Time |
-|--------|--------|--------|--------|---------|---------|-----|------|
-| Baseline | 2L2H | 6.5% | 22.3% | 35.8% | 52.1% | 0.065 | 1.5h |
-| Baseline | 4L4H | 8.2% | 28.1% | 41.3% | 58.7% | 0.082 | 2.5h |
-| + Cycle | 4L4H | 10.5% | 30.5% | 43.8% | 60.2% | 0.095 | 2.7h |
-| + CLNeg | 4L4H | 11.3% | 31.2% | 44.6% | 61.5% | 0.103 | 3.0h |
-| **Full (Ours)** | **4L4H** | **12.7%** | **33.8%** | **45.6%** | **62.3%** | **0.115** | **3.2h** |
-
-### IQON3000 Benchmark (7 categories)
-| Method | Layers | Top-1% | Top-5% | Top-10% | Top-20% | MRR | Time |
-|--------|--------|--------|--------|---------|---------|-----|------|
-| Baseline | 4L4H | 15.3% | 38.7% | 52.4% | 68.9% | 0.142 | 1.2h |
-| **Full (Ours)** | **4L4H** | **18.9%** | **42.5%** | **56.8%** | **72.1%** | **0.178** | **1.5h** |
-
-### Hardware Requirements
-| Configuration | VRAM Usage | Training Time (100 epochs) |
-|---------------|------------|----------------------------|
-| 2L2H, batch=64 | ~6GB | 1-1.5 hours |
-| 4L4H, batch=128 | ~12GB | 2-3 hours |
-| 6L6H, batch=128 + CLNeg | ~24GB | 3-4 hours |
-
----
-
-## 🚨 Troubleshooting
-
-### Common Issues
-
-#### CUDA Out of Memory
-```bash
-# Solution 1: Reduce batch size
-python run.py --batch-size 64 ...
-
-# Solution 2: Use smaller model
-python run.py --num-layers 2 --num-heads 2 ...
-
-# Solution 3: Disable CLNeg to save ~60% memory
-python run.py --use-center-base --use-cycle-loss  # No --use-clneg-loss
-```
-
-#### Missing Dataset Files
-```bash
-# Check if processed data exists
-ls datasets/DeepFurniture/
-# Should show: train.pkl, validation.pkl, test.pkl, category_centers.pkl.gz
-
-# If missing, rerun preprocessing
-python make_datasets.py --dataset deepfurniture ...
-```
-
-#### TensorFlow GPU Issues
-```bash
-# Enable memory growth
-export TF_FORCE_GPU_ALLOW_GROWTH=true
-
-# Specify GPU device
-export CUDA_VISIBLE_DEVICES=0
-
-# Check GPU availability
-python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
-```
-
-#### Visualization Not Generated
-```bash
-# Install visualization dependencies
-pip install matplotlib pillow
-
-# Verify image paths
-ls data/DeepFurniture/scenes/*/image.jpg | head -5
-ls data/DeepFurniture/furnitures/*.jpg | head -5
-
-# Enable visualization explicitly
-python run.py --mode test --enable-visualization
-```
-
-### Performance Optimization
-
-**Data Loading:**
-```bash
-# Use SSD for datasets
-ln -s /ssd/datasets datasets
-```
-
-**Mixed Precision (experimental):**
-```bash
-export TF_ENABLE_ONEDNN_OPTS=1
-```
-
-**Larger Batch Sizes:**
-```bash
-# If you have 48GB+ VRAM
-python run.py --batch-size 256 ...
-```
-
----
 
 ## 📝 Citation
 
