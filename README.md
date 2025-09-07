@@ -278,17 +278,21 @@ The evaluation system provides comprehensive metrics:
 
 ### Expected Performance (Table 3 Results)
 
-| Method | Dataset | Top-5% | Top-10% | Top-20% |
-|--------|---------|--------|---------|---------|
-| CST | IQON3000 | 19.12% | 29.93% | 45.08% |
-| CST + Cycle | IQON3000 | 19.16% | 30.14% | 45.29% |
-| CST + TPaNeg | IQON3000 | 20.76% | 32.26% | 47.64% |
-| Integrated (Ours) | IQON3000 | 20.68% | 32.10% | 47.50% |
-|--------|---------|--------|---------|---------|
-| CST | DeepFurniture | 45.79% | 54.79% | 63.71% |
-| CST + Cycle | DeepFurniture | 45.83% | 54.71% | 64.55% |
-| CST + TPaNeg | DeepFurniture | 49.75% | 57.88% | 66.48% |
-| Integrated (Ours) | DeepFurniture | 48.68% | 57.26% | 66.50% |
+#### IQON3000
+| Method | Top-5% | Top-10% | Top-20% |
+|--------|--------|---------|---------|
+| CST | 19.12% | 29.93% | 45.08% |
+| CST + Cycle | 19.16% | 30.14% | 45.29% |
+| CST + TPaNeg | 20.76% | 32.26% | 47.64% |
+| Integrated (Ours) | 20.68% | 32.10% | 47.50% |
+
+#### DeepFurniture
+| Method | Top-5% | Top-10% | Top-20% |
+|--------|--------|---------|---------|
+| CST | 45.79% | 54.79% | 63.71% |
+| CST + Cycle | 45.83% | 54.71% | 64.55% |
+| CST + TPaNeg | 49.75% | 57.88% | 66.48% |
+| Integrated (Ours) | 48.68% | 57.26% | 66.50% |
 
 ### Training Parameters
 
