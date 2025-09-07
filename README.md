@@ -1,10 +1,10 @@
 # SetRetrieval: Conservative Convergence-Aware Bidirectional Learning for Heterogeneous Set Retrieval
 
-**Official Implementation of WACV 2025 Paper** 🏆
+<!-- **Official Implementation of WACV 2025 Paper** 🏆 -->
 
-[![arXiv](https://img.shields.io/badge/arXiv-2024.XXXXX-b31b1b.svg)](https://arxiv.org/)
+<!-- [![arXiv](https://img.shields.io/badge/arXiv-2024.XXXXX-b31b1b.svg)](https://arxiv.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/) -->
 
 > **Abstract**: This work addresses the conservative convergence problem in heterogeneous set retrieval, where traditional unidirectional approaches converge toward statistical averages, failing to capture individual aesthetic preferences. We propose a bidirectional consistency learning framework with cycle consistency loss and curriculum-based hard negative mining to overcome this limitation.
 
@@ -12,7 +12,7 @@
 
 ## 📋 Table of Contents
 
-1. [Quick Start](#-quick-start)
+<!-- 1. [Quick Start](#-quick-start) -->
 2. [Project Structure](#-project-structure)
 3. [Installation](#-installation)
 4. [Dataset Preparation](#-dataset-preparation)
@@ -24,7 +24,7 @@
 10. [Troubleshooting](#-troubleshooting)
 11. [Citation](#-citation)
 
----
+<!-- ---
 
 ## 🚀 Quick Start
 
@@ -65,7 +65,7 @@ python run.py \
   --weights-path experiments/DeepFurniture/*/checkpoints/best_model.weights.h5
 ```
 
----
+--- -->
 
 ## 🗂️ Project Structure
 
@@ -181,7 +181,16 @@ ls data/DeepFurniture/metadata/
 # Should contain: annotations.json, furnitures.jsonl
 ```
 
-#### Step 3: Process Dataset
+#### Step 3: Aggregate Scene Annotations
+Before processing the dataset, you must first aggregate all individual scene annotations into a single file:
+
+# Aggregate all scene annotation.json files into one annotations.json
+python scripts/aggregate_annotations.py \
+  --scenes_dir data/DeepFurniture/scenes \
+  --output_path data/DeepFurniture/metadata/annotations.json
+
+
+#### Step 4: Process Dataset
 ```bash
 # Extract features and create train/val/test splits
 python make_datasets.py \
