@@ -258,6 +258,16 @@ CUDA_VISIBLE_DEVICES=0 python run.py --dataset DeepFurniture --mode train --data
 CUDA_VISIBLE_DEVICES=0 python run.py --dataset DeepFurniture --mode train --data_dir ./data --dataset_dir ./datasets --epochs 500 --batch_size 64 --learning_rate 1e-4 --num_layers 2 --num_heads 2 --use_cycle_loss --cycle_lambda 0.2 --use_tpaneg --candidate_neg_num 100 --pa_neg_epsilon 0.2
 ```
 
+### Training Parameters
+
+| Parameter | Description | DeepFurniture | IQON3000 |
+|-----------|-------------|---------------|----------|
+| `--cycle_lambda` | Cycle consistency weight α | 0.2 | 0.5 |
+| `--candidate_neg_num` | Number of negative samples | 100 | 300 |
+| `--pa_neg_epsilon` | Margin parameter ε | 0.2 | 0.2 |
+| `--epochs` | Training epochs | 500 | 100 |
+| `--batch_size` | Batch size | 64 | 64 |
+
 ---
 
 ## Evaluation
@@ -294,17 +304,6 @@ The evaluation system provides comprehensive metrics:
 | CST + TPaNeg | 49.75% | 57.88% | 66.48% |
 | Integrated (Ours) | 48.68% | 57.26% | 66.50% |
 
-### Training Parameters
-
-| Parameter | Description | DeepFurniture | IQON3000 |
-|-----------|-------------|---------------|----------|
-| `--cycle_lambda` | Cycle consistency weight α | 0.2 | 0.5 |
-| `--candidate_neg_num` | Number of negative samples | 100 | 300 |
-| `--pa_neg_epsilon` | Margin parameter ε | 0.2 | 0.2 |
-| `--epochs` | Training epochs | 500 | 100 |
-| `--batch_size` | Batch size | 64 | 64 |
-
-
 ### Output
 ```
 experiments/DeepFurniture/[experiment_name]/
@@ -318,38 +317,16 @@ experiments/DeepFurniture/[experiment_name]/
 ├── pca_embedding_space.png                     # Feature space visualization
 ├── visualization_summary_deepfurniture.txt     # Text summary of results
 └── collages/                                   # Scene visualizations
-├── scene_L3D187S8ENDI2MZOKYUG5TL46AF3P3WE888_retrieval.jpg
-├── scene_L3D187S8ENDI3TMJYAUI5MJEXXM3P3XU888_retrieval.jpg
+├── L3D187S8ENDI2MZOKYUG5TL46AF3P3WE888_retrieval.jpg
+├── L3D187S8ENDI3TMJYAUI5MJEXXM3P3XU888_retrieval.jpg
 └── [more_scene_visualizations].jpg
-```
-
-
----
-
-## 🎨 Visualization
-
-### Automatic Visualization
-Visualizations are automatically generated during evaluation for DeepFurniture:
-```bash
-# Test mode automatically creates visualizations
-python run.py --dataset DeepFurniture --mode test
-```
-
-### Visualization Output
-```
-experiments/DeepFurniture/[experiment_name]/visualizations/
-├── scene_L3D187S8ENDI2MZOKYUG5TL46AF3P3WE888_retrieval.jpg    # Scene-based retrieval
-├── scene_L3D187S8ENDI3TMJYAUI5MJEXXM3P3XU888_retrieval.jpg    # Another scene
-├── scene_L3D187S8ENDI4ABCDEFGHIJKLMNOPQRSTUV888_retrieval.jpg    
-├── scene_L3D187S8ENDI5WXYZABCDEFGHIJKLMNOP888_retrieval.jpg
-└── scene_L3D187S8ENDI6QRSTUVWXYZABCDEFGHIJ888_retrieval.jpg   # Up to 5 scenes
 ```
 
 Each visualization includes:
 - **Scene Image**: Original room photograph
 - **Query Items**: Input furniture items (green labels)
 - **Target Items**: Ground truth items (red labels)
-- **Top-3 Predictions**: Retrieved items with similarity scores
+- **Top-5 Predictions**: Retrieved items with similarity scores
 
 ---
 
@@ -358,30 +335,24 @@ Each visualization includes:
 ### Using run_exp.sh Script
 ```bash
 # Run all experiments without CLNeg for IQON3000
-./run_exp.sh --gpu 0 --clneg nouse all --mode train --DATASET IQON3000
-
-# Run specific experiment type
-./run_exp.sh --gpu 0 ablation --mode train --DATASET DeepFurniture
-
-# Run architecture comparison
-./run_exp.sh --gpu 1 architecture --mode train
+./run_exp.sh --gpu 0 
 ```
 
 ## 📝 Citation
 
 If you use this code in your research, please cite:
 
-```bibtex
+<!-- ```bibtex
 @inproceedings{yamazono2025setretrieval,
   title={Conservative Convergence-Aware Bidirectional Learning for Heterogeneous Set Retrieval},
   author={Yamazono, [First Name] and [Co-authors]},
   booktitle={Proceedings of the IEEE/CVF Winter Conference on Applications of Computer Vision (WACV)},
   year={2025}
-}
-```
+} -->
+<!-- ``` -->
 
 ---
-
+<!-- 
 ## 🤝 Contributing
 
 We welcome contributions! Please:
@@ -398,9 +369,9 @@ We welcome contributions! Please:
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
----
+--- -->
 
-## 🙏 Acknowledgments
+<!-- ## 🙏 Acknowledgments
 
 - **DeepFurniture dataset** authors for the furniture retrieval benchmark
 - **IQON3000 dataset** authors for the fashion retrieval benchmark  
@@ -418,4 +389,4 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ---
 
-**⭐ If you find this work helpful, please star the repository!**
+**⭐ If you find this work helpful, please star the repository!** -->
