@@ -275,9 +275,9 @@ The evaluation system provides comprehensive metrics:
 - **Mean Reciprocal Rank (MRR)**: Average of 1/rank
 - **Category-wise Performance**: Individual metrics per furniture type
 
-### Expected Output
-```bash
+
 ### Expected Performance (Table 3 Results)
+
 | Method | Dataset | Top-5% | Top-10% | Top-20% |
 |--------|---------|--------|---------|---------|
 | CST | DeepFurniture | 45.79% | 54.79% | 63.71% |
@@ -288,6 +288,7 @@ The evaluation system provides comprehensive metrics:
 | **Integrated (Ours)** | **IQON3000** | **20.68%** | **32.10%** | **47.50%** |
 
 ### Training Parameters
+
 | Parameter | Description | DeepFurniture | IQON3000 |
 |-----------|-------------|---------------|----------|
 | `--cycle_lambda` | Cycle consistency weight α | 0.2 | 0.5 |
@@ -295,7 +296,6 @@ The evaluation system provides comprehensive metrics:
 | `--pa_neg_epsilon` | Margin parameter ε | 0.2 | 0.2 |
 | `--epochs` | Training epochs | 500 | 100 |
 | `--batch_size` | Batch size | 64 | 64 |
-```
 
 
 ### Output
