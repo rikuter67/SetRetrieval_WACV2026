@@ -164,11 +164,8 @@ conda activate setretrieval
 cd data/
 git clone https://huggingface.co/datasets/rikuter67/DeepFurniture
 mv DeepFurniture/* DeepFurniture/
-```
 
-#### Step 2: Verify Data Structure
-```bash
-# Check directory structure
+#Verify Data Structure
 tree -L 2 data/DeepFurniture/
 # Expected:
 # data/DeepFurniture/
@@ -181,10 +178,8 @@ ls data/DeepFurniture/metadata/
 # Should contain: annotations.json, furnitures.jsonl
 ```
 
-#### Step 3: Aggregate Scene Annotations
+#### Step 2: Aggregate Scene Annotations
 Before processing the dataset, you must first aggregate all individual scene annotations into a single file:
-
-Aggregate all scene annotation.json files into one annotations.json
 ```
 python scripts/aggregate_annotations.py \
   --scenes_dir data/DeepFurniture/scenes \
@@ -192,9 +187,9 @@ python scripts/aggregate_annotations.py \
 ```
 
 
-#### Step 4: Process Dataset
-```
-# Extract features and create train/val/test splits
+#### Step 3: Process Dataset
+```bash
+# Extract features and create train/val/test splits (Process without inclusion removal)
 python make_datasets.py \
   --dataset deepfurniture \
   --image-dir data/DeepFurniture/furnitures \
@@ -204,40 +199,37 @@ python make_datasets.py \
   --batch-size 32
 ```
 
-**Expected output:**
-```
-Processing DeepFurniture dataset to 11 categories
-Using device: cuda
-Found 24742 valid images
-Extracting DeepFurniture features: 100%|██████████| 
-Built 20730 valid DeepFurniture scenes
-DeepFurniture split: Train 14402, Validation 3086, Test 3087
-Saved 11 DeepFurniture category centers to category_centers.pkl.gz
-```
+### IQON3000 Dataset (17 categories) - Manual Setup Required
 
-### IQON3000 Dataset (7 categories) - Manual Setup Required
-
-The IQON3000 dataset must be manually downloaded and placed in the correct directory structure:
+#### Step 1: Download IQON3000 Dataset
+**MANUAL DOWNLOAD REQUIRED**: The IQON3000 dataset must be downloaded manually from the official source.
 
 ```bash
-# Create directory structure
-mkdir -p data/IQON3000
+# 1. Visit the official IQON3000 dataset page
+# URL: https://drive.google.com/file/d/1sTfUoNPid9zG_MgV--lWZTBP1XZpmcK8/view
 
-# Download IQON3000 dataset manually from official source
-# Place the downloaded data in data/IQON3000/
+# 2. Create directory and extract downloaded data
+mkdir -p data/IQON3000
+# Extract your downloaded file to data/IQON3000/
+
+# 3. Verify directory structure
 # Expected structure:
 # data/IQON3000/
 # ├── [user_id]/
 # │   └── [coordinate_id]/
 # │       ├── [coordinate_id].json
 # │       └── [item_id]_m.jpg
+```
 
-# Process IQON3000 dataset
+#### Step 2: Process Dataset
+```bash
+# Process IQON3000 dataset with user-based splitting (prevents user overlap)
 python make_datasets.py \
   --dataset iqon3000 \
   --input-dir data/IQON3000 \
   --output-dir datasets/IQON3000 \
-  --batch-size 32
+  --batch-size 32 \
+  --user-based
 ```
 
 ---
