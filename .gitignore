@@ -19,3 +19,17 @@ installation_log.txt
 # IDE/Editor specific
 .vscode/
 .idea/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Analysis results and local data
+dataset_analysis/
+training_whitening_params.pkl
+hardcopy.0
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
