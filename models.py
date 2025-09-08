@@ -6,12 +6,6 @@ import pdb
 # tf.config.run_functions_eagerly(True) 　デバックモード
 
 class PerCategoryItemTopKAccuracy(tf.keras.metrics.Metric):
-   """
-   最小限の修正でエラーを解決した版
-   - tf.rangeループをPythonループに変更
-   - XLA無効化
-   - 動的形状問題を回避
-   """
    def __init__(self, k, num_categories, name='per_category_topk_acc', **kwargs):
        super().__init__(name=name, **kwargs)
        self.k_percent = float(k)  # 静的値として保存
@@ -22,9 +16,6 @@ class PerCategoryItemTopKAccuracy(tf.keras.metrics.Metric):
 
    @tf.function(jit_compile=False)  # XLA無効化
    def update_state(self, predictions, target_features, target_categories, sample_weight=None):
-       """
-       修正版TopK%精度計算
-       """
        B, S, D = tf.shape(target_features)[0], tf.shape(target_features)[1], tf.shape(target_features)[2]
        
        # データフラット化
@@ -37,10 +28,7 @@ class PerCategoryItemTopKAccuracy(tf.keras.metrics.Metric):
        batch_indices_flat = tf.reshape(batch_grid, [-1])
        
        # 有効アイテムマスク
-       valid_mask = tf.logical_and(
-           target_categories_flat > 0,
-           tf.reduce_sum(tf.abs(target_features_flat), axis=-1) > 1e-6
-       )
+       valid_mask = tf.logical_and(target_categories_flat > 0, tf.reduce_sum(tf.abs(target_features_flat), axis=-1) > 1e-6)
        
        valid_features = tf.boolean_mask(target_features_flat, valid_mask)
        valid_categories = tf.boolean_mask(target_categories_flat, valid_mask)
@@ -51,10 +39,7 @@ class PerCategoryItemTopKAccuracy(tf.keras.metrics.Metric):
        # 条件分岐で処理
        def process_when_valid():
            # 予測ベクトル取得
-           pred_indices = tf.stack([
-               valid_batch_indices,
-               tf.maximum(0, valid_categories - 1)
-           ], axis=1)
+           pred_indices = tf.stack([valid_batch_indices, tf.maximum(0, valid_categories - 1)], axis=1)
            pred_vectors = tf.gather_nd(predictions, pred_indices)
            
            # 正規化
@@ -83,17 +68,11 @@ class PerCategoryItemTopKAccuracy(tf.keras.metrics.Metric):
                    # ランク計算
                    expanded_diag = tf.expand_dims(diagonal_sims, axis=1)
                    
-                   better_mask = tf.logical_and(
-                       sim_matrix > expanded_diag,
-                       tf.logical_not(tf.eye(tf.shape(sim_matrix)[0], dtype=tf.bool))
-                   )
+                   better_mask = tf.logical_and(sim_matrix > expanded_diag, tf.logical_not(tf.eye(tf.shape(sim_matrix)[0], dtype=tf.bool)))
                    ranks = tf.reduce_sum(tf.cast(better_mask, tf.float32), axis=1) + 1.0
                    
                    # TopK%閾値
-                   k_threshold = tf.maximum(
-                       1.0, 
-                       (self.k_percent / 100.0) * cat_count_float
-                   )
+                   k_threshold = tf.maximum(1.0, (self.k_percent / 100.0) * cat_count_float)
                    
                    correct_in_cat = tf.reduce_sum(tf.cast(ranks <= k_threshold, tf.float32))
                    return correct_in_cat, cat_count_float
@@ -102,11 +81,7 @@ class PerCategoryItemTopKAccuracy(tf.keras.metrics.Metric):
                    return 0.0, 0.0
                
                # tf.condで条件分岐
-               correct_items, count_items = tf.cond(
-                   cat_count > 1,
-                   process_category,
-                   skip_category
-               )
+               correct_items, count_items = tf.cond(cat_count > 1, process_category, skip_category)
                
                total_correct_items += correct_items
                total_items += count_items
@@ -117,11 +92,7 @@ class PerCategoryItemTopKAccuracy(tf.keras.metrics.Metric):
            return 0.0, 0.0
        
        # メイン条件分岐
-       correct_items, count_items = tf.cond(
-           N_valid > 0,
-           process_when_valid,
-           skip_when_empty
-       )
+       correct_items, count_items = tf.cond(N_valid > 0, process_when_valid, skip_when_empty)
        
        # 統計更新
        self.total_correct.assign_add(correct_items)
@@ -141,27 +112,9 @@ class PerCategoryItemTopKAccuracy(tf.keras.metrics.Metric):
 class CrossAttentionSetRetrieval(Model):
     """Set Retrieval Model の基底クラス（共有ロジック）"""
     
-    def __init__(self, 
-                 feature_dim: int = 512,
-                 num_heads: int = 8,
-                 num_layers: int = 6,
-                 num_categories: int = 16,
-                 hidden_dim: int = 512,
-                 use_cycle_loss: bool = False,
-                 temperature: float = 1.0,
-                 dropout_rate: float = 0.1,
-                 k_values: List[int] = None,
-                 cycle_lambda: float = 0.1,
-                 cluster_centering: bool = False,
-                 use_tpaneg: bool = False,
-                 # 論文のT_gamma (TaNegの類似度閾値) に対応
-                 taneg_t_gamma_init: float = 0.5, 
-                 taneg_t_gamma_final: float = 0.8, # <-- 新しい引数
-                 taneg_curriculum_epochs: int = 100, # <-- 新しい引数
-                 # 論文のepsilon (PaNegのマージン) に対応
-                 paneg_epsilon: float = 0.2, 
-                 **kwargs):
-
+    def __init__(self, feature_dim: int = 512, num_heads: int = 8, num_layers: int = 6, num_categories: int = 16, hidden_dim: int = 512, 
+                 use_cycle_loss: bool = False, temperature: float = 1.0, dropout_rate: float = 0.1, k_values: List[int] = None, cycle_lambda: float = 0.1, cluster_centering: bool = False,
+                 use_tpaneg: bool = False, taneg_t_gamma_init: float = 0.5,  taneg_t_gamma_final: float = 0.8,  taneg_curriculum_epochs: int = 100,  paneg_epsilon: float = 0.2, **kwargs):
         super().__init__(**kwargs)
         
         self.feature_dim = feature_dim
@@ -177,11 +130,9 @@ class CrossAttentionSetRetrieval(Model):
         self.cluster_centering = cluster_centering
         self.use_tpaneg = use_tpaneg 
 
-        # 論文のT_gammaの初期値、最終値、カリキュラムエポック数
         self.taneg_t_gamma_init = taneg_t_gamma_init
         self.taneg_t_gamma_final = taneg_t_gamma_final
         self.taneg_curriculum_epochs = taneg_curriculum_epochs
-        # 論文のepsilon (PaNegのマージン)
         self.paneg_epsilon = paneg_epsilon
 
         self.category_centers = None
@@ -202,16 +153,10 @@ class CrossAttentionSetRetrieval(Model):
                 'norm1': layers.LayerNormalization(epsilon=1e-6, name=f'norm1_{i}'),
                 'norm2': layers.LayerNormalization(epsilon=1e-6, name=f'norm2_{i}'),
                 'norm3': layers.LayerNormalization(epsilon=1e-6, name=f'norm3_{i}'),
-                'ffn': tf.keras.Sequential([
-                    layers.Dense(self.hidden_dim * 2, activation='gelu'),
-                    layers.Dropout(self.dropout_rate),
-                    layers.Dense(self.hidden_dim)
-                ], name=f'ffn_{i}')
+                'ffn': tf.keras.Sequential([layers.Dense(self.hidden_dim * 2, activation='gelu'), layers.Dropout(self.dropout_rate), layers.Dense(self.hidden_dim)], name=f'ffn_{i}')
             }
             self.cross_attention_layers.append(layer_dict)
         self.output_projection = layers.Dense(self.feature_dim, activation=None, name='output_projection')
-        # BUG: This layer was defined but never used in the call method.
-        # It's not critical for fixing the current stagnation, but should be added for correctness later.
         self.output_norm = layers.LayerNormalization(epsilon=1e-6, name='output_norm')
 
     def _build_topk_metrics(self):
@@ -324,18 +269,8 @@ class SetRetrieval(CrossAttentionSetRetrieval):
             if self.use_tpaneg:
                 current_taneg_t_gamma = self.get_current_taneg_t_gamma()
                 
-                loss_X_to_Y = self._compute_tpaneg_loss(
-                    pred_Y,
-                    data['target_features'], data['target_categories'],
-                    data['candidate_negative_features'], data['candidate_negative_masks'],
-                    current_taneg_t_gamma
-                )
-                loss_Y_to_X = self._compute_tpaneg_loss(
-                    pred_X,
-                    data['query_features'], data['query_categories'],
-                    data['query_candidate_negative_features'], data['query_candidate_negative_masks'],
-                    current_taneg_t_gamma
-                )
+                loss_X_to_Y = self.tpaneg_loss(pred_Y, data['target_features'], data['target_categories'], data['candidate_negative_features'], data['candidate_negative_masks'], current_taneg_t_gamma)
+                loss_Y_to_X = self.tpaneg_loss(pred_X, data['query_features'], data['query_categories'], data['query_candidate_negative_features'], data['query_candidate_negative_masks'], current_taneg_t_gamma)
 
                 total_loss = loss_X_to_Y + loss_Y_to_X
 
@@ -344,31 +279,13 @@ class SetRetrieval(CrossAttentionSetRetrieval):
                     reconstructed_X = self({'query_features': pred_Y}, training=True)
                     reconstructed_Y = self({'query_features': pred_X}, training=True)
                     
-                    cycle_loss_X = self._compute_tpaneg_loss(
-                        reconstructed_X, 
-                        data['query_features'], data['query_categories'],
-                        data['query_candidate_negative_features'], data['query_candidate_negative_masks'],
-                        current_taneg_t_gamma
-                    )
-                    cycle_loss_Y = self._compute_tpaneg_loss(
-                        reconstructed_Y,
-                        data['target_features'], data['target_categories'],
-                        data['candidate_negative_features'], data['candidate_negative_masks'],
-                        current_taneg_t_gamma
-                    )
+                    cycle_loss_X = self.tpaneg_loss(reconstructed_X, data['query_features'], data['query_categories'], data['query_candidate_negative_features'], data['query_candidate_negative_masks'], current_taneg_t_gamma)
+                    cycle_loss_Y = self.tpaneg_loss(reconstructed_Y, data['target_features'], data['target_categories'], data['candidate_negative_features'], data['candidate_negative_masks'], current_taneg_t_gamma)
                     total_loss += self.cycle_lambda * (cycle_loss_X + cycle_loss_Y)
 
             else: 
-                loss_X_to_Y = self._compute_in_batch_hard_negative_loss(
-                    pred_Y,
-                    data['target_features'],
-                    data['target_categories']
-                )
-                loss_Y_to_X = self._compute_in_batch_hard_negative_loss(
-                    pred_X,
-                    data['query_features'],
-                    data['query_categories']
-                )
+                loss_X_to_Y = self.in_batch_loss(pred_Y, data['target_features'], data['target_categories'] )
+                loss_Y_to_X = self.in_batch_loss(pred_X, data['query_features'], data['query_categories'])
 
                 total_loss = loss_X_to_Y + loss_Y_to_X
 
@@ -377,12 +294,8 @@ class SetRetrieval(CrossAttentionSetRetrieval):
                     reconstructed_X = self({'query_features': pred_Y}, training=True)
                     reconstructed_Y = self({'query_features': pred_X}, training=True)
                     
-                    cycle_loss_X = self._compute_in_batch_hard_negative_loss(
-                        reconstructed_X, data['query_features'], data['query_categories']
-                    )
-                    cycle_loss_Y = self._compute_in_batch_hard_negative_loss(
-                        reconstructed_Y, data['target_features'], data['target_categories']
-                    )
+                    cycle_loss_X = self.in_batch_loss(reconstructed_X, data['query_features'], data['query_categories'])
+                    cycle_loss_Y = self.in_batch_loss(reconstructed_Y, data['target_features'], data['target_categories'])
                     total_loss += self.cycle_lambda * (cycle_loss_X + cycle_loss_Y)
 
         gradients = tape.gradient(total_loss, self.trainable_variables)
@@ -400,11 +313,7 @@ class SetRetrieval(CrossAttentionSetRetrieval):
         for k in self.k_values:
             metric_name = f'top{k}_accuracy'
             if metric_name in self.topk_metrics:
-                 self.topk_metrics[metric_name].update_state(
-                    pred_Y, 
-                    data['target_features'], 
-                    data['target_categories']
-                )
+                 self.topk_metrics[metric_name].update_state(pred_Y, data['target_features'], data['target_categories'])
         
         return {m.name: m.result() for m in self.metrics if not m.name.startswith('val_')}
 
@@ -416,15 +325,9 @@ class SetRetrieval(CrossAttentionSetRetrieval):
         current_taneg_t_gamma = self.get_current_taneg_t_gamma()
         
         if self.use_tpaneg and 'candidate_negative_features' in data:
-            val_loss = self._compute_tpaneg_loss(
-                pred_Y, data['target_features'], data['target_categories'],
-                data['candidate_negative_features'], data['candidate_negative_masks'],
-                current_taneg_t_gamma
-            )
+            val_loss = self.tpaneg_loss(pred_Y, data['target_features'], data['target_categories'], data['candidate_negative_features'], data['candidate_negative_masks'], current_taneg_t_gamma)
         else:
-            val_loss = self._compute_in_batch_hard_negative_loss(
-                pred_Y, data['target_features'], data['target_categories']
-            )
+            val_loss = self.in_batch_loss(pred_Y, data['target_features'], data['target_categories'])
         
         self.validation_loss_tracker.update_state(val_loss)
 
@@ -449,48 +352,28 @@ class SetRetrieval(CrossAttentionSetRetrieval):
         indices = tf.concat([batch_indices, cat_indices], axis=-1)
         return tf.gather_nd(predictions, indices)
     
-    
-    # def _compute_standard_contrastive_loss(self, predictions, target_features, target_categories):
-    #     sim_matrix = self._compute_set_similarities_fixed(predictions, target_features)
-    #     labels = tf.range(tf.shape(sim_matrix)[0])
-    #     loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=labels, logits=sim_matrix / self.temperature)
-    #     return tf.reduce_mean(loss)
-        
     @tf.function
-    def _compute_in_batch_hard_negative_loss(self, predictions, target_features, target_categories):
+    def in_batch_loss(self, predictions, target_features, target_categories):
         """
         In-batch Negative Samplingに基づくカテゴリ別コントラスティブ学習損失。
         同じセット内の同じカテゴリのアイテムはネガティブとして扱わない。
         """
         B, S, D = tf.shape(target_features)[0], tf.shape(target_features)[1], tf.shape(target_features)[2]
-        
-        # 1. データのフラット化と前処理
-        # target_features は Y
-        # predictions は Y' (Batch_Size, Num_Categories, Feature_Dimension)
 
         target_feats_flat = tf.reshape(target_features, [-1, D]) # (B*S, D)
         target_cats_flat = tf.reshape(target_categories, [-1])   # (B*S)
         
-        # オリジナルのバッチインデックスとアイテムインデックスのペアをフラット化
         batch_indices = tf.range(B, dtype=tf.int32)
         item_indices = tf.range(S, dtype=tf.int32)
         grid_b, grid_i = tf.meshgrid(batch_indices, item_indices, indexing='ij')
         original_flat_batch_indices = tf.reshape(grid_b, [-1]) # 各アイテムの元のバッチインデックス (B*S,)
         original_flat_item_indices = tf.reshape(grid_i, [-1])  # 各アイテムの元のセット内インデックス (B*S,)
         
-        # 有効アイテムマスク (パディングされたアイテムを除外)
-        is_valid_item_mask = tf.logical_and(
-            target_cats_flat > 0, # カテゴリIDが0より大きい
-            tf.reduce_sum(tf.abs(target_feats_flat), axis=-1) > 1e-6 # 特徴量がゼロでない
-        )
+        is_valid_item_mask = tf.logical_and(target_cats_flat > 0, tf.reduce_sum(tf.abs(target_feats_flat), axis=-1) > 1e-6)
         
-        # 予測ベクトルの取得 (target_features の各アイテムが属するカテゴリに対応する predictions のベクトル)
-        # predictions の形状は [B, C, D]
-        # target_cats_flat は [B*S]
         preds_indices_for_gather = tf.stack([original_flat_batch_indices, tf.maximum(0, target_cats_flat - 1)], axis=1) # (B*S, 2)
         preds_for_items_flat = tf.gather_nd(predictions, preds_indices_for_gather) # (B*S, D)
         
-        # NaN/Inf対策と正規化
         preds = tf.where(tf.math.is_finite(preds_for_items_flat), preds_for_items_flat, 0.0)
         targets = tf.where(tf.math.is_finite(target_feats_flat), target_feats_flat, 0.0)
         
@@ -499,77 +382,31 @@ class SetRetrieval(CrossAttentionSetRetrieval):
         
         # 2. カテゴリ別の損失計算
         total_loss = 0.0
-        total_items_contributing = 0.0 # 損失に貢献するアイテムの総数
+        total_items_contributing = 0.0 
         
         for cat_id in range(1, self.num_categories + 1):
             cat_id_tensor = tf.constant(cat_id, dtype=tf.int32)
-            
-            # このカテゴリに属し、かつ有効なアイテムのマスク
-            cat_specific_mask = tf.logical_and(
-                tf.equal(target_cats_flat, cat_id_tensor),
-                is_valid_item_mask
-            )
-            
-            # このカテゴリのアイテムのインデックス (flat_indices_in_cat)
-            indices_in_cat = tf.where(cat_specific_mask)[:, 0] # (N_cat,)
-            
+            cat_specific_mask = tf.logical_and(tf.equal(target_cats_flat, cat_id_tensor),is_valid_item_mask)
+            indices_in_cat = tf.where(cat_specific_mask)[:, 0]
             cat_count = tf.shape(indices_in_cat)[0]
             
             def process_category():
-                # このカテゴリのアイテムの予測とターゲットを抽出
                 cat_preds = tf.gather(preds_norm, indices_in_cat)    # (N_cat, D)
                 cat_targets = tf.gather(targets_norm, indices_in_cat) # (N_cat, D)
                 
-                # 同じカテゴリのアイテムの元のバッチインデックスも抽出
                 cat_original_batch_indices = tf.gather(original_flat_batch_indices, indices_in_cat) # (N_cat,)
                 
                 # カテゴリ内類似度行列 (N_cat x N_cat)
                 sim_matrix = tf.matmul(cat_preds, cat_targets, transpose_b=True)
-                
-                # --- 同じセット内のアイテムを除外するマスクを作成 ---
-                # 形状: (N_cat, N_cat)
-                # i番目のクエリとj番目のターゲットが同じバッチ（セット）に属するかどうかをチェック
-                # cat_original_batch_indices は (N_cat,) なので、これを (N_cat, 1) と (1, N_cat) に拡張して比較
-                same_batch_mask = tf.equal(
-                    tf.expand_dims(cat_original_batch_indices, 1), # (N_cat, 1)
-                    tf.expand_dims(cat_original_batch_indices, 0)  # (1, N_cat)
-                ) # (N_cat, N_cat)
+                same_batch_mask = tf.equal(tf.expand_dims(cat_original_batch_indices, 1), tf.expand_dims(cat_original_batch_indices, 0))
                 
                 # ポジティブペア (対角成分) を取得
                 identity_mask = tf.eye(cat_count, dtype=tf.bool) # (N_cat, N_cat)
                 
-                # ネガティブとして扱うペアのマスク:
-                # 1. ポジティブペアではない (identity_mask == False)
-                # 2. 同じバッチに属さない (same_batch_mask == False)
-                # ただし、今回は「同じバッチに属さないか、かつポジティブペアではない」を組み合わせる
-                
-                # 正しいネガティブマスクのロジック:
-                # ネガティブとして利用したいのは、「自分自身ではない」かつ「同じバッチ内ではない」ペア
-                # もしくは、あなたの意図「同じB_1内でも同じカテゴリの正解以外のアイテムはポジティブとしてもネガティブとしても扱いたくない。」
-                # を厳密に解釈すると、
-                # ポジティブ: 自分自身 (対角)
-                # ネガティブ: 同じカテゴリだが、異なるバッチに属するアイテム (same_batch_mask == False AND NOT identity_mask)
-                # 除外: 同じカテゴリで、同じバッチに属するが、自分自身ではないアイテム (same_batch_mask == True AND NOT identity_mask)
-
-                # --- ネガティブマスクの構築 ---
-                # まず、ネガティブにしたいのは「対角成分以外」
                 neg_base_mask = tf.logical_not(identity_mask)
-                
-                # そして、「同じバッチに属する」ものをネガティブから除外したい
-                # → same_batch_mask が True の場所はネガティブではない
-                # 最終的なネガティブマスクは (neg_base_mask AND NOT same_batch_mask)
                 neg_mask = tf.logical_and(neg_base_mask, tf.logical_not(same_batch_mask))
-                
-                # InfoNCE損失では、正解以外を全てネガティブとして扱うため、
-                # ネガティブとして扱いたくない部分の類似度を非常に小さな値にする
-                # (例: -inf に近い値) ことで、softmax計算から除外する
-                
-                # 除外したい要素に非常に小さな値を設定
-                # same_batch_mask && NOT identity_mask の位置に -inf を設定
-                # これは、同じバッチに属するが自分自身ではない、という位置
+    
                 mask_to_exclude_from_negatives = tf.logical_and(same_batch_mask, neg_base_mask)
-                
-                # 除外する要素には非常に小さな値を設定し、softmaxで確率が0に近づくようにする
                 masked_logits = tf.where(mask_to_exclude_from_negatives, -1e9, sim_matrix / self.temperature)
                 
                 # 正解ラベル（対角成分が正解）
@@ -577,37 +414,14 @@ class SetRetrieval(CrossAttentionSetRetrieval):
                 labels = tf.range(cat_size, dtype=tf.int32)
                 
                 # InfoNCE損失
-                cat_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
-                    labels=labels, logits=masked_logits
-                )
-                
-                # tf.reduce_sum(cat_loss) は、マスクされた -1e9 の項も計算に含めてしまう可能性があるので注意が必要
-                # 損失はポジティブペアに対して計算されるべきなので、labelsで指定されたポジティブペアの損失を合計する
-                # masked_logitsからlabelsに対応するlogitsだけを取り出してcross_entropyを計算
-                # (logitsは既に-1e9でマスクされているので、そのままsumしても良いはずだが、より安全なのは以下)
+                cat_loss = tf.nn.sparse_softmax_cross_entropy_with_logits( labels=labels, logits=masked_logits)
                 
                 return tf.reduce_sum(cat_loss), tf.cast(cat_size, tf.float32)
             
             def skip_category():
                 return 0.0, 0.0
-            
-            # カテゴリに十分なアイテムがある場合のみ処理
-            # コントラスティブ損失では、ポジティブ1つとネガティブが最低1つ必要。
-            # 今回の設計では、「同じバッチ内の自分自身以外のアイテムはネガティブではない」ので、
-            # 同じカテゴリのアイテムが複数あっても、それらが全て同じバッチに属する場合、
-            # 有効なネガティブペアがバッチ内に存在しない可能性がある。
-            # なので、cat_count > 1 ではなく、
-            # 「そのカテゴリ内で、異なるバッチに属するアイテムが存在する」という条件が必要になる。
-            # あるいは、ここでは cat_count > 1 のままにして、ネガティブマスクで対応する。
-            
-            # このままでも `masked_logits` の -1e9 が softmax でゼロに近づけるため、
-            # 有効なネガティブがなければ結果的に損失が計算されない方向になるはず。
-            # cat_count > 1 で良いでしょう。
-            cat_loss_sum, cat_items_count = tf.cond(
-                cat_count > 1,
-                process_category,
-                skip_category
-            )
+        
+            cat_loss_sum, cat_items_count = tf.cond(cat_count > 1, process_category, skip_category)
             
             total_loss += cat_loss_sum
             total_items_contributing += cat_items_count
@@ -619,20 +433,14 @@ class SetRetrieval(CrossAttentionSetRetrieval):
         def return_zero():
             return tf.constant(0.0, dtype=tf.float32)
         
-        final_loss = tf.cond(
-            total_items_contributing > 0.0, # 損失に貢献するアイテムが存在する場合のみ計算
-            compute_final,
-            return_zero
-        )
-        
-        # 勾配パス保持
+        final_loss = tf.cond(total_items_contributing > 0.0, compute_final, return_zero)
         final_loss += 0.0 * tf.reduce_sum(predictions)
         
         return final_loss
 
 
     @tf.function
-    def _compute_tpaneg_loss(self, predictions, target_features, target_categories, candidate_neg_feats, candidate_neg_masks, current_taneg_t_gamma):
+    def tpaneg_loss(self, predictions, target_features, target_categories, candidate_neg_feats, candidate_neg_masks, current_taneg_t_gamma):
         B, S, D = tf.shape(target_features)[0], tf.shape(target_features)[1], tf.shape(target_features)[2]
         N_cand = tf.shape(candidate_neg_feats)[2] # N_cand は候補ネガティブの数
 
@@ -640,30 +448,19 @@ class SetRetrieval(CrossAttentionSetRetrieval):
         target_feats_flat = tf.reshape(target_features, [-1, D])       # (B*S, D)
         target_cats_flat = tf.reshape(target_categories, [-1])         # (B*S)
         
-        # cand_neg_feats: (B, S, N_cand, D) -> (B*S, N_cand, D)
         cand_neg_feats_flat = tf.reshape(candidate_neg_feats, [-1, N_cand, D])
-        # cand_neg_masks: (B, S, N_cand) -> (B*S, N_cand)
         cand_neg_masks_flat = tf.reshape(candidate_neg_masks, [-1, N_cand])
 
-        # 各アイテムの元のバッチインデックスとセット内インデックスを保持
         batch_indices = tf.range(B, dtype=tf.int32)
         item_indices = tf.range(S, dtype=tf.int32)
         grid_b, grid_i = tf.meshgrid(batch_indices, item_indices, indexing='ij')
-        original_flat_batch_indices = tf.reshape(grid_b, [-1]) # 各アイテムの元のバッチインデックス (B*S,)
-        # original_flat_item_indices = tf.reshape(grid_i, [-1]) # 必要であればセット内インデックスも
+        original_flat_batch_indices = tf.reshape(grid_b, [-1]) 
+
+        is_valid_item_mask = tf.logical_and( target_cats_flat > 0, tf.reduce_sum(tf.abs(target_feats_flat), axis=-1) > 1e-6)
         
-        # 有効アイテムマスク (カテゴリID > 0 かつ特徴量がゼロでない)
-        is_valid_item_mask = tf.logical_and(
-            target_cats_flat > 0,
-            tf.reduce_sum(tf.abs(target_feats_flat), axis=-1) > 1e-6
-        )
-        
-        # predictions の形状は [B, C, D] であるという前提
-        # target_cats_flat の各アイテムが属するカテゴリに対応する予測ベクトルを predictions から抽出
         preds_indices_for_gather = tf.stack([original_flat_batch_indices, tf.maximum(0, target_cats_flat - 1)], axis=1)
         preds_for_items_flat = tf.gather_nd(predictions, preds_indices_for_gather) # (B*S, D)
         
-        # NaN/Inf対策と正規化
         preds = tf.where(tf.math.is_finite(preds_for_items_flat), preds_for_items_flat, 0.0)
         targets = tf.where(tf.math.is_finite(target_feats_flat), target_feats_flat, 0.0)
         cand_negs = tf.where(tf.math.is_finite(cand_neg_feats_flat), cand_neg_feats_flat, 0.0)
@@ -671,70 +468,37 @@ class SetRetrieval(CrossAttentionSetRetrieval):
         preds_norm, _ = tf.linalg.normalize(preds + 1e-8, axis=-1)
         targets_norm, _ = tf.linalg.normalize(targets + 1e-8, axis=-1)
         
-        # 候補ネガティブも正規化 (マスクされている場合は0に近づける)
-        # tf.expand_dims(cand_neg_masks_flat, axis=-1) は (B*S, N_cand, 1) になる
         mask_expanded = tf.cast(tf.expand_dims(cand_neg_masks_flat, axis=-1), tf.float32) # (B*S, N_cand, 1)
         safe_neg_feats = cand_negs * mask_expanded + (1.0 - mask_expanded) * 1e-8 # マスク外は小さな値
         cand_negs_norm, _ = tf.linalg.normalize(safe_neg_feats, axis=-1)
         cand_negs_norm = tf.where(tf.math.is_finite(cand_negs_norm), cand_negs_norm, 0.0)
 
         # 2. 類似度計算
-        # sim_target_neg: (B*S, N_cand) - target_item と candidate_neg の類似度
         sim_target_neg = tf.einsum('id,ind->in', targets_norm, cand_negs_norm)
-        
-        # sim_pred_pos: (B*S,) - predicted_item と target_item (ポジティブペア) の類似度
         sim_pred_pos = tf.einsum('id,id->i', preds_norm, targets_norm)
-        
-        # sim_pred_neg: (B*S, N_cand) - predicted_item と candidate_neg の類似度
         sim_pred_neg = tf.einsum('id,ind->in', preds_norm, cand_negs_norm)
         
         # 3. TPaNegマスクの適用
         paneg_epsilon = tf.constant(self.paneg_epsilon, dtype=tf.float32)
-        
-        # TaNegマスク: target_item と candidate_neg の類似度が閾値以上
-        taneg_mask = sim_target_neg >= current_taneg_t_gamma
-        
-        # PaNegマスク: predicted_item と candidate_neg の類似度が (predicted_item と target_item の類似度 - epsilon) 以上
+        taneg_mask = sim_target_neg >= current_taneg_t_gamma以上
         paneg_mask = sim_pred_neg >= (tf.expand_dims(sim_pred_pos, 1) - paneg_epsilon)
         
-        # 基本の候補ネガティブマスク (パディングされた候補を除外)
         base_cand_neg_mask = cand_neg_masks_flat # DataGeneratorから来るマスク
-
         final_neg_mask = tf.logical_and(tf.logical_and(base_cand_neg_mask, taneg_mask), paneg_mask)
 
         # 4. InfoNCE損失計算
         temperature = tf.constant(self.temperature, dtype=tf.float32)
-        
-        # ネガティブ logits: マスクされたネガティブ候補には非常に小さい値を設定
         neg_logits = tf.where(final_neg_mask, sim_pred_neg / temperature, -1e9) # (B*S, N_cand)
-        
-        # ポジティブ logits: predicted_item と target_item の類似度
         pos_logits = tf.expand_dims(sim_pred_pos / temperature, 1) # (B*S, 1)
-        
-        # ポジティブとネガティブのlogitsを結合
         all_logits = tf.concat([pos_logits, neg_logits], axis=1) # (B*S, 1 + N_cand)
-        
-        # 正解ラベルはポジティブ (最初の列)
         labels = tf.zeros_like(target_cats_flat, dtype=tf.int32) # (B*S,) 全て0
-
-        # アイテムごとの損失 (InfoNCE)
         per_item_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=labels, logits=all_logits) # (B*S,)
         
         # 5. 有効なアイテムのフィルタリング
-        # is_valid_item_mask: パディングされたアイテムやカテゴリID=0のアイテムを除外
-        # tf.reduce_any(final_neg_mask, axis=1): そのアイテムに対して少なくとも1つのハードネガティブが選択されたか
         items_to_consider = tf.logical_and(is_valid_item_mask, tf.reduce_any(final_neg_mask, axis=1))
-        
-        # マスクされた損失の合計
         masked_loss = per_item_loss * tf.cast(items_to_consider, dtype=tf.float32)
-        
-        # 損失に貢献するアイテムの数
         num_items_for_loss = tf.reduce_sum(tf.cast(items_to_consider, dtype=tf.float32))
-        
-        # 最終損失 (ゼロ除算対策)
         final_loss = tf.math.divide_no_nan(tf.reduce_sum(masked_loss), num_items_for_loss)
-
-        # デバッグコード追加
         effective_negatives_per_item = tf.reduce_sum(tf.cast(final_neg_mask, tf.float32), axis=1)
         avg_effective_negatives = tf.reduce_mean(effective_negatives_per_item)
 
@@ -746,8 +510,7 @@ class SetRetrieval(CrossAttentionSetRetrieval):
         """
         TaNeg: Target-aware curriculum hard Negative mining
         
-        論文のEquation 7実装:
-        N_cy(T_γ) = {l ∈ G_cy : l ≠ y, sim(l, y) ≥ T_γ}
+        論文のEquation 7実装: N_cy(T_γ) = {l ∈ G_cy : l ≠ y, sim(l, y) ≥ T_γ}
         """
         if not hasattr(self, 'negative_pool') or category not in self.negative_pool:
             return []
@@ -757,34 +520,22 @@ class SetRetrieval(CrossAttentionSetRetrieval):
         if len(category_pool) <= 1:
             return []
         
-        # 正解アイテムの特徴量を取得（簡易実装）
         target_features = self._get_item_features(item_id, category)
         if target_features is None:
             return []
-        
-        # 類似度計算して閾値以上のものを選択
+
         similarities = np.dot(category_pool, target_features)
         hard_negative_mask = similarities >= similarity_threshold
-        
-        # 正解アイテム自体は除外
         hard_negatives = category_pool[hard_negative_mask]
         
-        # ランダムサンプリングで数を制限
         if len(hard_negatives) > self.candidate_neg_num:
-            indices = np.random.choice(
-                len(hard_negatives), 
-                size=self.candidate_neg_num, 
-                replace=False
-            )
+            indices = np.random.choice(len(hard_negatives), size=self.candidate_neg_num, replace=False)
             hard_negatives = hard_negatives[indices]
-        
         return hard_negatives.tolist()
 
     def _apply_curriculum_threshold_schedule(self, epoch, total_epochs):
         """
-        カリキュラム学習：エポックに応じて類似度閾値を段階的に上昇
-        
-        論文では: 0.2 → 0.4 (IQON3000), 0.5 → 0.8 (DeepFurniture)
+        カリキュラム学習：エポックに応じて類似度閾値を段階的に上昇   0.2 → 0.4 (IQON3000), 0.5 → 0.8 (DeepFurniture)
         """
         if self.dataset_name == 'IQON3000':
             start_threshold = 0.2
@@ -793,131 +544,7 @@ class SetRetrieval(CrossAttentionSetRetrieval):
             start_threshold = 0.5
             end_threshold = 0.8
         
-        # 線形スケジューリング
         progress = min(epoch / total_epochs, 1.0)
         current_threshold = start_threshold + (end_threshold - start_threshold) * progress
         
         return current_threshold
-
-    @tf.function
-    def compute_cycle_consistency_loss(self, query_features, target_features, 
-                                    query_categories, target_categories):
-        """
-        双方向Cycle Consistency Loss計算
-        
-        Args:
-            query_features: (B, N_X, D) - クエリアイテム特徴量
-            target_features: (B, N_Y, D) - ターゲットアイテム特徴量
-            query_categories: (B, N_X) - クエリカテゴリ
-            target_categories: (B, N_Y) - ターゲットカテゴリ
-        """
-        
-        # Forward Path: X → Y'
-        # 1. クエリからターゲットカテゴリの予測を生成
-        forward_input = {
-            'query_features': query_features,
-            'target_categories': target_categories  # Z^Y の代わり
-        }
-        predicted_targets = self(forward_input, training=True)  # Y' = f_θ(X, Z^Y)
-        
-        # 2. Forward Contrastive Loss
-        forward_loss = self._compute_item_level_contrastive_loss(
-            predicted_targets, target_features, target_categories
-        )
-        
-        # Backward Path: Y' → X'
-        # 3. 予測からクエリカテゴリの再構築
-        backward_input = {
-            'query_features': predicted_targets,  # Y'を新しいクエリとして使用
-            'target_categories': query_categories  # Z^X の代わり
-        }
-        reconstructed_queries = self(backward_input, training=True)  # X' = f_θ(Y', Z^X)
-        
-        # 4. Backward Contrastive Loss
-        backward_loss = self._compute_item_level_contrastive_loss(
-            reconstructed_queries, query_features, query_categories
-        )
-        
-        # 5. 総合損失（論文のEquation 4）
-        total_cycle_loss = forward_loss + self.cycle_lambda * backward_loss
-        
-        return total_cycle_loss, forward_loss, backward_loss
-
-
-    def _compute_item_level_contrastive_loss(self, predictions, target_items, target_categories):
-        """
-        アイテムレベルのContrastive Loss（論文のEquation 5）
-        
-        L_con(Y,Ŷ) = -1/N_Y * Σ log(exp(sim(ŷ_p, y_p)/τ) / Σ_i exp(sim(ŷ_p, y_i)/τ))
-        """
-        
-        total_loss = 0.0
-        num_valid_items = 0
-        
-        B, S = tf.shape(target_items)[0], tf.shape(target_items)[1]
-        C = tf.shape(predictions)[1]
-        
-        for batch_idx in range(B):
-            for item_idx in range(S):
-                target_cat = target_categories[batch_idx, item_idx]
-                
-                if target_cat <= 0:
-                    continue  # 無効なアイテムはスキップ
-                
-                # カテゴリ予測ベクトルを取得
-                predicted_vector = predictions[batch_idx, target_cat - 1, :]  # (D,)
-                positive_item = target_items[batch_idx, item_idx, :]          # (D,)
-                
-                # 正解との類似度
-                pos_sim = tf.reduce_sum(predicted_vector * positive_item) / self.temperature
-                
-                # 同じバッチ内の全アイテムとの類似度（ネガティブ含む）
-                all_items = tf.reshape(target_items, [-1, tf.shape(target_items)[-1]])  # (B*S, D)
-                all_sims = tf.reduce_sum(
-                    tf.expand_dims(predicted_vector, 0) * all_items, axis=1
-                ) / self.temperature  # (B*S,)
-                
-                # InfoNCE損失
-                # 分子: exp(pos_sim)
-                # 分母: Σ exp(all_sims)
-                loss = -pos_sim + tf.reduce_logsumexp(all_sims)
-                
-                total_loss += loss
-                num_valid_items += 1
-        
-        return tf.cond(
-            num_valid_items > 0,
-            lambda: total_loss / tf.cast(num_valid_items, tf.float32),
-            lambda: tf.constant(0.0, dtype=tf.float32)
-        )
-
-
-    # 論文のEquation 9: ダブル双方向処理
-    def compute_double_bidirectional_loss(self, query_features, target_features,
-                                        query_categories, target_categories):
-        """
-        論文のEquation 9実装: 両方向でのCycle Consistency
-        L_bi(X,Y,Z^Y,Z^X) + L_bi(Y,X,Z^X,Z^Y)
-        """
-        
-        # 第1の双方向: (X → Y → X)
-        loss_1, fwd_1, bwd_1 = self.compute_cycle_consistency_loss(
-            query_features, target_features, query_categories, target_categories
-        )
-        
-        # 第2の双方向: (Y → X → Y) - 役割を交換
-        loss_2, fwd_2, bwd_2 = self.compute_cycle_consistency_loss(
-            target_features, query_features, target_categories, query_categories
-        )
-        
-        # 総合損失
-        total_loss = loss_1 + loss_2
-        
-        return total_loss, {
-            'cycle_loss_1': loss_1,
-            'cycle_loss_2': loss_2,
-            'forward_1': fwd_1,
-            'backward_1': bwd_1,
-            'forward_2': fwd_2,
-            'backward_2': bwd_2
-        }
