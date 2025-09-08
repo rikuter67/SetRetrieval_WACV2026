@@ -3,56 +3,7 @@ import tensorflow as tf
 from tensorflow.keras import layers, Model
 from typing import List
 import pdb
-# tf.config.run_functions_eagerly(True) 
-
-
-# ============================================================================
-# メトリック定義
-# ============================================================================
-# class BatchTopKAccuracy(tf.keras.metrics.Metric):
-#     """バッチ内TopK正解率メトリック"""
-#     def __init__(self, k=1, name='top1_accuracy', **kwargs):
-#         super().__init__(name=name, **kwargs)
-#         self.k = tf.constant(float(k), dtype=tf.float32)
-#         self.total_correct = self.add_weight(name='total_correct', initializer='zeros', dtype=tf.float32)
-#         self.total_count = self.add_weight(name='total_count', initializer='zeros', dtype=tf.float32)
-    
-#     def update_state(self, y_true, y_pred, sample_weight=None):
-#         similarities = tf.cast(y_pred, tf.float32)
-#         batch_size = tf.cast(tf.shape(similarities)[0], tf.float32)
-        
-#         def compute_metrics():
-#             diagonal = tf.linalg.diag_part(similarities)
-#             expanded_diag = tf.expand_dims(diagonal, axis=1)
-#             better_mask = similarities > expanded_diag
-#             batch_size_int = tf.cast(batch_size, tf.int32)
-#             eye_mask = tf.eye(batch_size_int, dtype=tf.bool)
-#             better_mask = tf.logical_and(better_mask, tf.logical_not(eye_mask))
-#             num_better = tf.reduce_sum(tf.cast(better_mask, tf.float32), axis=1)
-#             ranks = num_better + tf.constant(1.0, dtype=tf.float32)
-#             k_threshold = tf.minimum(self.k, batch_size - tf.constant(1.0, dtype=tf.float32))
-#             k_threshold = tf.maximum(k_threshold, tf.constant(1.0, dtype=tf.float32))
-#             correct = tf.reduce_sum(tf.cast(ranks <= k_threshold, tf.float32))
-#             return correct, batch_size
-        
-#         def skip_metrics():
-#             return tf.constant(0.0, dtype=tf.float32), tf.constant(0.0, dtype=tf.float32)
-        
-#         correct_count, valid_count = tf.cond(
-#             tf.greater(batch_size, tf.constant(1.0, dtype=tf.float32)),
-#             compute_metrics,
-#             skip_metrics
-#         )
-#         self.total_correct.assign_add(correct_count)
-#         self.total_count.assign_add(valid_count)
-    
-#     def result(self):
-#         accuracy = tf.math.divide_no_nan(self.total_correct, self.total_count)
-#         return accuracy * 100.0
-    
-#     def reset_state(self):
-#         self.total_correct.assign(0.0)
-#         self.total_count.assign(0.0)
+# tf.config.run_functions_eagerly(True) 　デバックモード
 
 class PerCategoryItemTopKAccuracy(tf.keras.metrics.Metric):
    """
@@ -187,7 +138,7 @@ class PerCategoryItemTopKAccuracy(tf.keras.metrics.Metric):
 # ============================================================================
 # ベースモデル定義
 # ============================================================================
-class SetRetrievalBaseModel(Model):
+class CrossAttentionSetRetrieval(Model):
     """Set Retrieval Model の基底クラス（共有ロジック）"""
     
     def __init__(self, 
@@ -315,20 +266,6 @@ class SetRetrievalBaseModel(Model):
             predictions = tf.nn.l2_normalize(predictions, axis=-1)
         return predictions
 
-    # def _compute_set_similarities_fixed(self, predictions, target_features):
-    #     target_mask = tf.reduce_sum(tf.abs(target_features), axis=-1) > 0
-    #     masked_targets = target_features * tf.cast(tf.expand_dims(target_mask, -1), tf.float32)
-    #     target_sum = tf.reduce_sum(masked_targets, axis=1)
-    #     target_count = tf.maximum(tf.reduce_sum(tf.cast(target_mask, tf.float32), axis=1, keepdims=True), 1.0)
-    #     target_repr = target_sum / target_count
-    #     if self.cluster_centering:
-    #         cluster_centers_normalized = tf.nn.l2_normalize(self.category_centers, axis=-1)
-    #         avg_cluster_center = tf.reduce_mean(cluster_centers_normalized, axis=0, keepdims=True)
-    #         target_repr = target_repr - avg_cluster_center
-    #         target_repr = tf.nn.l2_normalize(target_repr, axis=-1)
-    #     all_pairwise_similarities_by_category = tf.einsum('qcd,td->qct', predictions, target_repr)
-    #     return tf.reduce_max(all_pairwise_similarities_by_category, axis=1)
-
     def infer_single_set(self, query_features):
         if len(query_features.shape) == 2:
             query_features = tf.expand_dims(query_features, 0)
@@ -336,7 +273,7 @@ class SetRetrievalBaseModel(Model):
         return tf.squeeze(predictions, axis=0)
 
 
-class TPaNegModel(SetRetrievalBaseModel):
+class SetRetrieval(CrossAttentionSetRetrieval):
     def __init__(self, *args, **kwargs):
         if 'use_clcatneg' in kwargs:
             kwargs['use_tpaneg'] = kwargs.pop('use_clcatneg')
@@ -801,203 +738,7 @@ class TPaNegModel(SetRetrievalBaseModel):
         effective_negatives_per_item = tf.reduce_sum(tf.cast(final_neg_mask, tf.float32), axis=1)
         avg_effective_negatives = tf.reduce_mean(effective_negatives_per_item)
 
-
-
-        # デバッグ: 詳細な値の確認
-        # if tf.equal(tf.cast(self.optimizer.iterations, tf.int32) % 50, 0):
-        #     tf.print("=== TPaNeg Debug Values ===")
-        #     tf.print("current_taneg_t_gamma:", current_taneg_t_gamma)
-        #     tf.print("paneg_epsilon:", paneg_epsilon)
-        #     tf.print("sim_target_neg range:", tf.reduce_min(sim_target_neg), "to", tf.reduce_max(sim_target_neg))
-        #     tf.print("sim_pred_pos range:", tf.reduce_min(sim_pred_pos), "to", tf.reduce_max(sim_pred_pos))
-        #     tf.print("sim_pred_neg range:", tf.reduce_min(sim_pred_neg), "to", tf.reduce_max(sim_pred_neg))
-            
-        #     # マスクの通過率
-        #     taneg_pass_rate = tf.reduce_mean(tf.cast(taneg_mask, tf.float32))
-        #     paneg_pass_rate = tf.reduce_mean(tf.cast(paneg_mask, tf.float32))
-        #     base_pass_rate = tf.reduce_mean(tf.cast(base_cand_neg_mask, tf.float32))
-        #     final_pass_rate = tf.reduce_mean(tf.cast(final_neg_mask, tf.float32))
-            
-        #     tf.print("TaNeg mask pass rate:", taneg_pass_rate * 100.0, "%")
-        #     tf.print("PaNeg mask pass rate:", paneg_pass_rate * 100.0, "%") 
-        #     tf.print("Base mask pass rate:", base_pass_rate * 100.0, "%")
-        #     tf.print("Final mask pass rate:", final_pass_rate * 100.0, "%")
-
-        # tf.print("Avg effective negatives per item:", avg_effective_negatives)
-        # tf.print("Max effective negatives:", tf.reduce_max(effective_negatives_per_item))
-        # tf.print("Items with 0 negatives:", tf.reduce_sum(tf.cast(tf.equal(effective_negatives_per_item, 0), tf.float32)))
-        
-        # 勾配パス保持のためのダミー加算 (損失が0になるケース対策)
         return final_loss + (0.0 * tf.reduce_sum(predictions))
-
-
-
-    # @tf.function # これが関数全体をグラフ化する
-    # def _compute_in_batch_hard_negative_loss(self, predictions, target_features, target_categories):
-    #     """
-    #     バッチ内の同じカテゴリのアイテムをネガティブとして扱う
-    #     カテゴリ別コントラスティブ学習損失
-    #     """
-    #     B, S, D = tf.shape(target_features)[0], tf.shape(target_features)[1], tf.shape(target_features)[2]
-
-    #     # 1. データのフラット化と前処理
-    #     target_feats_flat = tf.reshape(target_features, [-1, D])
-    #     target_cats_flat = tf.reshape(target_categories, [-1])
-        
-    #     # バッチインデックスの作成
-    #     batch_indices = tf.range(B, dtype=tf.int32)
-    #     item_indices = tf.range(S, dtype=tf.int32)
-    #     grid_b, grid_i = tf.meshgrid(batch_indices, item_indices, indexing='ij')
-    #     flat_indices = tf.stack([tf.reshape(grid_b, [-1]), tf.reshape(grid_i, [-1])], axis=1)
-        
-    #     # 有効アイテムマスク
-    #     is_valid_item_mask = tf.logical_and(
-    #         target_cats_flat > 0,
-    #         tf.reduce_sum(tf.abs(target_feats_flat), axis=-1) > 1e-6
-    #     )
-        
-    #     # 予測ベクトルの取得
-    #     preds_indices = tf.stack([flat_indices[:, 0], tf.maximum(0, target_cats_flat - 1)], axis=1)
-    #     preds_for_items_flat = tf.gather_nd(predictions, preds_indices)
-        
-    #     # NaN/Inf対策と正規化
-    #     preds = tf.where(tf.math.is_finite(preds_for_items_flat), preds_for_items_flat, 0.0)
-    #     targets = tf.where(tf.math.is_finite(target_feats_flat), target_feats_flat, 0.0)
-        
-    #     preds_norm, _ = tf.linalg.normalize(preds + 1e-8, axis=-1)
-    #     targets_norm, _ = tf.linalg.normalize(targets + 1e-8, axis=-1)
-        
-    #     # 2. カテゴリ別の損失計算
-    #     total_loss = 0.0
-    #     total_items = 0.0
-        
-    #     pdb.set_trace()
-        
-    #     # 各カテゴリについて処理
-    #     for cat_id in range(1, self.num_categories + 1):
-    #         cat_id_tensor = tf.constant(cat_id, dtype=tf.int32)
-            
-    #         # このカテゴリのアイテムマスク
-    #         cat_mask = tf.logical_and(
-    #             tf.equal(target_cats_flat, cat_id_tensor),
-    #             is_valid_item_mask
-    #         )
-            
-    #         cat_count = tf.reduce_sum(tf.cast(cat_mask, tf.int32))
-            
-    #         def process_category():
-    #             # このカテゴリのアイテムを抽出
-    #             cat_preds = tf.boolean_mask(preds_norm, cat_mask)      # (N_cat, D)
-    #             cat_targets = tf.boolean_mask(targets_norm, cat_mask)  # (N_cat, D)
-                
-    #             # カテゴリ内類似度行列
-    #             sim_matrix = tf.matmul(cat_preds, cat_targets, transpose_b=True)  # (N_cat, N_cat)
-                
-    #             # 温度で割る
-    #             logits = sim_matrix / self.temperature
-                
-    #             # 正解ラベル（対角成分が正解）
-    #             cat_size = tf.shape(cat_preds)[0]
-    #             labels = tf.range(cat_size, dtype=tf.int32)
-                
-    #             # InfoNCE損失
-    #             cat_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
-    #                 labels=labels, logits=logits
-    #             )
-                
-    #             return tf.reduce_sum(cat_loss), tf.cast(cat_size, tf.float32)
-            
-    #         def skip_category():
-    #             return 0.0, 0.0
-            
-    #         # カテゴリに十分なアイテムがある場合のみ処理
-    #         cat_loss_sum, cat_items_count = tf.cond(
-    #             cat_count > 1,  # 最低2個必要（自分 + ネガティブ）
-    #             process_category,
-    #             skip_category
-    #         )
-            
-    #         total_loss += cat_loss_sum
-    #         total_items += cat_items_count
-        
-    #     # 3. 最終損失
-    #     def compute_final():
-    #         return total_loss / total_items
-        
-    #     def return_zero():
-    #         return tf.constant(0.0, dtype=tf.float32)
-        
-    #     final_loss = tf.cond(
-    #         total_items > 0.0,
-    #         compute_final,
-    #         return_zero
-    #     )
-        
-    #     # 勾配パス保持
-    #     final_loss += 0.0 * tf.reduce_sum(predictions)
-        
-    #     return final_loss
-
-    # @tf.function
-    # def _compute_tpaneg_loss(self, predictions, target_features, target_categories, candidate_neg_feats, candidate_neg_masks, current_taneg_t_gamma):
-    #     B, S, D = tf.shape(target_features)[0], tf.shape(target_features)[1], tf.shape(target_features)[2]
-    #     N_cand = tf.shape(candidate_neg_feats)[2]
-
-    #     target_feats_flat = tf.reshape(target_features, [-1, D])
-    #     target_cats_flat = tf.reshape(target_categories, [-1])
-    #     cand_neg_feats_flat = tf.reshape(candidate_neg_feats, [-1, N_cand, D])
-    #     cand_neg_masks_flat = tf.reshape(candidate_neg_masks, [-1, N_cand])
-
-    #     is_valid_item_mask = target_cats_flat > 0
-        
-    #     batch_indices = tf.range(B, dtype=tf.int32) 
-    #     item_indices = tf.range(S, dtype=tf.int32)
-    #     grid_b, grid_i = tf.meshgrid(batch_indices, item_indices, indexing='ij') 
-    #     flat_indices = tf.stack([tf.reshape(grid_b, [-1]), tf.reshape(grid_i, [-1])], axis=1)
-        
-    #     preds_indices_for_gather = tf.stack([flat_indices[:, 0], tf.maximum(0, target_cats_flat - 1)], axis=1)
-    #     preds_for_items_flat = tf.gather_nd(predictions, preds_indices_for_gather)
-        
-    #     preds = tf.where(tf.math.is_finite(preds_for_items_flat), preds_for_items_flat, 0.0)
-    #     targets = tf.where(tf.math.is_finite(target_feats_flat), target_feats_flat, 0.0)
-    #     cand_negs = tf.where(tf.math.is_finite(cand_neg_feats_flat), cand_neg_feats_flat, 0.0)
-        
-    #     preds_norm, _ = tf.linalg.normalize(preds + 1e-8, axis=-1)
-    #     targets_norm, _ = tf.linalg.normalize(targets + 1e-8, axis=-1)
-        
-    #     mask_expanded = tf.expand_dims(cand_neg_masks_flat, axis=-1)
-    #     safe_neg_feats = cand_negs + (tf.cast(mask_expanded, tf.float32) * 1e-8)
-    #     cand_negs_norm, _ = tf.linalg.normalize(safe_neg_feats, axis=-1)
-    #     cand_negs_norm = tf.where(tf.math.is_finite(cand_negs_norm), cand_negs_norm, 0.0)
-        
-    #     sim_target_neg = tf.einsum('id,ind->in', targets_norm, cand_negs_norm)
-    #     sim_pred_pos = tf.einsum('id,id->i', preds_norm, targets_norm)
-    #     sim_pred_neg = tf.einsum('id,ind->in', preds_norm, cand_negs_norm)
-        
-    #     paneg_epsilon = tf.constant(self.paneg_epsilon, dtype=tf.float32)
-    #     taneg_mask = sim_target_neg >= current_taneg_t_gamma
-    #     paneg_mask = sim_pred_neg >= (tf.expand_dims(sim_pred_pos, 1) - paneg_epsilon)
-    #     final_neg_mask = tf.logical_and(tf.logical_and(cand_neg_masks_flat, taneg_mask), paneg_mask)
-
-    #     temperature = tf.constant(self.temperature, dtype=tf.float32)
-    #     neg_logits = tf.where(final_neg_mask, sim_pred_neg / temperature, -1e9)
-    #     pos_logits = tf.expand_dims(sim_pred_pos / temperature, 1)
-    #     all_logits = tf.concat([pos_logits, neg_logits], axis=1)
-        
-    #     labels = tf.zeros_like(target_cats_flat, dtype=tf.int32)
-    #     per_item_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=labels, logits=all_logits)
-        
-    #     items_to_consider = tf.logical_and(is_valid_item_mask, tf.reduce_any(final_neg_mask, axis=1))
-        
-    #     masked_loss = per_item_loss * tf.cast(items_to_consider, dtype=tf.float32)
-        
-    #     num_items_for_loss = tf.reduce_sum(tf.cast(items_to_consider, dtype=tf.float32))
-        
-    #     final_loss = tf.math.divide_no_nan(tf.reduce_sum(masked_loss), num_items_for_loss)
-        
-    #     # pdb.set_trace()
-
-    #     return final_loss + (0.0 * tf.reduce_sum(predictions))
 
 
 
