@@ -14,7 +14,7 @@ from helpers import build_image_path_map
 from util import evaluate_model, setup_gpu_memory, collect_test_data, save_whitening_params, load_whitening_params, compute_input_whitening_stats, HardNegativeMiner, save_hard_negative_cache, load_hard_negative_cache
 from config import get_dataset_config
 from plot import plot_training_curves, generate_qualitative_examples
-from models import TPaNegModel
+from models import SetRetrieval
 from precompute_negatives import precompute_negatives_gpu 
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -278,7 +278,7 @@ def main():
         else:
             print(f"✅ Found existing cache: {cache_path}")
 
-    model = TPaNegModel(
+    model = SetRetrieval(
         feature_dim=args.feature_dim, num_heads=args.num_heads, num_layers=args.num_layers,
         num_categories=num_categories, temperature=args.temperature, dropout_rate=args.dropout_rate,
         use_cycle_loss=args.use_cycle_loss, cycle_lambda=args.cycle_lambda, k_values=args.topk_values,
