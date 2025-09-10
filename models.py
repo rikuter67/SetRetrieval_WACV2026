@@ -3,107 +3,98 @@ import tensorflow as tf
 from tensorflow.keras import layers, Model
 from typing import List
 import pdb
-# tf.config.run_functions_eagerly(True) 　デバックモード
+# tf.config.run_functions_eagerly(True)  # debug flag
 
 class PerCategoryItemTopKAccuracy(tf.keras.metrics.Metric):
-   def __init__(self, k, num_categories, name='per_category_topk_acc', **kwargs):
-       super().__init__(name=name, **kwargs)
-       self.k_percent = float(k)  # 静的値として保存
-       self.num_categories = num_categories
-       
-       self.total_correct = self.add_weight(name='total_correct', initializer='zeros')
-       self.total_count = self.add_weight(name='total_count', initializer='zeros')
+    """
+    Per-category Top-K% accuracy for set retrieval tasks.
+    Evaluates what percentage of items rank in the top K% within their category,
+    providing balanced evaluation across categories regardless of size.
+    """
+    
+    def __init__(self, k_percent, num_categories, name='per_category_topk_acc', **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.k_percent = float(k_percent)  
+        self.num_categories = num_categories
+        self.total_correct = self.add_weight(name='total_correct', initializer='zeros')
+        self.total_count = self.add_weight(name='total_count', initializer='zeros')
 
-   @tf.function(jit_compile=False)  # XLA無効化
-   def update_state(self, predictions, target_features, target_categories, sample_weight=None):
-       B, S, D = tf.shape(target_features)[0], tf.shape(target_features)[1], tf.shape(target_features)[2]
-       
-       # データフラット化
-       target_features_flat = tf.reshape(target_features, [-1, D])
-       target_categories_flat = tf.reshape(target_categories, [-1])
-       
-       # バッチインデックス作成
-       batch_indices = tf.range(B, dtype=tf.int32)
-       batch_grid = tf.tile(tf.expand_dims(batch_indices, 1), [1, S])
-       batch_indices_flat = tf.reshape(batch_grid, [-1])
-       
-       # 有効アイテムマスク
-       valid_mask = tf.logical_and(target_categories_flat > 0, tf.reduce_sum(tf.abs(target_features_flat), axis=-1) > 1e-6)
-       
-       valid_features = tf.boolean_mask(target_features_flat, valid_mask)
-       valid_categories = tf.boolean_mask(target_categories_flat, valid_mask)
-       valid_batch_indices = tf.boolean_mask(batch_indices_flat, valid_mask)
-       
-       N_valid = tf.shape(valid_features)[0]
+    @tf.function(jit_compile=False)
+    def update_state(self, predictions, target_features, target_categories, sample_weight=None):
+        """
+        Args:
+            predictions: (batch_size, num_categories, feature_dim) - Model predictions per category
+            target_features: (batch_size, items_per_set, feature_dim) - Ground truth features
+            target_categories: (batch_size, items_per_set) - Ground truth category IDs (1-indexed)
+        """
+        batch_size, items_per_set, feature_dim = tf.unpack(tf.shape(target_features))
+        
+        # Flatten and filter valid items (non-zero category, non-zero features)
+        target_flat = tf.reshape(target_features, [-1, feature_dim])
+        categories_flat = tf.reshape(target_categories, [-1])
+        batch_ids = tf.repeat(tf.range(batch_size), items_per_set)
+        
+        valid_mask = tf.logical_and(
+            categories_flat > 0,
+            tf.reduce_sum(tf.abs(target_flat), axis=-1) > 1e-6
+        )
+        
+        valid_features = tf.boolean_mask(target_flat, valid_mask)
+        valid_categories = tf.boolean_mask(categories_flat, valid_mask)  
+        valid_batch_ids = tf.boolean_mask(batch_ids, valid_mask)
+        
+        if tf.size(valid_features) == 0:
+            return
+            
+        # Get corresponding prediction vectors for each valid item
+        pred_indices = tf.stack([valid_batch_ids, valid_categories - 1], axis=1)
+        pred_vectors = tf.gather_nd(predictions, pred_indices)
+        
+        # Normalize for cosine similarity
+        pred_norm = tf.nn.l2_normalize(pred_vectors, axis=-1)
+        target_norm = tf.nn.l2_normalize(valid_features, axis=-1)
+        
+        total_correct, total_items = 0.0, 0.0
+        
+        # Evaluate each category independently
+        for cat_id in range(1, self.num_categories + 1):
+            cat_mask = tf.equal(valid_categories, cat_id)
+            num_items = tf.reduce_sum(tf.cast(cat_mask, tf.int32))
+            
+            if num_items <= 1:
+                continue
+                
+            # Extract category-specific predictions and targets
+            cat_preds = tf.boolean_mask(pred_norm, cat_mask)
+            cat_targets = tf.boolean_mask(target_norm, cat_mask)
+            
+            # Compute similarity matrix and ranks
+            sim_matrix = tf.matmul(cat_preds, cat_targets, transpose_b=True)
+            diag_sims = tf.linalg.diag_part(sim_matrix)
+            
+            # Count items with higher similarity (excluding self-comparison)
+            higher_count = tf.reduce_sum(tf.cast(
+                sim_matrix > tf.expand_dims(diag_sims, 1), tf.float32
+            ), axis=1) - tf.cast(tf.range(num_items), tf.float32) * 0  # Remove self from count
+            
+            ranks = higher_count + 1.0
+            
+            # Count items within top K%
+            k_threshold = tf.maximum(1.0, (self.k_percent / 100.0) * tf.cast(num_items, tf.float32))
+            correct_in_cat = tf.reduce_sum(tf.cast(ranks <= k_threshold, tf.float32))
+            
+            total_correct += correct_in_cat
+            total_items += tf.cast(num_items, tf.float32)
+        
+        self.total_correct.assign_add(total_correct)
+        self.total_count.assign_add(total_items)
 
-       # 条件分岐で処理
-       def process_when_valid():
-           # 予測ベクトル取得
-           pred_indices = tf.stack([valid_batch_indices, tf.maximum(0, valid_categories - 1)], axis=1)
-           pred_vectors = tf.gather_nd(predictions, pred_indices)
-           
-           # 正規化
-           pred_vectors = tf.nn.l2_normalize(pred_vectors, axis=-1)
-           valid_features_norm = tf.nn.l2_normalize(valid_features, axis=-1)
-           
-           total_correct_items = 0.0
-           total_items = 0.0
-           
-           # Pythonのrangeを使用（TensorFlowのtf.rangeではない）
-           for cat_id in range(1, self.num_categories + 1):
-               cat_id_tensor = tf.constant(cat_id, dtype=tf.int32)
-               cat_mask = tf.equal(valid_categories, cat_id_tensor)
-               cat_count = tf.reduce_sum(tf.cast(cat_mask, tf.int32))
-               
-               # 条件分岐を使って処理
-               def process_category():
-                   cat_features = tf.boolean_mask(valid_features_norm, cat_mask)
-                   cat_pred_vectors = tf.boolean_mask(pred_vectors, cat_mask)
-                   cat_count_float = tf.cast(cat_count, tf.float32)
-                   
-                   # 類似度行列
-                   sim_matrix = tf.matmul(cat_pred_vectors, cat_features, transpose_b=True)
-                   diagonal_sims = tf.linalg.diag_part(sim_matrix)
-                   
-                   # ランク計算
-                   expanded_diag = tf.expand_dims(diagonal_sims, axis=1)
-                   
-                   better_mask = tf.logical_and(sim_matrix > expanded_diag, tf.logical_not(tf.eye(tf.shape(sim_matrix)[0], dtype=tf.bool)))
-                   ranks = tf.reduce_sum(tf.cast(better_mask, tf.float32), axis=1) + 1.0
-                   
-                   # TopK%閾値
-                   k_threshold = tf.maximum(1.0, (self.k_percent / 100.0) * cat_count_float)
-                   
-                   correct_in_cat = tf.reduce_sum(tf.cast(ranks <= k_threshold, tf.float32))
-                   return correct_in_cat, cat_count_float
-               
-               def skip_category():
-                   return 0.0, 0.0
-               
-               # tf.condで条件分岐
-               correct_items, count_items = tf.cond(cat_count > 1, process_category, skip_category)
-               
-               total_correct_items += correct_items
-               total_items += count_items
-           
-           return total_correct_items, total_items
-           
-       def skip_when_empty():
-           return 0.0, 0.0
-       
-       # メイン条件分岐
-       correct_items, count_items = tf.cond(N_valid > 0, process_when_valid, skip_when_empty)
-       
-       # 統計更新
-       self.total_correct.assign_add(correct_items)
-       self.total_count.assign_add(count_items)
+    def result(self):
+        return tf.math.divide_no_nan(self.total_correct, self.total_count) * 100.0
 
-   def result(self):
-       return tf.math.divide_no_nan(self.total_correct, self.total_count) * 100.0
-
-   def reset_state(self):
-       self.total_correct.assign(0.0)
-       self.total_count.assign(0.0)
+    def reset_state(self):
+        self.total_correct.assign(0.0)
+        self.total_count.assign(0.0)
 
         
 # ============================================================================
