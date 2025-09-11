@@ -162,21 +162,12 @@ class Transformer(Model):
         return [self.loss_tracker, self.xy_loss_tracker, self.yx_loss_tracker] + [self.train_topk_metric, self.val_topk_metric]
         
     def set_category_centers(self, centers: np.ndarray, whitening_params=None):
-        if centers.shape[0] != self.num_categories:
-            raise ValueError(f"Expected {self.num_categories} centers, got {centers.shape[0]}")
         if whitening_params is not None:
-            print("🔄 Applying whitening transformation to category centers...")
             centers = np.dot(centers - whitening_params['mean'], whitening_params['matrix'])
-            print(f"✅ Category centers whitened: {centers.shape}")
-        centers = centers / (np.linalg.norm(centers, axis=1, keepdims=True) + 1e-8)
-        self.category_centers = self.add_weight(name='category_centers', shape=(self.num_categories, self.hidden_dim), initializer='glorot_uniform', trainable=True)
-        if centers.shape[1] != self.hidden_dim:
-            init_centers = np.random.normal(0, 0.02, (self.num_categories, self.hidden_dim)).astype(np.float32)
-        else:
-            init_centers = centers.astype(np.float32)
-        self.category_centers.assign(init_centers)
-        print(f"✅ Category centers initialized: {centers.shape}")
-
+        init_centers = centers.astype(np.float32)
+        self.category_centers = tf.constant(init_centers, dtype=tf.float32, name='category_centers') 
+        # self.category_centers = self.add_weight(name='category_centers', shape=(self.num_categories, self.hidden_dim), initializer='glorot_uniform', trainable=True) if you want to train the centers
+        
     def call(self, inputs, training=None):
         query_features = inputs['query_features']
         query_projected = self.input_projection(query_features)
@@ -201,7 +192,6 @@ class Transformer(Model):
             predictions = predictions - tf.expand_dims(cluster_centers_normalized, 0)
             predictions = tf.nn.l2_normalize(predictions, axis=-1)
 
-        pdb.set_trace()
         return predictions
 
     def infer_single_set(self, query_features):
