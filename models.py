@@ -5,19 +5,28 @@ from typing import List
 import pdb
 # tf.config.run_functions_eagerly(True)  # debug flag
 
-class PerCategoryItemTopKAccuracy(tf.keras.metrics.Metric):
+class TopKAccuracy(tf.keras.metrics.Metric):
     """
     Per-category Top-K% accuracy for set retrieval tasks.
     Evaluates what percentage of items rank in the top K% within their category,
     providing balanced evaluation across categories regardless of size.
     """
-    
-    def __init__(self, k_percent, num_categories, name='per_category_topk_acc', **kwargs):
+    def __init__(self, k_values=[1, 5, 10, 20], num_categories=16, name='per_category_topk_acc', **kwargs):
         super().__init__(name=name, **kwargs)
-        self.k_percent = float(k_percent)  
+        # Support both single k_percent (legacy) and k_values (new)
+        if isinstance(k_values, (int, float)):
+            self.k_values = [k_values]  # Convert single value to list
+        else:
+            self.k_values = sorted(k_values)
+        
         self.num_categories = num_categories
-        self.total_correct = self.add_weight(name='total_correct', initializer='zeros')
-        self.total_count = self.add_weight(name='total_count', initializer='zeros')
+        
+        # Create separate counters for each k value
+        self.totals_correct = {}
+        self.totals_count = {}
+        for k in self.k_values:
+            self.totals_correct[k] = self.add_weight(name=f'total_correct_{k}', initializer='zeros')
+            self.totals_count[k] = self.add_weight(name=f'total_count_{k}', initializer='zeros')
 
     @tf.function(jit_compile=False)
     def update_state(self, predictions, target_features, target_categories, sample_weight=None):
@@ -27,74 +36,70 @@ class PerCategoryItemTopKAccuracy(tf.keras.metrics.Metric):
             target_features: (batch_size, items_per_set, feature_dim) - Ground truth features
             target_categories: (batch_size, items_per_set) - Ground truth category IDs (1-indexed)
         """
-        batch_size, items_per_set, feature_dim = tf.unpack(tf.shape(target_features))
+        batch_size, items_per_set, feature_dim = tf.unstack(tf.shape(target_features))  # (64, 16, 512)
         
-        # Flatten and filter valid items (non-zero category, non-zero features)
-        target_flat = tf.reshape(target_features, [-1, feature_dim])
-        categories_flat = tf.reshape(target_categories, [-1])
-        batch_ids = tf.repeat(tf.range(batch_size), items_per_set)
+        # Flatten and filter target items (non-zero category, non-zero features)
+        target_flat = tf.reshape(target_features, [-1, feature_dim]) # TensorShape([1024, 512])
+        categories_flat = tf.reshape(target_categories, [-1]) # <tf.Tensor: shape=(1024,), dtype=int32, numpy=array([2, 6, 2, ..., 0, 0, 0], dtype=int32)>
+        batch_ids = tf.repeat(tf.range(batch_size), items_per_set) # <tf.Tensor: shape=(1024,), dtype=int32, numpy=array([ 0,  0,  0, ..., 63, 63, 63], dtype=int32)>
         
-        valid_mask = tf.logical_and(
-            categories_flat > 0,
-            tf.reduce_sum(tf.abs(target_flat), axis=-1) > 1e-6
-        )
+        # remove padding
+        target_mask = tf.logical_and(categories_flat > 0, tf.reduce_sum(tf.abs(target_flat), axis=-1) > 1e-6) # <tf.Tensor: shape=(1024,), dtype=bool, numpy=array([ True,  True,  True, ..., False, False, False])>
         
-        valid_features = tf.boolean_mask(target_flat, valid_mask)
-        valid_categories = tf.boolean_mask(categories_flat, valid_mask)  
-        valid_batch_ids = tf.boolean_mask(batch_ids, valid_mask)
+        target_features = tf.boolean_mask(target_flat, target_mask) # TensorShape([172, 512])
+        target_categories = tf.boolean_mask(categories_flat, target_mask) # TensorShape([172])
+        target_batch_ids = tf.boolean_mask(batch_ids, target_mask) # TensorShape([172])
         
-        if tf.size(valid_features) == 0:
-            return
-            
-        # Get corresponding prediction vectors for each valid item
-        pred_indices = tf.stack([valid_batch_ids, valid_categories - 1], axis=1)
-        pred_vectors = tf.gather_nd(predictions, pred_indices)
+        # Get corresponding prediction vectors for each target item
+        pred_indices = tf.stack([target_batch_ids, target_categories - 1], axis=1) # TensorShape([172, 2]) [batchID, categoryID]
+        pred_vectors = tf.gather_nd(predictions, pred_indices) # TensorShape([172, 512]) [item, prediction]
         
         # Normalize for cosine similarity
-        pred_norm = tf.nn.l2_normalize(pred_vectors, axis=-1)
-        target_norm = tf.nn.l2_normalize(valid_features, axis=-1)
-        
-        total_correct, total_items = 0.0, 0.0
+        pred_norm = tf.nn.l2_normalize(pred_vectors, axis=-1) # TensorShape([172, 512])
+        target_norm = tf.nn.l2_normalize(target_features, axis=-1) # TensorShape([172, 512])
         
         # Evaluate each category independently
         for cat_id in range(1, self.num_categories + 1):
-            cat_mask = tf.equal(valid_categories, cat_id)
-            num_items = tf.reduce_sum(tf.cast(cat_mask, tf.int32))
+            cat_mask = tf.equal(target_categories, cat_id) # process only cat_id categories
+            num_items = tf.reduce_sum(tf.cast(cat_mask, tf.int32)) # num_items in cat_id 
             
-            if num_items <= 1:
+            if num_items <= 1: # skip no candidates
                 continue
                 
             # Extract category-specific predictions and targets
-            cat_preds = tf.boolean_mask(pred_norm, cat_mask)
-            cat_targets = tf.boolean_mask(target_norm, cat_mask)
+            cat_preds = tf.boolean_mask(pred_norm, cat_mask) # TensorShape([num_items in cat_id, 512])
+            cat_targets = tf.boolean_mask(target_norm, cat_mask) # TensorShape([num_items in cat_id, 512])
             
-            # Compute similarity matrix and ranks
-            sim_matrix = tf.matmul(cat_preds, cat_targets, transpose_b=True)
-            diag_sims = tf.linalg.diag_part(sim_matrix)
+            # Compute similarity matrix and ranks (ONCE per category)
+            sim_matrix = tf.matmul(cat_preds, cat_targets, transpose_b=True) # 3×3
+            diag_sims = tf.linalg.diag_part(sim_matrix) # the correct answer is the diagonal component
             
-            # Count items with higher similarity (excluding self-comparison)
-            higher_count = tf.reduce_sum(tf.cast(
-                sim_matrix > tf.expand_dims(diag_sims, 1), tf.float32
-            ), axis=1) - tf.cast(tf.range(num_items), tf.float32) * 0  # Remove self from count
+            # Count items with higher similarity + 1 = rank
+            ranks = tf.reduce_sum(tf.cast(sim_matrix > tf.expand_dims(diag_sims, 1), tf.float32), axis=1) + 1.0
             
-            ranks = higher_count + 1.0
-            
-            # Count items within top K%
-            k_threshold = tf.maximum(1.0, (self.k_percent / 100.0) * tf.cast(num_items, tf.float32))
-            correct_in_cat = tf.reduce_sum(tf.cast(ranks <= k_threshold, tf.float32))
-            
-            total_correct += correct_in_cat
-            total_items += tf.cast(num_items, tf.float32)
-        
-        self.total_correct.assign_add(total_correct)
-        self.total_count.assign_add(total_items)
+            # Count items within top K% for ALL K values simultaneously
+            num_items_float = tf.cast(num_items, tf.float32)
+            for k in self.k_values:
+                k_threshold = tf.maximum(1.0, (k / 100.0) * num_items_float)
+                correct_in_cat = tf.reduce_sum(tf.cast(ranks <= k_threshold, tf.float32))
+                
+                self.totals_correct[k].assign_add(correct_in_cat)
+                self.totals_count[k].assign_add(num_items_float)
 
     def result(self):
-        return tf.math.divide_no_nan(self.total_correct, self.total_count) * 100.0
+        """Return accuracy for the first k value (backward compatibility)"""
+        results = {}
+        for k in self.k_values:
+            accuracy = tf.math.divide_no_nan(self.totals_correct[k], self.totals_count[k]) * 100.0
+            results[f'top{k}_accuracy'] = accuracy
+        return results
 
     def reset_state(self):
-        self.total_correct.assign(0.0)
-        self.total_count.assign(0.0)
+        """Reset all counters in epoch"""
+        for k in self.k_values:
+            self.totals_correct[k].assign(0.0)
+            self.totals_count[k].assign(0.0)
+
 
         
 # ============================================================================
@@ -151,15 +156,15 @@ class CrossAttentionSetRetrieval(Model):
         self.output_norm = layers.LayerNormalization(epsilon=1e-6, name='output_norm')
 
     def _build_topk_metrics(self):
-        self.topk_metrics = {}
-        for k in sorted(self.k_values): 
-            self.topk_metrics[f'top{k}_accuracy'] = PerCategoryItemTopKAccuracy(k, self.num_categories, name=f'top{k}_accuracy')
-            self.topk_metrics[f'val_top{k}_accuracy'] = PerCategoryItemTopKAccuracy(k, self.num_categories, name=f'val_top{k}_accuracy')
+        """Build efficient TopK metrics - single metric for all k values"""
+        self.train_topk_metric = TopKAccuracy(k_values=self.k_values, num_categories=self.num_categories, name='train_topk')
+        self.val_topk_metric = TopKAccuracy(k_values=self.k_values, num_categories=self.num_categories, name='val_topk')
+        self.topk_metrics = {'train_multi': self.train_topk_metric,  'val_multi': self.val_topk_metric}
 
     @property
     def metrics(self):
         base_metrics = [self.loss_tracker, self.xy_loss_tracker, self.yx_loss_tracker]
-        return base_metrics + list(self.topk_metrics.values())
+        return base_metrics + [self.train_topk_metric, self.val_topk_metric]
         
     def set_category_centers(self, centers: np.ndarray, whitening_params=None):
         if centers.shape[0] != self.num_categories:
@@ -301,12 +306,16 @@ class SetRetrieval(CrossAttentionSetRetrieval):
             self.reconstruct_x_loss_tracker.update_state(cycle_loss_X)
             self.reconstruct_y_loss_tracker.update_state(cycle_loss_Y)
 
-        for k in self.k_values:
-            metric_name = f'top{k}_accuracy'
-            if metric_name in self.topk_metrics:
-                 self.topk_metrics[metric_name].update_state(pred_Y, data['target_features'], data['target_categories'])
+        self.train_topk_metric.update_state(pred_Y, data['target_features'], data['target_categories'])
         
-        return {m.name: m.result() for m in self.metrics if not m.name.startswith('val_')}
+        results = {"loss": self.loss_tracker.result(), "X->Y' Loss": self.xy_loss_tracker.result(), "Y'->X' Loss": self.yx_loss_tracker.result()}
+        
+        # Top-K結果を追加
+        topk_results = self.train_topk_metric.result()
+        if isinstance(topk_results, dict):
+            results.update(topk_results)
+        
+        return results
 
 
     @tf.function
@@ -322,17 +331,15 @@ class SetRetrieval(CrossAttentionSetRetrieval):
         
         self.validation_loss_tracker.update_state(val_loss)
 
-        for k in self.k_values:
-            metric_name = f'val_top{k}_accuracy'
-            if metric_name in self.topk_metrics:
-                self.topk_metrics[metric_name].update_state(
-                    pred_Y, data['target_features'], data['target_categories'])
+        self.val_topk_metric.update_state(pred_Y, data['target_features'], data['target_categories'])
 
         results = {"loss": self.validation_loss_tracker.result()}
-        for k in self.k_values:
-            metric_name = f'val_top{k}_accuracy'
-            if metric_name in self.topk_metrics:
-                results[metric_name] = self.topk_metrics[metric_name].result()
+        
+        topk_results = self.val_topk_metric.result()
+        if isinstance(topk_results, dict):
+            for k, v in topk_results.items():
+                results[f"val_{k}"] = v
+        
         return results
 
     def _get_predictions_for_items(self, predictions, categories):
@@ -471,7 +478,7 @@ class SetRetrieval(CrossAttentionSetRetrieval):
         
         # 3. TPaNegマスクの適用
         paneg_epsilon = tf.constant(self.paneg_epsilon, dtype=tf.float32)
-        taneg_mask = sim_target_neg >= current_taneg_t_gamma以上
+        taneg_mask = sim_target_neg >= current_taneg_t_gamma
         paneg_mask = sim_pred_neg >= (tf.expand_dims(sim_pred_pos, 1) - paneg_epsilon)
         
         base_cand_neg_mask = cand_neg_masks_flat # DataGeneratorから来るマスク
