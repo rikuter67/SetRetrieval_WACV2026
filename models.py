@@ -3,7 +3,7 @@ import tensorflow as tf
 from tensorflow.keras import layers, Model
 from typing import List
 import pdb
-# tf.config.run_functions_eagerly(True)  # debug flag
+tf.config.run_functions_eagerly(True)  # debug flag
 
 class TopKAccuracy(tf.keras.metrics.Metric):
     """
@@ -101,31 +101,27 @@ class TopKAccuracy(tf.keras.metrics.Metric):
             self.totals_count[k].assign(0.0)
 
 
-        
-# ============================================================================
-# ベースモデル定義
-# ============================================================================
-class CrossAttentionSetRetrieval(Model):
-    """Set Retrieval Model の基底クラス（共有ロジック）"""
-    
+class Transformer(Model):
     def __init__(self, feature_dim: int = 512, num_heads: int = 8, num_layers: int = 6, num_categories: int = 16, hidden_dim: int = 512, 
-                 use_cycle_loss: bool = False, temperature: float = 1.0, dropout_rate: float = 0.1, k_values: List[int] = None, cycle_lambda: float = 0.1, cluster_centering: bool = False,
+                 temperature: float = 1.0, dropout_rate: float = 0.1, k_values: List[int] = None, use_cycle_loss: bool = False, cycle_lambda: float = 0.1, cluster_centering: bool = False,
                  use_tpaneg: bool = False, taneg_t_gamma_init: float = 0.5,  taneg_t_gamma_final: float = 0.8,  taneg_curriculum_epochs: int = 100,  paneg_epsilon: float = 0.2, **kwargs):
         super().__init__(**kwargs)
         
-        self.feature_dim = feature_dim
+        self.feature_dim = feature_dim 
         self.num_heads = num_heads
         self.num_layers = num_layers
         self.num_categories = num_categories
         self.hidden_dim = hidden_dim
-        self.use_cycle_loss = use_cycle_loss
         self.temperature = temperature
         self.dropout_rate = dropout_rate
-        self.k_values = k_values if k_values is not None else [1, 5, 10, 20]
+
+        self.use_cycle_loss = use_cycle_loss
+        self.k_values = k_values if k_values is not None else [5, 10, 20]
+
         self.cycle_lambda = cycle_lambda
         self.cluster_centering = cluster_centering
-        self.use_tpaneg = use_tpaneg 
 
+        self.use_tpaneg = use_tpaneg 
         self.taneg_t_gamma_init = taneg_t_gamma_init
         self.taneg_t_gamma_final = taneg_t_gamma_final
         self.taneg_curriculum_epochs = taneg_curriculum_epochs
@@ -140,7 +136,7 @@ class CrossAttentionSetRetrieval(Model):
         self._build_topk_metrics()
     
     def _build_layers(self):
-        self.input_projection = layers.Dense(self.hidden_dim, activation='relu', name='input_projection')
+        self.input_projection = layers.Dense(self.hidden_dim, activation='gelu', name='input_projection')
         self.cross_attention_layers = []
         for i in range(self.num_layers):
             layer_dict = {
@@ -163,8 +159,7 @@ class CrossAttentionSetRetrieval(Model):
 
     @property
     def metrics(self):
-        base_metrics = [self.loss_tracker, self.xy_loss_tracker, self.yx_loss_tracker]
-        return base_metrics + [self.train_topk_metric, self.val_topk_metric]
+        return [self.loss_tracker, self.xy_loss_tracker, self.yx_loss_tracker] + [self.train_topk_metric, self.val_topk_metric]
         
     def set_category_centers(self, centers: np.ndarray, whitening_params=None):
         if centers.shape[0] != self.num_categories:
@@ -205,6 +200,8 @@ class CrossAttentionSetRetrieval(Model):
             cluster_centers_normalized = tf.nn.l2_normalize(self.category_centers, axis=-1)
             predictions = predictions - tf.expand_dims(cluster_centers_normalized, 0)
             predictions = tf.nn.l2_normalize(predictions, axis=-1)
+
+        pdb.set_trace()
         return predictions
 
     def infer_single_set(self, query_features):
@@ -214,7 +211,7 @@ class CrossAttentionSetRetrieval(Model):
         return tf.squeeze(predictions, axis=0)
 
 
-class SetRetrieval(CrossAttentionSetRetrieval):
+class SetRetrieval(Transformer):
     def __init__(self, *args, **kwargs):
         if 'use_clcatneg' in kwargs:
             kwargs['use_tpaneg'] = kwargs.pop('use_clcatneg')
