@@ -3,7 +3,7 @@ import tensorflow as tf
 from tensorflow.keras import layers, Model
 from typing import List
 import pdb
-tf.config.run_functions_eagerly(True)  # debug flag
+# tf.config.run_functions_eagerly(True)  # debug flag
 
 class TopKAccuracy(tf.keras.metrics.Metric):
     """
@@ -166,35 +166,37 @@ class Transformer(Model):
             centers = np.dot(centers - whitening_params['mean'], whitening_params['matrix'])
         init_centers = centers.astype(np.float32)
         self.category_centers = tf.constant(init_centers, dtype=tf.float32, name='category_centers') 
-        # self.category_centers = self.add_weight(name='category_centers', shape=(self.num_categories, self.hidden_dim), initializer='glorot_uniform', trainable=True) if you want to train the centers
+        # self.category_centers = self.add_weight(name='category_centers', shape=(self.num_categories, self.hidden_dim), initializer='glorot_uniform', trainable=True) # if you want to train the centers
         
     def call(self, inputs, training=None):
-        query_features = inputs['query_features']
-        query_projected = self.input_projection(query_features)
-        if self.category_centers is None:
-            raise ValueError("Category centers not set! Call set_category_centers() first.")
+        query_features = inputs['query_features'] # (batch_size, N_items, 512)
+        query_projected = self.input_projection(query_features) # Linear(512→512) + ReLU
         batch_size = tf.shape(query_features)[0]
-        x = tf.tile(tf.expand_dims(self.category_centers, 0), [batch_size, 1, 1])
+        x = tf.tile(tf.expand_dims(self.category_centers, 0), [batch_size, 1, 1]) # category_centers shape : TensorShape([11, 512]) -> TensorShape([64, 11, 512])
         for layer_dict in self.cross_attention_layers:
+            q_att = layer_dict['self_attention'](query=query_projected, key=query_projected, value=query_projected, training=training)
+            query_projected = layer_dict['norm1'](query_projected + q_att, training=training)
+            
             cross_attn_out = layer_dict['cross_attention'](query=x, key=query_projected, value=query_projected, training=training)
             x = layer_dict['norm1'](x + cross_attn_out, training=training)
+            
             self_attn_out = layer_dict['self_attention'](query=x, key=x, value=x, training=training)
             x = layer_dict['norm2'](x + self_attn_out, training=training)
+
             ffn_out = layer_dict['ffn'](x, training=training)
             x = layer_dict['norm3'](x + ffn_out, training=training)
-        predictions = self.output_projection(x)
 
-        # NOTE: self.output_norm is not used here. This is a potential bug but not the cause of the stagnation.
+        predictions = self.output_projection(x)
         predictions = self.output_norm(predictions) 
 
-        if self.cluster_centering:
+        if self.cluster_centering: # no using in basic
             cluster_centers_normalized = tf.nn.l2_normalize(self.category_centers, axis=-1)
             predictions = predictions - tf.expand_dims(cluster_centers_normalized, 0)
             predictions = tf.nn.l2_normalize(predictions, axis=-1)
 
-        return predictions
+        return predictions # TensorShape([batch_size, 11, 512])
 
-    def infer_single_set(self, query_features):
+    def infer_single_set(self, query_features): # 未確認
         if len(query_features.shape) == 2:
             query_features = tf.expand_dims(query_features, 0)
         predictions = self({'query_features': query_features}, training=False)
@@ -206,7 +208,6 @@ class SetRetrieval(Transformer):
         if 'use_clcatneg' in kwargs:
             kwargs['use_tpaneg'] = kwargs.pop('use_clcatneg')
         super().__init__(*args, **kwargs)
-        print("🚀 TPaNeg (Dynamic Hard Negative) Model initialized")
 
         self.validation_loss_tracker = tf.keras.metrics.Mean(name="loss") 
         self.reconstruct_x_loss_tracker = tf.keras.metrics.Mean(name="L_RecX")
@@ -216,9 +217,12 @@ class SetRetrieval(Transformer):
         self.final_taneg_t_gamma_curr = self.taneg_t_gamma_final
         self.taneg_curriculum_epochs_val = self.taneg_curriculum_epochs
         self.current_epoch = 0 
-        
-        print(f"📚 Curriculum Learning (TaNeg T_gamma): {self.initial_taneg_t_gamma_curr:.1f} → {self.final_taneg_t_gamma_curr:.1f} over {self.taneg_curriculum_epochs_val} epochs")
-        print(f"📚 PaNeg Epsilon (fixed ε): {self.paneg_epsilon:.1f}")
+
+    def set_current_epoch(self, epoch):
+        self.current_epoch = epoch
+        current_t_gamma = self.get_current_taneg_t_gamma()
+        if epoch % 10 == 0:
+            print(f"📚 Epoch {epoch}: TaNeg T_gamma = {current_t_gamma:.3f}")
 
     def get_current_taneg_t_gamma(self):
         if self.current_epoch >= self.taneg_curriculum_epochs_val:
@@ -228,26 +232,19 @@ class SetRetrieval(Transformer):
         current_t_gamma = self.initial_taneg_t_gamma_curr + (self.final_taneg_t_gamma_curr - self.initial_taneg_t_gamma_curr) * progress
         return current_t_gamma
 
-    def set_current_epoch(self, epoch):
-        self.current_epoch = epoch
-        current_t_gamma = self.get_current_taneg_t_gamma()
-        if epoch % 10 == 0:
-            print(f"📚 Epoch {epoch}: TaNeg T_gamma = {current_t_gamma:.3f}")
-
     @property
     def metrics(self):
         common_metrics = [self.loss_tracker, self.xy_loss_tracker, self.yx_loss_tracker]
         all_topk_metrics = list(self.topk_metrics.values())
         val_main_loss_metric = [self.validation_loss_tracker]
         reconstruction_metrics = [self.reconstruct_x_loss_tracker, self.reconstruct_y_loss_tracker]
-
         return common_metrics + reconstruction_metrics + all_topk_metrics + val_main_loss_metric
 
     @tf.function
-    def train_step(self, data):
+    def train_step(self, data): # dict_keys(['query_features', 'target_features', 'query_categories', 'target_categories', 'query_item_ids', 'target_item_ids', 'candidate_negative_features', 'candidate_negative_masks', 'query_candidate_negative_features', 'query_candidate_negative_masks'])
         with tf.GradientTape() as tape:
-            pred_Y = self({'query_features': data['query_features']}, training=True)
-            pred_X = self({'query_features': data['target_features']}, training=True)
+            pred_Y = self({'query_features': data['query_features']}, training=True) # X -> Y' pred_Y : TensorShape([64, 11, 512]) , data['query_features'] : TensorShape([64, 20, 512])
+            pred_X = self({'query_features': data['target_features']}, training=True) # Y -> X' pred_X : TensorShape([64, 11, 512]) , data['target_features'] : TensorShape([64, 20, 512])
 
             if self.use_tpaneg:
                 current_taneg_t_gamma = self.get_current_taneg_t_gamma()
@@ -259,27 +256,35 @@ class SetRetrieval(Transformer):
 
                 if self.use_cycle_loss:
                     # Cycle loss is not part of the current debugging, so this branch is not used.
-                    reconstructed_X = self({'query_features': pred_Y}, training=True)
-                    reconstructed_Y = self({'query_features': pred_X}, training=True)
+                    reconst_input_Y = self._get_predictions_for_items(pred_Y, data['target_categories'])
+                    reconst_input_X = self._get_predictions_for_items(pred_X, data['query_categories'])
+                    
+                    reconstructed_X = self({'query_features': reconst_input_Y}, training=True)
+                    reconstructed_Y = self({'query_features': reconst_input_X}, training=True)
                     
                     cycle_loss_X = self.tpaneg_loss(reconstructed_X, data['query_features'], data['query_categories'], data['query_candidate_negative_features'], data['query_candidate_negative_masks'], current_taneg_t_gamma)
                     cycle_loss_Y = self.tpaneg_loss(reconstructed_Y, data['target_features'], data['target_categories'], data['candidate_negative_features'], data['candidate_negative_masks'], current_taneg_t_gamma)
                     total_loss += self.cycle_lambda * (cycle_loss_X + cycle_loss_Y)
 
             else: 
-                loss_X_to_Y = self.in_batch_loss(pred_Y, data['target_features'], data['target_categories'] )
-                loss_Y_to_X = self.in_batch_loss(pred_X, data['query_features'], data['query_categories'])
+                loss_X_to_Y = self.in_batch_loss(pred_Y, data['target_features'], data['target_categories'] ) # X -> Y' <=> Y <tf.Tensor: shape=(), dtype=float32, numpy=3.118135452270508>
+                loss_Y_to_X = self.in_batch_loss(pred_X, data['query_features'], data['query_categories']) # Y -> X' <=> <tf.Tensor: shape=(), dtype=float32, numpy=3.1540865898132324>
 
                 total_loss = loss_X_to_Y + loss_Y_to_X
 
                 if self.use_cycle_loss:
                     # Cycle loss is not part of the current debugging, so this branch is not used.
-                    reconstructed_X = self({'query_features': pred_Y}, training=True)
-                    reconstructed_Y = self({'query_features': pred_X}, training=True)
+                    reconst_input_Y = self._get_predictions_for_items(pred_Y, data['target_categories']) # Y' -> X" reconstructed_X : TensorShape([64, 11, 512]) , pred_Y : TensorShape([64, 11, 512])
+                    reconst_input_X = self._get_predictions_for_items(pred_X, data['query_categories']) # X' -> Y" reconstructed_Y : TensorShape([64, 11, 512]) , pred_X : TensorShape([64, 11, 512])
+                    
+                    reconstructed_X = self({'query_features': reconst_input_Y}, training=True)
+                    reconstructed_Y = self({'query_features': reconst_input_X}, training=True)
                     
                     cycle_loss_X = self.in_batch_loss(reconstructed_X, data['query_features'], data['query_categories'])
                     cycle_loss_Y = self.in_batch_loss(reconstructed_Y, data['target_features'], data['target_categories'])
                     total_loss += self.cycle_lambda * (cycle_loss_X + cycle_loss_Y)
+
+                # pdb.set_trace()
 
         gradients = tape.gradient(total_loss, self.trainable_variables)
 
@@ -329,13 +334,21 @@ class SetRetrieval(Transformer):
         
         return results
 
-    def _get_predictions_for_items(self, predictions, categories):
-        shape = tf.shape(categories)
-        B, S = shape[0], shape[1]
-        cat_indices = tf.expand_dims(tf.maximum(categories - 1, 0), axis=-1)
-        batch_indices = tf.tile(tf.reshape(tf.range(B, dtype=tf.int32), [B, 1, 1]), [1, S, 1])
-        indices = tf.concat([batch_indices, cat_indices], axis=-1)
-        return tf.gather_nd(predictions, indices)
+    def _get_predictions_for_items(self, predictions, categories): # fix mask
+        batch_size, set_size = tf.shape(categories)[0], tf.shape(categories)[1]
+        
+        valid_mask = categories > 0
+        safe_categories = tf.where(valid_mask, categories - 1, 0)
+        
+        batch_indices = tf.tile(tf.reshape(tf.range(batch_size, dtype=tf.int32), [batch_size, 1]), [1, set_size])
+        
+        gather_indices = tf.stack([batch_indices, safe_categories], axis=-1)
+        item_predictions = tf.gather_nd(predictions, gather_indices)
+        
+        valid_mask_expanded = tf.expand_dims(tf.cast(valid_mask, tf.float32), axis=-1)
+        masked_predictions = item_predictions * valid_mask_expanded
+        
+        return masked_predictions
     
     @tf.function
     def in_batch_loss(self, predictions, target_features, target_categories):
