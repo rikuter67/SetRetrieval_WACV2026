@@ -7,9 +7,7 @@ import pdb
 
 class TopKAccuracy(tf.keras.metrics.Metric):
     """
-    Per-category Top-K% accuracy for set retrieval tasks.
-    Evaluates what percentage of items rank in the top K% within their category,
-    providing balanced evaluation across categories regardless of size.
+    Per-category Top-K% accuracy for set retrieval tasks. Evaluates what percentage of items rank in the top K% within their category, providing balanced evaluation across categories regardless of size.
     """
     def __init__(self, k_values=[1, 5, 10, 20], num_categories=16, name='per_category_topk_acc', **kwargs):
         super().__init__(name=name, **kwargs)
@@ -132,6 +130,8 @@ class Transformer(Model):
         self.xy_loss_tracker = tf.keras.metrics.Mean(name="X->Y' Loss")
         self.yx_loss_tracker = tf.keras.metrics.Mean(name="Y'->X' Loss")
         
+        self.scale_consistent = True
+
         self._build_layers()
         self._build_topk_metrics()
     
@@ -168,6 +168,81 @@ class Transformer(Model):
         self.category_centers = tf.constant(init_centers, dtype=tf.float32, name='category_centers') 
         # self.category_centers = self.add_weight(name='category_centers', shape=(self.num_categories, self.hidden_dim), initializer='glorot_uniform', trainable=True) # if you want to train the centers
         
+    # def call(self, inputs, training=None):
+    #     query_features = inputs['query_features'] # (batch_size, N_items, 512)
+        
+    #     # Step 1: 入力スケール情報を保存（RevINスタイル）
+    #     query_norms = tf.norm(query_features, axis=-1, keepdims=True)  # (batch_size, N_items, 1)
+    #     category_norms = tf.norm(self.category_centers, axis=-1, keepdims=True)  # (11, 1)
+        
+    #     # 正規化して処理
+    #     query_features_normalized = tf.nn.l2_normalize(query_features, axis=-1)
+    #     category_centers_normalized = tf.nn.l2_normalize(self.category_centers, axis=-1)
+        
+    #     query_projected = self.input_projection(query_features_normalized)
+    #     batch_size = tf.shape(query_features)[0]
+    #     x = tf.tile(tf.expand_dims(category_centers_normalized, 0), [batch_size, 1, 1])
+        
+    #     # Transformer layers（正規化された空間で処理）
+    #     for layer_dict in self.cross_attention_layers:
+    #         q_att = layer_dict['self_attention'](query=query_projected, key=query_projected, value=query_projected, training=training)
+    #         query_projected = layer_dict['norm1'](query_projected + q_att, training=training)
+            
+    #         cross_attn_out = layer_dict['cross_attention'](query=x, key=query_projected, value=query_projected, training=training)
+    #         x = layer_dict['norm1'](x + cross_attn_out, training=training)
+            
+    #         self_attn_out = layer_dict['self_attention'](query=x, key=x, value=x, training=training)
+    #         x = layer_dict['norm2'](x + self_attn_out, training=training)
+
+    #         ffn_out = layer_dict['ffn'](x, training=training)
+    #         x = layer_dict['norm3'](x + ffn_out, training=training)
+
+    #     predictions = self.output_projection(x)
+    #     predictions = self.output_norm(predictions) # No Top-20%: 0.5995 (59.95%) Yes Top-20%: 0.6175 (61.75%)
+        
+    #     # 出力のノルムを計算
+    #     # output_norms = tf.norm(predictions, axis=-1, keepdims=True)
+    #     # # 元のカテゴリセンターのスケールを復元
+    #     # predictions = predictions * tf.expand_dims(category_norms, 0) / output_norms # No Top-20%: 0.6707 (67.07%)　IQON Top-20%: 0.4535 (45.35%)
+
+    # def call(self, inputs, training=None): # Top-20%: 0.6118 (61.18%)
+    #     query_features = inputs['query_features'] # (batch_size, N_items, 512)
+        
+    #     # Option 1: 完全にスケール保持（推奨）
+    #     if self.scale_consistent:
+    #         # 入力のスケール情報を保存
+    #         query_norms = tf.norm(query_features, axis=-1, keepdims=True)
+    #         category_norms = tf.norm(self.category_centers, axis=-1, keepdims=True)
+            
+    #         # 正規化して処理
+    #         query_features_normalized = tf.nn.l2_normalize(query_features, axis=-1)
+    #         category_centers_normalized = tf.nn.l2_normalize(self.category_centers, axis=-1)
+            
+    #         query_projected = self.input_projection(query_features_normalized)
+    #         batch_size = tf.shape(query_features)[0]
+    #         x = tf.tile(tf.expand_dims(category_centers_normalized, 0), [batch_size, 1, 1])
+    #     else:
+    #         # 従来通り（L2正規化なし）
+    #         query_projected = self.input_projection(query_features)
+    #         batch_size = tf.shape(query_features)[0]
+    #         x = tf.tile(tf.expand_dims(self.category_centers, 0), [batch_size, 1, 1])
+        
+    #     # Transformer layers
+    #     for layer_dict in self.cross_attention_layers:
+    #         q_att = layer_dict['self_attention'](query=query_projected, key=query_projected, value=query_projected, training=training)
+    #         query_projected = layer_dict['norm1'](query_projected + q_att, training=training)
+            
+    #         cross_attn_out = layer_dict['cross_attention'](query=x, key=query_projected, value=query_projected, training=training)
+    #         x = layer_dict['norm1'](x + cross_attn_out, training=training)
+            
+    #         self_attn_out = layer_dict['self_attention'](query=x, key=x, value=x, training=training)
+    #         x = layer_dict['norm2'](x + self_attn_out, training=training)
+
+    #         ffn_out = layer_dict['ffn'](x, training=training)
+    #         x = layer_dict['norm3'](x + ffn_out, training=training)
+
+    #     predictions = self.output_projection(x)
+
     def call(self, inputs, training=None):
         query_features = inputs['query_features'] # (batch_size, N_items, 512)
         query_projected = self.input_projection(query_features) # Linear(512→512) + ReLU
@@ -196,6 +271,46 @@ class Transformer(Model):
 
         return predictions # TensorShape([batch_size, 11, 512])
 
+        
+        if self.scale_consistent:
+            # 重要：output_normは使わない（スケール情報を保持するため）
+            
+            # Step 1: 元のカテゴリセンターのスケールを復元
+            output_norms = tf.norm(predictions, axis=-1, keepdims=True)
+            predictions = predictions * tf.expand_dims(category_norms, 0) / (output_norms + 1e-8)
+            
+            # Step 2: ターゲット（CLIP特徴量）の平均スケールに調整
+            # これは訓練データの統計に基づいて設定
+            target_scale = 0.1813  # pdbで確認したtarg_norms.mean()
+            predictions = predictions * target_scale
+            
+            # クラスタセンタリング（L2正規化なし版）
+            if self.cluster_centering:
+                # 正規化済みセンターにスケールを戻す
+                centered_references = category_centers_normalized * tf.expand_dims(category_norms, 0) * target_scale
+                predictions = predictions - centered_references
+                # 重要：ここでL2正規化はしない
+        else:
+            # 従来のパス
+            predictions = self.output_norm(predictions)
+            
+            if self.cluster_centering:
+                cluster_centers_normalized = tf.nn.l2_normalize(self.category_centers, axis=-1)
+                predictions = predictions - tf.expand_dims(cluster_centers_normalized, 0)
+                predictions = tf.nn.l2_normalize(predictions, axis=-1)
+
+        return predictions
+
+
+        # クラスタセンタリング処理
+        if self.cluster_centering:
+            # スケール一致型の場合、正規化済みセンターを使用
+            predictions = predictions - tf.expand_dims(category_centers_normalized, 0) * tf.expand_dims(category_norms, 0)
+
+            predictions = tf.nn.l2_normalize(predictions, axis=-1)
+
+        return predictions
+
     def infer_single_set(self, query_features): # 未確認
         if len(query_features.shape) == 2:
             query_features = tf.expand_dims(query_features, 0)
@@ -218,6 +333,111 @@ class SetRetrieval(Transformer):
         self.taneg_curriculum_epochs_val = self.taneg_curriculum_epochs
         self.current_epoch = 0 
 
+    @tf.function
+    def in_batch_loss(self, predictions, targets, target_categories):
+        # pdb.set_trace()
+
+        batch_size = tf.shape(targets)[0]     # <tf.Tensor: shape=(), dtype=int32, numpy=64>
+        set_size = tf.shape(targets)[1]       # <tf.Tensor: shape=(), dtype=int32, numpy=20>
+        feature_dim = tf.shape(targets)[2]    # <tf.Tensor: shape=(), dtype=int32, numpy=512>
+
+        # Data flattening for batch processing
+        target_feats_flat = tf.reshape(targets, [-1, feature_dim])  # TensorShape([1280, 512])
+        target_cats_flat = tf.reshape(target_categories, [-1])              # <tf.Tensor: shape=(1280,), dtype=int32, numpy=array([5, 1, 1, ..., 0, 0, 0], dtype=int32)>
+        
+        # Record the original location information for each item
+        batch_indices = tf.range(batch_size, dtype=tf.int32)               # [0,1,2,...,63] tf.Tensor : shape=(64,)
+        item_indices = tf.range(set_size, dtype=tf.int32)                  # [0,1,2,...,19] tf.Tensor : shape=(20,)
+        batch_grid, item_grid = tf.meshgrid(batch_indices, item_indices, indexing='ij') 
+        # batch_grid : TensorShape([64, 20]) array([[ 0,  0,  0, ..., ], [], [], ... [..., 63, 63, 63]], dtype=int32)>
+        # item_grid : TensorShape([64, 20]) array([[ 0,  1,  2, ..., ], [], [], ... [..., 17, 18, 19]], dtype=int32)>
+        
+        original_batch_indices = tf.reshape(batch_grid, [-1])      # <tf.Tensor: shape=(1280,), dtype=int32, numpy=array([ 0,  0,  0, ..., 63, 63, 63], dtype=int32)>
+        original_item_indices = tf.reshape(item_grid, [-1])        # <tf.Tensor: shape=(1280,), dtype=int32, numpy=array([ 0,  1,  2, ..., 17, 18, 19], dtype=int32)>
+        
+        is_valid_item_mask = target_cats_flat > 0        # <tf.Tensor: shape=(1280,), dtype=bool, numpy=array([ True,  True,  True, ..., False, False, False])>
+        
+        # Extract the predicted category corresponding to each item
+        category_indices = tf.maximum(0, target_cats_flat - 1)   # 1-indexed → 0-indexed
+        prediction_indices = tf.stack([original_batch_indices, category_indices], axis=1) # <tf.Tensor: shape=(1280, 2), dtype=int32, numpy=array([[ 0,  4], [ 0,  0], [ 0,  0], ..., [63,  0], [63,  0], [63,  0]], dtype=int32)>
+        predictions_for_items = tf.gather_nd(predictions, prediction_indices)  # TensorShape([1280, 512]), predictions : TensorShape([64, 11, 512])
+        
+        # L2正規化 - コサイン類似度計算のため　消してみる　→　超絶過学習　なぜ？？　一旦一通り見てこの正規化の意味を把握
+        # predictions_normalized, _ = tf.linalg.normalize(predictions_for_items  + 1e-8, axis=-1)
+        # targets_normalized, _ = tf.linalg.normalize(target_feats_flat + 1e-8, axis=-1)
+        predictions_normalized = predictions_for_items
+        targets_normalized = target_feats_flat
+        
+        # カテゴリ別の損失計算
+        total_loss = 0.0
+        total_items_contributing = 0.0
+        
+        # 各カテゴリに対して独立してInfoNCE損失を計算
+        for category_id in range(1, self.num_categories + 1):
+            category_tensor = tf.constant(category_id, dtype=tf.int32)
+            
+            # 現在のカテゴリかつ有効なアイテムを選択
+            is_current_category = tf.equal(target_cats_flat, category_tensor)
+            category_item_mask = tf.logical_and(is_current_category, is_valid_item_mask)
+            category_item_indices = tf.where(category_item_mask)[:, 0]     # 該当アイテムのインデックス
+            num_items_in_category = tf.shape(category_item_indices)[0]
+            
+            def process_category():
+                # カテゴリ内のアイテムの予測と正解を抽出
+                category_predictions = tf.gather(predictions_normalized, category_item_indices)
+                category_targets = tf.gather(targets_normalized, category_item_indices)
+                category_batch_ids = tf.gather(original_batch_indices, category_item_indices)
+                
+                # カテゴリ内アイテム間の類似度行列を計算
+                similarity_matrix = tf.matmul(category_predictions, category_targets, transpose_b=True)
+                
+                # 同一セット（バッチ）内のマスクを作成 - 同じセットのアイテムはネガティブにしない
+                same_set_mask = tf.equal(tf.expand_dims(category_batch_ids, 1), tf.expand_dims(category_batch_ids, 0))
+                
+                # 対角成分マスク - 自分自身は常にポジティブ
+                diagonal_mask = tf.eye(num_items_in_category, dtype=tf.bool)
+                
+                # ネガティブサンプルのベースマスク
+                negative_base_mask = tf.logical_not(diagonal_mask)
+                # 同一セット内は除外
+                valid_negative_mask = tf.logical_and(negative_base_mask, tf.logical_not(same_set_mask))
+                
+                # 同一セット内かつ非対角のペアを-∞でマスク
+                same_set_non_diagonal = tf.logical_and(same_set_mask, negative_base_mask)
+                masked_logits = tf.where(same_set_non_diagonal, -1e9, similarity_matrix / self.temperature)
+                
+                # InfoNCE損失計算 - 対角成分が正解ラベル
+                category_size = tf.shape(category_predictions)[0]
+                correct_labels = tf.range(category_size, dtype=tf.int32)
+                
+                # 交差エントロピー損失
+                category_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=correct_labels, logits=masked_logits)
+                
+                return tf.reduce_sum(category_loss), tf.cast(category_size, tf.float32)
+            
+            def skip_category():
+                return 0.0, 0.0
+            
+            # カテゴリに2個以上のアイテムがある場合のみ処理
+            category_loss_sum, category_item_count = tf.cond(num_items_in_category > 1, process_category, skip_category)
+            
+            total_loss += category_loss_sum
+            total_items_contributing += category_item_count
+        
+        # 最終損失の計算
+        def compute_final_loss():
+            return total_loss / total_items_contributing
+        
+        def return_zero_loss():
+            return tf.constant(0.0, dtype=tf.float32)
+        
+        final_loss = tf.cond(total_items_contributing > 0.0, compute_final_loss, return_zero_loss)
+        
+        # 勾配計算のためのダミー項
+        final_loss += 0.0 * tf.reduce_sum(predictions)
+        
+        return final_loss
+
     def set_current_epoch(self, epoch):
         self.current_epoch = epoch
         current_t_gamma = self.get_current_taneg_t_gamma()
@@ -232,210 +452,48 @@ class SetRetrieval(Transformer):
         current_t_gamma = self.initial_taneg_t_gamma_curr + (self.final_taneg_t_gamma_curr - self.initial_taneg_t_gamma_curr) * progress
         return current_t_gamma
 
-    @property
-    def metrics(self):
-        common_metrics = [self.loss_tracker, self.xy_loss_tracker, self.yx_loss_tracker]
-        all_topk_metrics = list(self.topk_metrics.values())
-        val_main_loss_metric = [self.validation_loss_tracker]
-        reconstruction_metrics = [self.reconstruct_x_loss_tracker, self.reconstruct_y_loss_tracker]
-        return common_metrics + reconstruction_metrics + all_topk_metrics + val_main_loss_metric
-
-    @tf.function
-    def train_step(self, data): # dict_keys(['query_features', 'target_features', 'query_categories', 'target_categories', 'query_item_ids', 'target_item_ids', 'candidate_negative_features', 'candidate_negative_masks', 'query_candidate_negative_features', 'query_candidate_negative_masks'])
-        with tf.GradientTape() as tape:
-            pred_Y = self({'query_features': data['query_features']}, training=True) # X -> Y' pred_Y : TensorShape([64, 11, 512]) , data['query_features'] : TensorShape([64, 20, 512])
-            pred_X = self({'query_features': data['target_features']}, training=True) # Y -> X' pred_X : TensorShape([64, 11, 512]) , data['target_features'] : TensorShape([64, 20, 512])
-
-            if self.use_tpaneg:
-                current_taneg_t_gamma = self.get_current_taneg_t_gamma()
-                
-                loss_X_to_Y = self.tpaneg_loss(pred_Y, data['target_features'], data['target_categories'], data['candidate_negative_features'], data['candidate_negative_masks'], current_taneg_t_gamma)
-                loss_Y_to_X = self.tpaneg_loss(pred_X, data['query_features'], data['query_categories'], data['query_candidate_negative_features'], data['query_candidate_negative_masks'], current_taneg_t_gamma)
-
-                total_loss = loss_X_to_Y + loss_Y_to_X
-
-                if self.use_cycle_loss:
-                    # Cycle loss is not part of the current debugging, so this branch is not used.
-                    reconst_input_Y = self._get_predictions_for_items(pred_Y, data['target_categories'])
-                    reconst_input_X = self._get_predictions_for_items(pred_X, data['query_categories'])
-                    
-                    reconstructed_X = self({'query_features': reconst_input_Y}, training=True)
-                    reconstructed_Y = self({'query_features': reconst_input_X}, training=True)
-                    
-                    cycle_loss_X = self.tpaneg_loss(reconstructed_X, data['query_features'], data['query_categories'], data['query_candidate_negative_features'], data['query_candidate_negative_masks'], current_taneg_t_gamma)
-                    cycle_loss_Y = self.tpaneg_loss(reconstructed_Y, data['target_features'], data['target_categories'], data['candidate_negative_features'], data['candidate_negative_masks'], current_taneg_t_gamma)
-                    total_loss += self.cycle_lambda * (cycle_loss_X + cycle_loss_Y)
-
-            else: 
-                loss_X_to_Y = self.in_batch_loss(pred_Y, data['target_features'], data['target_categories'] ) # X -> Y' <=> Y <tf.Tensor: shape=(), dtype=float32, numpy=3.118135452270508>
-                loss_Y_to_X = self.in_batch_loss(pred_X, data['query_features'], data['query_categories']) # Y -> X' <=> <tf.Tensor: shape=(), dtype=float32, numpy=3.1540865898132324>
-
-                total_loss = loss_X_to_Y + loss_Y_to_X
-
-                if self.use_cycle_loss:
-                    # Cycle loss is not part of the current debugging, so this branch is not used.
-                    reconst_input_Y = self._get_predictions_for_items(pred_Y, data['target_categories']) # Y' -> X" reconstructed_X : TensorShape([64, 11, 512]) , pred_Y : TensorShape([64, 11, 512])
-                    reconst_input_X = self._get_predictions_for_items(pred_X, data['query_categories']) # X' -> Y" reconstructed_Y : TensorShape([64, 11, 512]) , pred_X : TensorShape([64, 11, 512])
-                    
-                    reconstructed_X = self({'query_features': reconst_input_Y}, training=True)
-                    reconstructed_Y = self({'query_features': reconst_input_X}, training=True)
-                    
-                    cycle_loss_X = self.in_batch_loss(reconstructed_X, data['query_features'], data['query_categories'])
-                    cycle_loss_Y = self.in_batch_loss(reconstructed_Y, data['target_features'], data['target_categories'])
-                    total_loss += self.cycle_lambda * (cycle_loss_X + cycle_loss_Y)
-
-                # pdb.set_trace()
-
-        gradients = tape.gradient(total_loss, self.trainable_variables)
-
-
-        self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
-
-        self.loss_tracker.update_state(total_loss)
-        self.xy_loss_tracker.update_state(loss_X_to_Y)
-        self.yx_loss_tracker.update_state(loss_Y_to_X)
-        if self.use_cycle_loss:
-            self.reconstruct_x_loss_tracker.update_state(cycle_loss_X)
-            self.reconstruct_y_loss_tracker.update_state(cycle_loss_Y)
-
-        self.train_topk_metric.update_state(pred_Y, data['target_features'], data['target_categories'])
-        
-        results = {"loss": self.loss_tracker.result(), "X->Y' Loss": self.xy_loss_tracker.result(), "Y'->X' Loss": self.yx_loss_tracker.result()}
-        
-        # Top-K結果を追加
-        topk_results = self.train_topk_metric.result()
-        if isinstance(topk_results, dict):
-            results.update(topk_results)
-        
-        return results
-
-
-    @tf.function
-    def test_step(self, data):
-        pred_Y = self({'query_features': data['query_features']}, training=False)
-        
-        current_taneg_t_gamma = self.get_current_taneg_t_gamma()
-        
-        if self.use_tpaneg and 'candidate_negative_features' in data:
-            val_loss = self.tpaneg_loss(pred_Y, data['target_features'], data['target_categories'], data['candidate_negative_features'], data['candidate_negative_masks'], current_taneg_t_gamma)
-        else:
-            val_loss = self.in_batch_loss(pred_Y, data['target_features'], data['target_categories'])
-        
-        self.validation_loss_tracker.update_state(val_loss)
-
-        self.val_topk_metric.update_state(pred_Y, data['target_features'], data['target_categories'])
-
-        results = {"loss": self.validation_loss_tracker.result()}
-        
-        topk_results = self.val_topk_metric.result()
-        if isinstance(topk_results, dict):
-            for k, v in topk_results.items():
-                results[f"val_{k}"] = v
-        
-        return results
-
-    def _get_predictions_for_items(self, predictions, categories): # fix mask
-        batch_size, set_size = tf.shape(categories)[0], tf.shape(categories)[1]
-        
-        valid_mask = categories > 0
-        safe_categories = tf.where(valid_mask, categories - 1, 0)
-        
-        batch_indices = tf.tile(tf.reshape(tf.range(batch_size, dtype=tf.int32), [batch_size, 1]), [1, set_size])
-        
-        gather_indices = tf.stack([batch_indices, safe_categories], axis=-1)
-        item_predictions = tf.gather_nd(predictions, gather_indices)
-        
-        valid_mask_expanded = tf.expand_dims(tf.cast(valid_mask, tf.float32), axis=-1)
-        masked_predictions = item_predictions * valid_mask_expanded
-        
-        return masked_predictions
-    
-    @tf.function
-    def in_batch_loss(self, predictions, target_features, target_categories):
+    def _apply_curriculum_threshold_schedule(self, epoch, total_epochs):
         """
-        In-batch Negative Samplingに基づくカテゴリ別コントラスティブ学習損失。
-        同じセット内の同じカテゴリのアイテムはネガティブとして扱わない。
+        カリキュラム学習：エポックに応じて類似度閾値を段階的に上昇   0.2 → 0.4 (IQON3000), 0.5 → 0.8 (DeepFurniture)
         """
-        B, S, D = tf.shape(target_features)[0], tf.shape(target_features)[1], tf.shape(target_features)[2]
+        if self.dataset_name == 'IQON3000':
+            start_threshold = 0.2
+            end_threshold = 0.4
+        else:  # DeepFurniture
+            start_threshold = 0.5
+            end_threshold = 0.8
+        
+        progress = min(epoch / total_epochs, 1.0)
+        current_threshold = start_threshold + (end_threshold - start_threshold) * progress
+        
+        return current_threshold
 
-        target_feats_flat = tf.reshape(target_features, [-1, D]) # (B*S, D)
-        target_cats_flat = tf.reshape(target_categories, [-1])   # (B*S)
+    def _get_taneg_candidates(self, item_id, category, similarity_threshold):
+        """
+        TaNeg: Target-aware curriculum hard Negative mining
         
-        batch_indices = tf.range(B, dtype=tf.int32)
-        item_indices = tf.range(S, dtype=tf.int32)
-        grid_b, grid_i = tf.meshgrid(batch_indices, item_indices, indexing='ij')
-        original_flat_batch_indices = tf.reshape(grid_b, [-1]) # 各アイテムの元のバッチインデックス (B*S,)
-        original_flat_item_indices = tf.reshape(grid_i, [-1])  # 各アイテムの元のセット内インデックス (B*S,)
+        論文のEquation 7実装: N_cy(T_γ) = {l ∈ G_cy : l ≠ y, sim(l, y) ≥ T_γ}
+        """
+        if not hasattr(self, 'negative_pool') or category not in self.negative_pool:
+            return []
         
-        is_valid_item_mask = tf.logical_and(target_cats_flat > 0, tf.reduce_sum(tf.abs(target_feats_flat), axis=-1) > 1e-6)
+        category_pool = self.negative_pool[category]  # 同カテゴリの全アイテム
         
-        preds_indices_for_gather = tf.stack([original_flat_batch_indices, tf.maximum(0, target_cats_flat - 1)], axis=1) # (B*S, 2)
-        preds_for_items_flat = tf.gather_nd(predictions, preds_indices_for_gather) # (B*S, D)
+        if len(category_pool) <= 1:
+            return []
         
-        preds = tf.where(tf.math.is_finite(preds_for_items_flat), preds_for_items_flat, 0.0)
-        targets = tf.where(tf.math.is_finite(target_feats_flat), target_feats_flat, 0.0)
-        
-        preds_norm, _ = tf.linalg.normalize(preds + 1e-8, axis=-1)
-        targets_norm, _ = tf.linalg.normalize(targets + 1e-8, axis=-1)
-        
-        # 2. カテゴリ別の損失計算
-        total_loss = 0.0
-        total_items_contributing = 0.0 
-        
-        for cat_id in range(1, self.num_categories + 1):
-            cat_id_tensor = tf.constant(cat_id, dtype=tf.int32)
-            cat_specific_mask = tf.logical_and(tf.equal(target_cats_flat, cat_id_tensor),is_valid_item_mask)
-            indices_in_cat = tf.where(cat_specific_mask)[:, 0]
-            cat_count = tf.shape(indices_in_cat)[0]
-            
-            def process_category():
-                cat_preds = tf.gather(preds_norm, indices_in_cat)    # (N_cat, D)
-                cat_targets = tf.gather(targets_norm, indices_in_cat) # (N_cat, D)
-                
-                cat_original_batch_indices = tf.gather(original_flat_batch_indices, indices_in_cat) # (N_cat,)
-                
-                # カテゴリ内類似度行列 (N_cat x N_cat)
-                sim_matrix = tf.matmul(cat_preds, cat_targets, transpose_b=True)
-                same_batch_mask = tf.equal(tf.expand_dims(cat_original_batch_indices, 1), tf.expand_dims(cat_original_batch_indices, 0))
-                
-                # ポジティブペア (対角成分) を取得
-                identity_mask = tf.eye(cat_count, dtype=tf.bool) # (N_cat, N_cat)
-                
-                neg_base_mask = tf.logical_not(identity_mask)
-                neg_mask = tf.logical_and(neg_base_mask, tf.logical_not(same_batch_mask))
-    
-                mask_to_exclude_from_negatives = tf.logical_and(same_batch_mask, neg_base_mask)
-                masked_logits = tf.where(mask_to_exclude_from_negatives, -1e9, sim_matrix / self.temperature)
-                
-                # 正解ラベル（対角成分が正解）
-                cat_size = tf.shape(cat_preds)[0]
-                labels = tf.range(cat_size, dtype=tf.int32)
-                
-                # InfoNCE損失
-                cat_loss = tf.nn.sparse_softmax_cross_entropy_with_logits( labels=labels, logits=masked_logits)
-                
-                return tf.reduce_sum(cat_loss), tf.cast(cat_size, tf.float32)
-            
-            def skip_category():
-                return 0.0, 0.0
-        
-            cat_loss_sum, cat_items_count = tf.cond(cat_count > 1, process_category, skip_category)
-            
-            total_loss += cat_loss_sum
-            total_items_contributing += cat_items_count
-        
-        # 3. 最終損失
-        def compute_final():
-            return total_loss / total_items_contributing
-        
-        def return_zero():
-            return tf.constant(0.0, dtype=tf.float32)
-        
-        final_loss = tf.cond(total_items_contributing > 0.0, compute_final, return_zero)
-        final_loss += 0.0 * tf.reduce_sum(predictions)
-        
-        return final_loss
+        target_features = self._get_item_features(item_id, category)
+        if target_features is None:
+            return []
 
+        similarities = np.dot(category_pool, target_features)
+        hard_negative_mask = similarities >= similarity_threshold
+        hard_negatives = category_pool[hard_negative_mask]
+        
+        if len(hard_negatives) > self.candidate_neg_num:
+            indices = np.random.choice(len(hard_negatives), size=self.candidate_neg_num, replace=False)
+            hard_negatives = hard_negatives[indices]
+        return hard_negatives.tolist()
 
     @tf.function
     def tpaneg_loss(self, predictions, target_features, target_categories, candidate_neg_feats, candidate_neg_masks, current_taneg_t_gamma):
@@ -502,47 +560,117 @@ class SetRetrieval(Transformer):
 
         return final_loss + (0.0 * tf.reduce_sum(predictions))
 
+    def _get_predictions_for_items(self, predictions, categories): # fix mask
+        batch_size, set_size = tf.shape(categories)[0], tf.shape(categories)[1]
+        
+        valid_mask = categories > 0
+        safe_categories = tf.where(valid_mask, categories - 1, 0)
+        
+        batch_indices = tf.tile(tf.reshape(tf.range(batch_size, dtype=tf.int32), [batch_size, 1]), [1, set_size])
+        
+        gather_indices = tf.stack([batch_indices, safe_categories], axis=-1)
+        item_predictions = tf.gather_nd(predictions, gather_indices)
+        
+        valid_mask_expanded = tf.expand_dims(tf.cast(valid_mask, tf.float32), axis=-1)
+        masked_predictions = item_predictions * valid_mask_expanded
+        
+        return masked_predictions
+
+    @property
+    def metrics(self):
+        common_metrics = [self.loss_tracker, self.xy_loss_tracker, self.yx_loss_tracker]
+        all_topk_metrics = list(self.topk_metrics.values())
+        val_main_loss_metric = [self.validation_loss_tracker]
+        reconstruction_metrics = [self.reconstruct_x_loss_tracker, self.reconstruct_y_loss_tracker]
+        return common_metrics + reconstruction_metrics + all_topk_metrics + val_main_loss_metric
+
+    @tf.function
+    def train_step(self, data): # dict_keys(['query_features', 'target_features', 'query_categories', 'target_categories', 'query_item_ids', 'target_item_ids', 'candidate_negative_features', 'candidate_negative_masks', 'query_candidate_negative_features', 'query_candidate_negative_masks'])
+        with tf.GradientTape() as tape:
+            pred_Y = self({'query_features': data['query_features']}, training=True) # X -> Y' pred_Y : TensorShape([64, 11, 512]) , data['query_features'] : TensorShape([64, 20, 512])
+            pred_X = self({'query_features': data['target_features']}, training=True) # Y -> X' pred_X : TensorShape([64, 11, 512]) , data['target_features'] : TensorShape([64, 20, 512])
+
+            if self.use_tpaneg == False:
+                loss_X_to_Y = self.in_batch_loss(pred_Y, data['target_features'], data['target_categories'] ) # X -> Y' <=> Y <tf.Tensor: shape=(), dtype=float32, numpy=3.118135452270508>
+                loss_Y_to_X = self.in_batch_loss(pred_X, data['query_features'], data['query_categories']) # Y -> X' <=> <tf.Tensor: shape=(), dtype=float32, numpy=3.1540865898132324>
+
+                total_loss = loss_X_to_Y + loss_Y_to_X
+
+                if self.use_cycle_loss:
+                    # Cycle loss is not part of the current debugging, so this branch is not used.
+                    reconst_input_Y = self._get_predictions_for_items(pred_Y, data['target_categories']) # Y' -> X" reconstructed_X : TensorShape([64, 11, 512]) , pred_Y : TensorShape([64, 11, 512])
+                    reconst_input_X = self._get_predictions_for_items(pred_X, data['query_categories']) # X' -> Y" reconstructed_Y : TensorShape([64, 11, 512]) , pred_X : TensorShape([64, 11, 512])
+                    
+                    reconstructed_X = self({'query_features': reconst_input_Y}, training=True)
+                    reconstructed_Y = self({'query_features': reconst_input_X}, training=True)
+                    
+                    cycle_loss_X = self.in_batch_loss(reconstructed_X, data['query_features'], data['query_categories'])
+                    cycle_loss_Y = self.in_batch_loss(reconstructed_Y, data['target_features'], data['target_categories'])
+                    total_loss += self.cycle_lambda * (cycle_loss_X + cycle_loss_Y)
+
+            else: 
+                current_taneg_t_gamma = self.get_current_taneg_t_gamma()
+                
+                loss_X_to_Y = self.tpaneg_loss(pred_Y, data['target_features'], data['target_categories'], data['candidate_negative_features'], data['candidate_negative_masks'], current_taneg_t_gamma)
+                loss_Y_to_X = self.tpaneg_loss(pred_X, data['query_features'], data['query_categories'], data['query_candidate_negative_features'], data['query_candidate_negative_masks'], current_taneg_t_gamma)
+
+                total_loss = loss_X_to_Y + loss_Y_to_X
+
+                if self.use_cycle_loss:
+                    # Cycle loss is not part of the current debugging, so this branch is not used.
+                    reconst_input_Y = self._get_predictions_for_items(pred_Y, data['target_categories'])
+                    reconst_input_X = self._get_predictions_for_items(pred_X, data['query_categories'])
+                    
+                    reconstructed_X = self({'query_features': reconst_input_Y}, training=True)
+                    reconstructed_Y = self({'query_features': reconst_input_X}, training=True)
+                    
+                    cycle_loss_X = self.tpaneg_loss(reconstructed_X, data['query_features'], data['query_categories'], data['query_candidate_negative_features'], data['query_candidate_negative_masks'], current_taneg_t_gamma)
+                    cycle_loss_Y = self.tpaneg_loss(reconstructed_Y, data['target_features'], data['target_categories'], data['candidate_negative_features'], data['candidate_negative_masks'], current_taneg_t_gamma)
+                    total_loss += self.cycle_lambda * (cycle_loss_X + cycle_loss_Y)
+
+        gradients = tape.gradient(total_loss, self.trainable_variables)
 
 
-    def _get_taneg_candidates(self, item_id, category, similarity_threshold):
-        """
-        TaNeg: Target-aware curriculum hard Negative mining
-        
-        論文のEquation 7実装: N_cy(T_γ) = {l ∈ G_cy : l ≠ y, sim(l, y) ≥ T_γ}
-        """
-        if not hasattr(self, 'negative_pool') or category not in self.negative_pool:
-            return []
-        
-        category_pool = self.negative_pool[category]  # 同カテゴリの全アイテム
-        
-        if len(category_pool) <= 1:
-            return []
-        
-        target_features = self._get_item_features(item_id, category)
-        if target_features is None:
-            return []
+        self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
 
-        similarities = np.dot(category_pool, target_features)
-        hard_negative_mask = similarities >= similarity_threshold
-        hard_negatives = category_pool[hard_negative_mask]
-        
-        if len(hard_negatives) > self.candidate_neg_num:
-            indices = np.random.choice(len(hard_negatives), size=self.candidate_neg_num, replace=False)
-            hard_negatives = hard_negatives[indices]
-        return hard_negatives.tolist()
+        self.loss_tracker.update_state(total_loss)
+        self.xy_loss_tracker.update_state(loss_X_to_Y)
+        self.yx_loss_tracker.update_state(loss_Y_to_X)
+        if self.use_cycle_loss:
+            self.reconstruct_x_loss_tracker.update_state(cycle_loss_X)
+            self.reconstruct_y_loss_tracker.update_state(cycle_loss_Y)
 
-    def _apply_curriculum_threshold_schedule(self, epoch, total_epochs):
-        """
-        カリキュラム学習：エポックに応じて類似度閾値を段階的に上昇   0.2 → 0.4 (IQON3000), 0.5 → 0.8 (DeepFurniture)
-        """
-        if self.dataset_name == 'IQON3000':
-            start_threshold = 0.2
-            end_threshold = 0.4
-        else:  # DeepFurniture
-            start_threshold = 0.5
-            end_threshold = 0.8
+        self.train_topk_metric.update_state(pred_Y, data['target_features'], data['target_categories'])
         
-        progress = min(epoch / total_epochs, 1.0)
-        current_threshold = start_threshold + (end_threshold - start_threshold) * progress
+        results = {"loss": self.loss_tracker.result(), "X->Y' Loss": self.xy_loss_tracker.result(), "Y'->X' Loss": self.yx_loss_tracker.result()}
         
-        return current_threshold
+        # Top-K結果を追加
+        topk_results = self.train_topk_metric.result()
+        if isinstance(topk_results, dict):
+            results.update(topk_results)
+        
+        return results
+
+    @tf.function
+    def test_step(self, data):
+        pred_Y = self({'query_features': data['query_features']}, training=False)
+        
+        current_taneg_t_gamma = self.get_current_taneg_t_gamma()
+        
+        if self.use_tpaneg and 'candidate_negative_features' in data:
+            val_loss = self.tpaneg_loss(pred_Y, data['target_features'], data['target_categories'], data['candidate_negative_features'], data['candidate_negative_masks'], current_taneg_t_gamma)
+        else:
+            val_loss = self.in_batch_loss(pred_Y, data['target_features'], data['target_categories'])
+        
+        self.validation_loss_tracker.update_state(val_loss)
+
+        self.val_topk_metric.update_state(pred_Y, data['target_features'], data['target_categories'])
+
+        results = {"loss": self.validation_loss_tracker.result()}
+        
+        topk_results = self.val_topk_metric.result()
+        if isinstance(topk_results, dict):
+            for k, v in topk_results.items():
+                results[f"val_{k}"] = v
+        
+        return results

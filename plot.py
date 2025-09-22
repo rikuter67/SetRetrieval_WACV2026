@@ -207,7 +207,7 @@ def plot_training_curves(history_data, output_dir, dataset_name="Unknown"):
                     # print(f"[DEBUG] Found training metric: {key} -> train_top{k}")
                 
                 # Validation metrics - 複数のパターンをチェック
-                val_patterns = [f'val_top{k}_accuracy']
+                val_patterns = [f'val_val_top{k}_accuracy']
                 for pattern in val_patterns:
                     if key == pattern:
                         metric_mapping[f'val_top{k}'] = key

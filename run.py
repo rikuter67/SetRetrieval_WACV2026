@@ -190,7 +190,7 @@ def main():
     parser.add_argument('--model_path', default=None, help="Path to pre-trained model weights for testing.")
 
     parser.add_argument('--feature_dim', type=int, default=512)
-    parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--num_heads', type=int, default=2)
     parser.add_argument('--num_layers', type=int, default=2)
     parser.add_argument('--hidden_dim', type=int, default=512)
@@ -303,9 +303,11 @@ def main():
                          loss=None, 
                          metrics=model.metrics)
         
-        callbacks = [
+        callbacks = [ 
             EarlyStopping(monitor='val_val_top10_accuracy', patience=args.early_stop, mode='max', verbose=1, restore_best_weights=True),
             ReduceLROnPlateau(monitor='val_val_top10_accuracy', factor=0.8, patience=15, min_lr=1e-5, mode='min'),
+            # EarlyStopping(monitor='val_loss', patience=args.early_stop, mode='min', verbose=1, restore_best_weights=True),
+            # ReduceLROnPlateau(monitor='val_val_top5_accuracy', factor=0.8, patience=15, min_lr=1e-5, mode='min'),
             EpochUpdateCallback(train_gen, model),
             TimeHistory()
         ]
