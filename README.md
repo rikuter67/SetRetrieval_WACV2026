@@ -162,7 +162,7 @@ conda activate setretrieval
 ```bash
 # Clone the DeepFurniture dataset from HuggingFace
 cd data/
-git clone https://huggingface.co/datasets/rikuter67/DeepFurniture
+git clone https://huggingface.co/datasets/byliu/DeepFurniture
 mv DeepFurniture/* DeepFurniture/
 
 #Verify Data Structure
