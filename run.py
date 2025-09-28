@@ -14,7 +14,7 @@ from helpers import build_image_path_map
 from util import evaluate_model, setup_gpu_memory, collect_test_data, save_whitening_params, load_whitening_params, compute_input_whitening_stats, HardNegativeMiner, save_hard_negative_cache, load_hard_negative_cache
 from config import get_dataset_config
 from plot import plot_training_curves, generate_qualitative_examples
-from models import TPaNegModel
+from models import SetRetrieval
 from precompute_negatives import precompute_negatives_gpu 
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -43,7 +43,6 @@ class TimeHistory(tf.keras.callbacks.Callback):
         print(f"Epoch {epoch+1} Time: {elapsed_seconds:.2f} seconds")
 
     def on_train_end(self, logs={}):
-        # 全学習終了後に平均時間を計算して表示
         if not self.epoch_times:
             print("⚠️ No epoch times were recorded (training might have been too short).")
             return
@@ -51,7 +50,7 @@ class TimeHistory(tf.keras.callbacks.Callback):
         avg_seconds = np.mean(self.epoch_times)
         avg_minutes = avg_seconds / 60
         print("\n" + "="*40)
-        print("✅ Training Time Summary")
+        print("Training Time Summary")
         print(f"   Average time per epoch: {avg_seconds:.2f} seconds")
         print(f"   Average time per epoch: {avg_minutes:.4f} minutes")
         print("="*40)
@@ -68,7 +67,6 @@ class EpochUpdateCallback(tf.keras.callbacks.Callback):
         if hasattr(self.data_generator, 'set_epoch'):
             self.data_generator.set_epoch(epoch)
         
-        # モデルにも現在のエポックを設定
         if self.tpaneg_model and hasattr(self.tpaneg_model, 'set_current_epoch'):
             self.tpaneg_model.set_current_epoch(epoch)
 
@@ -77,7 +75,6 @@ def create_output_dir(args: argparse.Namespace) -> str:
     if args.output_dir:
         return args.output_dir
         
-    # 基本的なパラメータ
     components = [
         f"Epoch{args.epochs}"
         f"batch{args.batch_size}",
@@ -86,7 +83,6 @@ def create_output_dir(args: argparse.Namespace) -> str:
         f"LR{args.learning_rate}"
     ]
     
-    # 条件に応じたフラグを追加
     if args.use_whitening:
         components.append("use_whitening")
     if args.use_tpaneg:
@@ -95,18 +91,14 @@ def create_output_dir(args: argparse.Namespace) -> str:
         components.append("use_cycle_loss")
         components.append(f"lambda{args.cycle_lambda}")
     
-    # TPaNeg関連のパラメータを実験名に追加
     if args.use_tpaneg:
         components.append(f"TaNegInit{args.taneg_t_gamma_init}")
         components.append(f"TaNegFinal{args.taneg_t_gamma_final}")
         components.append(f"TaNegEps{args.taneg_curriculum_epochs}")
         components.append(f"PaNegEps{args.paneg_epsilon}")
 
-
-    # シード値は常に含める
     components.append(f"seed{args.seed}")
     
-    # ★ output_dir をここで定義して返す
     experiment_name = "_".join(components)
     output_dir = os.path.join("experiments", args.dataset, experiment_name)
     return output_dir
@@ -116,17 +108,11 @@ def detect_num_categories(dataset_path: str) -> int:
     config = get_dataset_config(os.path.basename(dataset_path))
     return config.get('num_categories', 16)
 
-# <--- 修正点: データセット作成ロジックをクリーンな形に再構成 --->
 def create_data_generators(dataset_path: str, batch_size: int,
                            use_negatives: bool = False, candidate_neg_num: int = 50,
                            seed: int = 42, random_split: bool = True,
                            whitening_params: dict = None,
                            negative_cache_path: str = None) -> tuple:
-    
-    print(f"🔧 DataGenerator Configuration:")
-    print(f"   - TPaNeg (use_negatives): {use_negatives}")
-    print(f"   - Random Split: {random_split}")
-    print(f"   - Negative Cache Path: {negative_cache_path if use_negatives else 'N/A'}")
     
     train_gen = DataGenerator(
         split_path=os.path.join(dataset_path, 'train.pkl'),
@@ -202,31 +188,32 @@ def main():
     parser.add_argument('--dataset_dir', default='datasets', help="Root directory for datasets.")
     parser.add_argument('--output_dir', default=None, help="Specify a custom output directory.")
     parser.add_argument('--model_path', default=None, help="Path to pre-trained model weights for testing.")
+
     parser.add_argument('--feature_dim', type=int, default=512)
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--num_heads', type=int, default=2)
     parser.add_argument('--num_layers', type=int, default=2)
+    parser.add_argument('--hidden_dim', type=int, default=512)
     parser.add_argument('--epochs', type=int, default=300)
     parser.add_argument('--early_stop', type=int, default=50)
     parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--temperature', type=float, default=0.8, help="Temperature for contrastive loss")
     parser.add_argument('--dropout_rate', type=float, default=0.1, help="Dropout rate for regularization")
     parser.add_argument('--seed', type=int, default=42, help="Random seed for reproducibility.")
+
     parser.add_argument('--topk_values', type=int, nargs='+', default=[5, 10, 20], help="TopK values to track.")
-    parser.add_argument('--use_cycle_loss', action='store_true', help='Include cycle consistency loss')
-    parser.add_argument('--cycle_lambda', type=float, default=0.2, help='Weight for cycle consistency loss')
+    parser.add_argument('--use_weighted_topk', action='store_true', help='Enable weighted TopK accuracy metrics during evaluation')
     parser.add_argument('--use_cluster_centering', action='store_true', help='Cluster center base loss')
     parser.add_argument('--use_whitening', action='store_true', help='Enable whitening transformation during evaluation')
-    parser.add_argument('--use_weighted_topk', action='store_true', help='Enable weighted TopK accuracy metrics during evaluation')
+
+    parser.add_argument('--use_cycle_loss', action='store_true', help='Include cycle consistency loss')
+    parser.add_argument('--cycle_lambda', type=float, default=0.2, help='Weight for cycle consistency loss')
+    
     parser.add_argument('--use_tpaneg', action='store_true', help='Enable TPaNeg dynamic hard negative learning')
     parser.add_argument('--candidate_neg_num', type=int, default=50, help='Number of candidate negatives for TPaNeg')
-    
-    # 論文のT_gamma (TaNegの類似度閾値) に対応するパラメータ
     parser.add_argument('--taneg_t_gamma_init', type=float, default=0.2, help='Initial T_gamma (TaNeg similarity threshold). Used for precomputing and as start of curriculum.')
     parser.add_argument('--taneg_t_gamma_final', type=float, default=0.4, help='Final T_gamma (TaNeg similarity threshold). End point of curriculum learning.')
     parser.add_argument('--taneg_curriculum_epochs', type=int, default=100, help='Number of epochs over which TaNeg T_gamma linearly increases.')
-
-    # 論文のepsilon (PaNegのマージン) に対応するパラメータ
     parser.add_argument('--paneg_epsilon', type=float, default=0.2, help='Epsilon (ε) margin for Prediction-Aware Negative selection (PaNeg). Fixed during training.')
     
     args = parser.parse_args()
@@ -278,16 +265,10 @@ def main():
         else:
             print(f"✅ Found existing cache: {cache_path}")
 
-    model = TPaNegModel(
-        feature_dim=args.feature_dim, num_heads=args.num_heads, num_layers=args.num_layers,
-        num_categories=num_categories, temperature=args.temperature, dropout_rate=args.dropout_rate,
-        use_cycle_loss=args.use_cycle_loss, cycle_lambda=args.cycle_lambda, k_values=args.topk_values,
-        cluster_centering=args.use_cluster_centering, use_tpaneg=args.use_tpaneg,
-        # TPaNeg関連のパラメータをモデルに渡す
-        taneg_t_gamma_init=args.taneg_t_gamma_init, 
-        taneg_t_gamma_final=args.taneg_t_gamma_final,
-        taneg_curriculum_epochs=args.taneg_curriculum_epochs,
-        paneg_epsilon=args.paneg_epsilon 
+    model = SetRetrieval(
+        feature_dim=args.feature_dim, num_heads=args.num_heads, num_layers=args.num_layers, num_categories=num_categories,  hidden_dim=args.hidden_dim, 
+        temperature=args.temperature, dropout_rate=args.dropout_rate, k_values=args.topk_values, use_cycle_loss=args.use_cycle_loss, cycle_lambda=args.cycle_lambda, cluster_centering=args.use_cluster_centering, 
+        use_tpaneg=args.use_tpaneg,taneg_t_gamma_init=args.taneg_t_gamma_init, taneg_t_gamma_final=args.taneg_t_gamma_final, taneg_curriculum_epochs=args.taneg_curriculum_epochs, paneg_epsilon=args.paneg_epsilon 
     )
 
     centers_path = os.path.join(dataset_path, 'category_centers.pkl.gz')
@@ -304,7 +285,6 @@ def main():
     _ = model(dummy_input)
     model.summary()
 
-    print("🚀 Using DataGenerator for all data loading")
     train_data, val_data, test_data, train_gen, val_gen, steps_per_epoch, validation_steps = create_data_generators(
         dataset_path,
         args.batch_size, 
@@ -317,7 +297,7 @@ def main():
     )
 
     if args.mode == 'train':
-        print(f"\n--- 🚂 Starting Training with TopK={args.topk_values} ---")
+        print(f"\n--- Starting Training with TopK={args.topk_values} ---")
 
         model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=args.learning_rate), 
                          loss=None, 
@@ -344,14 +324,14 @@ def main():
 
         model_path_for_testing = os.path.join(output_dir, 'final_model.weights.h5')
         model.save_weights(model_path_for_testing)
-        print(f"\n💾 Model saved to: {model_path_for_testing}")
+        print(f"\n Model saved to: {model_path_for_testing}")
 
-        print("\n--- 📊 Creating Training Visualization ---")
+        print("\n--- Creating Training Visualization ---")
         try:
             plot_training_curves(history.history, output_dir, args.dataset)
-            print("✅ Training visualization complete!")
+            print("Training visualization complete!")
         except Exception as e:
-            print(f"⚠️ Visualization failed: {e}")
+            print(f"Visualization failed: {e}")
             print(f"Available keys: {list(history.history.keys())}")
             
 
@@ -374,9 +354,8 @@ def main():
             num_examples=30, top_k=10,
             min_target_items=4 
         )
-        print(f"✅ Image collages saved to: {collage_dir}")
-        print(f"\n🎉 Training and evaluation completed!")
-        print(f"📁 All results saved to: {output_dir}")
+        print(f"Image collages saved to: {collage_dir}")
+        print(f"All results saved to: {output_dir}")
     else:
         print(f"❌ Model weights not found: {model_path_for_testing}")
 
