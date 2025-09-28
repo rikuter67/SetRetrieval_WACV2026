@@ -22,7 +22,6 @@ def setup_gpu_memory():
     if gpus:
         try:
             for gpu in gpus: tf.config.experimental.set_memory_growth(gpu, True)
-            print("🚀 GPU setup completed")
         except RuntimeError as e: print(f"GPU setup error: {e}")
 
 def clear_memory():

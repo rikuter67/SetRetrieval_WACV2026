@@ -76,7 +76,7 @@ def create_output_dir(args: argparse.Namespace) -> str:
         return args.output_dir
         
     components = [
-        f"Epoch{args.epochs}"
+        f"Epoch{args.epochs}",
         f"batch{args.batch_size}",
         f"L{args.num_layers}",
         f"H{args.num_heads}",
@@ -89,7 +89,15 @@ def create_output_dir(args: argparse.Namespace) -> str:
         components.append("use_tpaneg")
     if args.use_cycle_loss:
         components.append("use_cycle_loss")
-        components.append(f"lambda{args.cycle_lambda}")
+        if args.use_dynamic_cycle:
+            components.append("dynamic_cycle")
+            components.append(f"base{args.base_cycle_ratio}")
+            components.append(f"sens{args.quality_sensitivity}")
+            components.append(f"prog{args.epoch_progression_factor}")
+            components.append(f"min{args.min_cycle_ratio}")
+            components.append(f"max{args.max_cycle_ratio}")
+        else:
+            components.append(f"lambda{args.cycle_lambda}")
     
     if args.use_tpaneg:
         components.append(f"TaNegInit{args.taneg_t_gamma_init}")
@@ -190,7 +198,7 @@ def main():
     parser.add_argument('--model_path', default=None, help="Path to pre-trained model weights for testing.")
 
     parser.add_argument('--feature_dim', type=int, default=512)
-    parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--num_heads', type=int, default=2)
     parser.add_argument('--num_layers', type=int, default=2)
     parser.add_argument('--hidden_dim', type=int, default=512)
@@ -216,6 +224,14 @@ def main():
     parser.add_argument('--taneg_curriculum_epochs', type=int, default=100, help='Number of epochs over which TaNeg T_gamma linearly increases.')
     parser.add_argument('--paneg_epsilon', type=float, default=0.2, help='Epsilon (ε) margin for Prediction-Aware Negative selection (PaNeg). Fixed during training.')
     
+    # Dynamic Cycle Weighting パラメータ
+    parser.add_argument('--use_dynamic_cycle', action='store_true', help='Enable dynamic cycle weighting (only works with --use_cycle_loss)')
+    parser.add_argument('--base_cycle_ratio', type=float, default=0.05, help='Base cycle ratio for dynamic weighting (default: 0.05)')
+    parser.add_argument('--quality_sensitivity', type=float, default=2.0, help='Quality sensitivity factor for dynamic weighting (default: 2.0)')
+    parser.add_argument('--epoch_progression_factor', type=float, default=1.5, help='Epoch progression factor for dynamic weighting (default: 1.5)')
+    parser.add_argument('--min_cycle_ratio', type=float, default=0.01, help='Minimum cycle ratio limit (default: 0.01)')
+    parser.add_argument('--max_cycle_ratio', type=float, default=0.20, help='Maximum cycle ratio limit (default: 0.20)')
+
     args = parser.parse_args()
 
     model_path_for_testing = args.model_path
@@ -268,7 +284,14 @@ def main():
     model = SetRetrieval(
         feature_dim=args.feature_dim, num_heads=args.num_heads, num_layers=args.num_layers, num_categories=num_categories,  hidden_dim=args.hidden_dim, 
         temperature=args.temperature, dropout_rate=args.dropout_rate, k_values=args.topk_values, use_cycle_loss=args.use_cycle_loss, cycle_lambda=args.cycle_lambda, cluster_centering=args.use_cluster_centering, 
-        use_tpaneg=args.use_tpaneg,taneg_t_gamma_init=args.taneg_t_gamma_init, taneg_t_gamma_final=args.taneg_t_gamma_final, taneg_curriculum_epochs=args.taneg_curriculum_epochs, paneg_epsilon=args.paneg_epsilon 
+        use_tpaneg=args.use_tpaneg,taneg_t_gamma_init=args.taneg_t_gamma_init, taneg_t_gamma_final=args.taneg_t_gamma_final, taneg_curriculum_epochs=args.taneg_curriculum_epochs, paneg_epsilon=args.paneg_epsilon,
+        # Dynamic Cycle パラメータ
+        use_dynamic_cycle=args.use_dynamic_cycle,
+        base_cycle_ratio=args.base_cycle_ratio,
+        quality_sensitivity=args.quality_sensitivity,
+        epoch_progression_factor=args.epoch_progression_factor,
+        min_cycle_ratio=args.min_cycle_ratio,
+        max_cycle_ratio=args.max_cycle_ratio
     )
 
     centers_path = os.path.join(dataset_path, 'category_centers.pkl.gz')
@@ -300,7 +323,6 @@ def main():
         print(f"\n--- Starting Training with TopK={args.topk_values} ---")
 
         model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=args.learning_rate), 
-                         loss=None, 
                          metrics=model.metrics)
         
         callbacks = [

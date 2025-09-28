@@ -203,48 +203,154 @@ class Transformer(Model):
         return tf.squeeze(predictions, axis=0)
 
 
+def simple_percentile(values, q):
+    """tensorflow-probability不要のpercentile計算"""
+    sorted_values = tf.sort(values)
+    n = tf.cast(tf.shape(sorted_values)[0], tf.float32)
+    index = (q / 100.0) * (n - 1)
+    lower_idx = tf.cast(tf.floor(index), tf.int32)
+    upper_idx = tf.minimum(lower_idx + 1, tf.cast(n - 1, tf.int32))
+    
+    lower_val = sorted_values[lower_idx]
+    upper_val = sorted_values[upper_idx]
+    weight = index - tf.cast(lower_idx, tf.float32)
+    
+    return lower_val + weight * (upper_val - lower_val)
+
+class DynamicCycleRatioWeighter:
+    def __init__(self, base_cycle_ratio=0.05, total_epochs=1000, 
+                 quality_sensitivity=2.0, epoch_progression_factor=1.5,
+                 min_cycle_ratio=0.01, max_cycle_ratio=0.20):
+        self.base_cycle_ratio = base_cycle_ratio
+        self.total_epochs = total_epochs
+        self.quality_sensitivity = quality_sensitivity
+        self.epoch_progression_factor = epoch_progression_factor
+        self.min_cycle_ratio = min_cycle_ratio
+        self.max_cycle_ratio = max_cycle_ratio
+    
+    def _normalize_losses(self, losses):
+        """損失を0-1範囲に正規化"""
+        # 有効な損失のみを処理
+        valid_losses = tf.boolean_mask(losses, losses > 1e-8)
+        
+        def handle_insufficient_data():
+            return tf.ones_like(losses) * 0.5
+        
+        def normalize_valid_data():
+            q25 = simple_percentile(valid_losses, 25.0)
+            q75 = simple_percentile(valid_losses, 75.0)
+            iqr = q75 - q25 + 1e-6
+            normalized = (losses - q25) / iqr
+            return tf.clip_by_value(normalized, 0.0, 1.0)
+        
+        return tf.cond(
+            tf.shape(valid_losses)[0] > 10,
+            normalize_valid_data,
+            handle_insufficient_data
+        )
+    
+    def compute_prediction_quality_scores(self, forward_losses, cycle_losses):
+        """予測品質スコアを計算"""
+        forward_norm = self._normalize_losses(forward_losses)
+        cycle_norm = self._normalize_losses(cycle_losses)
+        
+        # forward重視の品質スコア (低損失=高品質)
+        quality_scores = 1.0 - (0.7 * forward_norm + 0.3 * cycle_norm)
+        quality_scores = tf.pow(quality_scores, self.quality_sensitivity)
+        
+        return tf.clip_by_value(quality_scores, 0.0, 1.0)
+    
+    def get_epoch_progression_multiplier(self, epoch):
+        """学習進捗倍率"""
+        progress = tf.minimum(tf.cast(epoch, tf.float32) / self.total_epochs, 1.0)
+        multiplier = 0.5 + (self.epoch_progression_factor - 0.5) * tf.pow(progress, 0.7)
+        return multiplier
+    
+    def compute_dynamic_cycle_ratios(self, forward_losses, cycle_losses, epoch):
+        """動的cycle損失割合を計算"""
+        quality_scores = self.compute_prediction_quality_scores(forward_losses, cycle_losses)
+        epoch_multiplier = self.get_epoch_progression_multiplier(epoch)
+        
+        # 品質に基づく倍率 (0.2〜3.0倍)
+        quality_multiplier = 0.2 + 2.8 * quality_scores
+        
+        cycle_ratios = self.base_cycle_ratio * quality_multiplier * epoch_multiplier
+        
+        return tf.clip_by_value(cycle_ratios, self.min_cycle_ratio, self.max_cycle_ratio)
+    
+    def apply_dynamic_weighting(self, contrastive_loss, cycle_losses, 
+                              forward_losses, epoch, reduction='mean'):
+        """動的重み付きで損失を結合"""
+        cycle_ratios = self.compute_dynamic_cycle_ratios(forward_losses, cycle_losses, epoch)
+        weighted_cycle_losses = cycle_ratios * cycle_losses
+        
+        if reduction == 'mean':
+            aggregated_cycle_loss = tf.reduce_mean(weighted_cycle_losses)
+        else:
+            aggregated_cycle_loss = tf.reduce_sum(weighted_cycle_losses)
+        
+        total_loss = contrastive_loss + aggregated_cycle_loss
+        
+        debug_info = {
+            'avg_cycle_ratio': tf.reduce_mean(cycle_ratios),
+            'cycle_ratio_range': (tf.reduce_min(cycle_ratios), tf.reduce_max(cycle_ratios)),
+            'contrastive_loss': contrastive_loss,
+            'weighted_cycle_loss': aggregated_cycle_loss,
+            'epoch': epoch
+        }
+        
+        return total_loss, debug_info
+
 class SetRetrieval(Transformer):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, use_dynamic_cycle=False, base_cycle_ratio=0.05, 
+                 quality_sensitivity=2.0, epoch_progression_factor=1.5,
+                 min_cycle_ratio=0.01, max_cycle_ratio=0.20, *args, **kwargs):
         if 'use_clcatneg' in kwargs:
             kwargs['use_tpaneg'] = kwargs.pop('use_clcatneg')
         super().__init__(*args, **kwargs)
 
-        self.validation_loss_tracker = tf.keras.metrics.Mean(name="loss") 
+        self.validation_loss_tracker = tf.keras.metrics.Mean(name="val_loss") 
         self.reconstruct_x_loss_tracker = tf.keras.metrics.Mean(name="L_RecX")
         self.reconstruct_y_loss_tracker = tf.keras.metrics.Mean(name="L_RecY")
 
         self.initial_taneg_t_gamma_curr = self.taneg_t_gamma_init
         self.final_taneg_t_gamma_curr = self.taneg_t_gamma_final
         self.taneg_curriculum_epochs_val = self.taneg_curriculum_epochs
-        self.current_epoch = 0 
-
-    def set_current_epoch(self, epoch):
-        self.current_epoch = epoch
-        current_t_gamma = self.get_current_taneg_t_gamma()
-        if epoch % 10 == 0:
-            print(f"📚 Epoch {epoch}: TaNeg T_gamma = {current_t_gamma:.3f}")
-
-    def get_current_taneg_t_gamma(self):
-        if self.current_epoch >= self.taneg_curriculum_epochs_val:
-            return self.final_taneg_t_gamma_curr
+        self.current_epoch = 0
         
-        progress = self.current_epoch / self.taneg_curriculum_epochs_val
-        current_t_gamma = self.initial_taneg_t_gamma_curr + (self.final_taneg_t_gamma_curr - self.initial_taneg_t_gamma_curr) * progress
-        return current_t_gamma
+        # Dynamic Cycle Weighter の設定
+        self.use_dynamic_cycle = use_dynamic_cycle
+        if self.use_dynamic_cycle and self.use_cycle_loss:
+            self.dynamic_cycle_weighter = DynamicCycleRatioWeighter(
+                base_cycle_ratio=base_cycle_ratio,
+                total_epochs=1000,
+                quality_sensitivity=quality_sensitivity,
+                epoch_progression_factor=epoch_progression_factor,
+                min_cycle_ratio=min_cycle_ratio,
+                max_cycle_ratio=max_cycle_ratio
+            )
+        else:
+            self.dynamic_cycle_weighter = None
 
-    @property
-    def metrics(self):
-        common_metrics = [self.loss_tracker, self.xy_loss_tracker, self.yx_loss_tracker]
-        all_topk_metrics = list(self.topk_metrics.values())
-        val_main_loss_metric = [self.validation_loss_tracker]
-        reconstruction_metrics = [self.reconstruct_x_loss_tracker, self.reconstruct_y_loss_tracker]
-        return common_metrics + reconstruction_metrics + all_topk_metrics + val_main_loss_metric
+    def compile(self, optimizer, **kwargs):
+        """TensorFlowのloss期待問題を解決"""
+        def dummy_loss(y_true, y_pred):
+            return tf.constant(0.0)
+        
+        super().compile(
+            optimizer=optimizer,
+            loss=dummy_loss,
+            **kwargs
+        )
 
     @tf.function
-    def train_step(self, data): # dict_keys(['query_features', 'target_features', 'query_categories', 'target_categories', 'query_item_ids', 'target_item_ids', 'candidate_negative_features', 'candidate_negative_masks', 'query_candidate_negative_features', 'query_candidate_negative_masks'])
+    def train_step(self, data):
+        cycle_loss_X = tf.constant(0.0)
+        cycle_loss_Y = tf.constant(0.0)
+        
         with tf.GradientTape() as tape:
-            pred_Y = self({'query_features': data['query_features']}, training=True) # X -> Y' pred_Y : TensorShape([64, 11, 512]) , data['query_features'] : TensorShape([64, 20, 512])
-            pred_X = self({'query_features': data['target_features']}, training=True) # Y -> X' pred_X : TensorShape([64, 11, 512]) , data['target_features'] : TensorShape([64, 20, 512])
+            pred_Y = self({'query_features': data['query_features']}, training=True)
+            pred_X = self({'query_features': data['target_features']}, training=True)
 
             if self.use_tpaneg:
                 current_taneg_t_gamma = self.get_current_taneg_t_gamma()
@@ -255,7 +361,6 @@ class SetRetrieval(Transformer):
                 total_loss = loss_X_to_Y + loss_Y_to_X
 
                 if self.use_cycle_loss:
-                    # Cycle loss is not part of the current debugging, so this branch is not used.
                     reconst_input_Y = self._get_predictions_for_items(pred_Y, data['target_categories'])
                     reconst_input_X = self._get_predictions_for_items(pred_X, data['query_categories'])
                     
@@ -267,69 +372,193 @@ class SetRetrieval(Transformer):
                     total_loss += self.cycle_lambda * (cycle_loss_X + cycle_loss_Y)
 
             else: 
-                loss_X_to_Y = self.in_batch_loss(pred_Y, data['target_features'], data['target_categories'] ) # X -> Y' <=> Y <tf.Tensor: shape=(), dtype=float32, numpy=3.118135452270508>
-                loss_Y_to_X = self.in_batch_loss(pred_X, data['query_features'], data['query_categories']) # Y -> X' <=> <tf.Tensor: shape=(), dtype=float32, numpy=3.1540865898132324>
-
-                total_loss = loss_X_to_Y + loss_Y_to_X
-
-                if self.use_cycle_loss:
-                    # Cycle loss is not part of the current debugging, so this branch is not used.
-                    reconst_input_Y = self._get_predictions_for_items(pred_Y, data['target_categories']) # Y' -> X" reconstructed_X : TensorShape([64, 11, 512]) , pred_Y : TensorShape([64, 11, 512])
-                    reconst_input_X = self._get_predictions_for_items(pred_X, data['query_categories']) # X' -> Y" reconstructed_Y : TensorShape([64, 11, 512]) , pred_X : TensorShape([64, 11, 512])
+                if self.use_cycle_loss and self.use_dynamic_cycle and self.dynamic_cycle_weighter:
+                    # === Dynamic Cycle Weighting適用 ===
+                    reconst_input_Y = self._get_predictions_for_items(pred_Y, data['target_categories'])
+                    reconst_input_X = self._get_predictions_for_items(pred_X, data['query_categories'])
+                    
+                    reconstructed_X = self({'query_features': reconst_input_Y}, training=True)
+                    reconstructed_Y = self({'query_features': reconst_input_X}, training=True)
+                    
+                    # X->Y direction with dynamic weighting
+                    loss_X_to_Y, debug_info_XY = self._compute_dynamic_weighted_cycle_loss(
+                        pred_Y, data['target_features'], data['target_categories'],
+                        reconstructed_X, data['query_features'], data['query_categories'],
+                        self.current_epoch
+                    )
+                    
+                    # Y->X direction with dynamic weighting  
+                    loss_Y_to_X, debug_info_YX = self._compute_dynamic_weighted_cycle_loss(
+                        pred_X, data['query_features'], data['query_categories'],
+                        reconstructed_Y, data['target_features'], data['target_categories'],
+                        self.current_epoch
+                    )
+                    
+                    total_loss = loss_X_to_Y + loss_Y_to_X
+                    
+                    cycle_loss_X = debug_info_XY['weighted_cycle_loss']
+                    cycle_loss_Y = debug_info_YX['weighted_cycle_loss']
+                    
+                    # Dynamic weighting統計を定期的に出力
+                    if tf.equal(tf.cast(self.optimizer.iterations, tf.int32) % 50, 0):
+                        tf.print("🎯 Dynamic Cycle Stats - Epoch", self.current_epoch, ":")
+                        tf.print("   Avg cycle ratio:", debug_info_XY['avg_cycle_ratio'])
+                        tf.print("   Cycle ratio range: [", debug_info_XY['cycle_ratio_range'][0], ",", debug_info_XY['cycle_ratio_range'][1], "]")
+                        
+                elif self.use_cycle_loss:
+                    # === 通常のstatic cycle loss ===
+                    reconst_input_Y = self._get_predictions_for_items(pred_Y, data['target_categories'])
+                    reconst_input_X = self._get_predictions_for_items(pred_X, data['query_categories'])
                     
                     reconstructed_X = self({'query_features': reconst_input_Y}, training=True)
                     reconstructed_Y = self({'query_features': reconst_input_X}, training=True)
                     
                     cycle_loss_X = self.in_batch_loss(reconstructed_X, data['query_features'], data['query_categories'])
                     cycle_loss_Y = self.in_batch_loss(reconstructed_Y, data['target_features'], data['target_categories'])
-                    total_loss += self.cycle_lambda * (cycle_loss_X + cycle_loss_Y)
-
-                # pdb.set_trace()
+                    
+                    loss_X_to_Y = self.in_batch_loss(pred_Y, data['target_features'], data['target_categories'])
+                    loss_Y_to_X = self.in_batch_loss(pred_X, data['query_features'], data['query_categories'])
+                    
+                    total_loss = loss_X_to_Y + loss_Y_to_X + self.cycle_lambda * (cycle_loss_X + cycle_loss_Y)
+                else:
+                    # cycle無し - 通常のin-batch loss
+                    loss_X_to_Y = self.in_batch_loss(pred_Y, data['target_features'], data['target_categories'])
+                    loss_Y_to_X = self.in_batch_loss(pred_X, data['query_features'], data['query_categories'])
+                    total_loss = loss_X_to_Y + loss_Y_to_X
 
         gradients = tape.gradient(total_loss, self.trainable_variables)
-
-
         self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
 
         self.loss_tracker.update_state(total_loss)
         self.xy_loss_tracker.update_state(loss_X_to_Y)
         self.yx_loss_tracker.update_state(loss_Y_to_X)
+        
         if self.use_cycle_loss:
             self.reconstruct_x_loss_tracker.update_state(cycle_loss_X)
             self.reconstruct_y_loss_tracker.update_state(cycle_loss_Y)
 
         self.train_topk_metric.update_state(pred_Y, data['target_features'], data['target_categories'])
         
-        results = {"loss": self.loss_tracker.result(), "X->Y' Loss": self.xy_loss_tracker.result(), "Y'->X' Loss": self.yx_loss_tracker.result()}
+        results = {
+            "loss": self.loss_tracker.result(), 
+            "X->Y' Loss": self.xy_loss_tracker.result(), 
+            "Y'->X' Loss": self.yx_loss_tracker.result()
+        }
         
-        # Top-K結果を追加
         topk_results = self.train_topk_metric.result()
         if isinstance(topk_results, dict):
             results.update(topk_results)
         
         return results
 
+    @tf.function
+    def _compute_dynamic_weighted_cycle_loss(self, predictions, target_features, target_categories,
+                                           cycle_predictions, cycle_targets, cycle_categories, epoch):
+        """Dynamic Cycle Weighting を適用したcycle損失計算"""
+        # 1. Forward損失を各アイテム別に計算
+        forward_losses = self._compute_per_item_forward_losses(predictions, target_features, target_categories)
+        
+        # 2. Cycle損失を各アイテム別に計算
+        cycle_losses = self._compute_per_item_cycle_losses(cycle_predictions, cycle_targets, cycle_categories)
+        
+        # 3. Contrastive損失（通常の）
+        contrastive_loss = self.in_batch_loss(predictions, target_features, target_categories)
+        
+        # 4. Dynamic weighting適用
+        total_loss, debug_info = self.dynamic_cycle_weighter.apply_dynamic_weighting(
+            contrastive_loss=contrastive_loss,
+            cycle_losses=cycle_losses,
+            forward_losses=forward_losses,
+            epoch=epoch,
+            reduction='mean'
+        )
+        
+        return total_loss, debug_info
 
     @tf.function
+    def _compute_per_item_forward_losses(self, predictions, target_features, target_categories):
+        """アイテム別forward損失計算"""
+        B, S, D = tf.shape(target_features)[0], tf.shape(target_features)[1], tf.shape(target_features)[2]
+        
+        target_feats_flat = tf.reshape(target_features, [-1, D])
+        target_cats_flat = tf.reshape(target_categories, [-1])
+        
+        batch_indices = tf.range(B, dtype=tf.int32)
+        item_indices = tf.range(S, dtype=tf.int32)
+        grid_b, grid_i = tf.meshgrid(batch_indices, item_indices, indexing='ij')
+        original_flat_batch_indices = tf.reshape(grid_b, [-1])
+        
+        is_valid_item_mask = tf.logical_and(
+            target_cats_flat > 0,
+            tf.reduce_sum(tf.abs(target_feats_flat), axis=-1) > 1e-6
+        )
+        
+        preds_indices_for_gather = tf.stack([original_flat_batch_indices, tf.maximum(0, target_cats_flat - 1)], axis=1)
+        preds_for_items_flat = tf.gather_nd(predictions, preds_indices_for_gather)
+        
+        preds_norm = tf.nn.l2_normalize(preds_for_items_flat + 1e-8, axis=-1)
+        targets_norm = tf.nn.l2_normalize(target_feats_flat + 1e-8, axis=-1)
+        
+        # 各アイテムのforward品質を類似度で評価
+        similarities = tf.reduce_sum(preds_norm * targets_norm, axis=-1)
+        forward_losses = 1.0 - similarities
+        
+        # 無効アイテムは損失0
+        forward_losses = tf.where(is_valid_item_mask, forward_losses, 0.0)
+        
+        return forward_losses
+
+    @tf.function  
+    def _compute_per_item_cycle_losses(self, cycle_predictions, cycle_targets, cycle_categories):
+        """アイテム別cycle損失計算"""
+        B, S, D = tf.shape(cycle_targets)[0], tf.shape(cycle_targets)[1], tf.shape(cycle_targets)[2]
+        
+        cycle_targets_flat = tf.reshape(cycle_targets, [-1, D])
+        cycle_cats_flat = tf.reshape(cycle_categories, [-1])
+        
+        batch_indices = tf.range(B, dtype=tf.int32)
+        item_indices = tf.range(S, dtype=tf.int32)
+        grid_b, grid_i = tf.meshgrid(batch_indices, item_indices, indexing='ij')
+        original_flat_batch_indices = tf.reshape(grid_b, [-1])
+        
+        is_valid_item_mask = tf.logical_and(
+            cycle_cats_flat > 0,
+            tf.reduce_sum(tf.abs(cycle_targets_flat), axis=-1) > 1e-6
+        )
+        
+        cycle_preds_indices = tf.stack([original_flat_batch_indices, tf.maximum(0, cycle_cats_flat - 1)], axis=1)
+        cycle_preds_flat = tf.gather_nd(cycle_predictions, cycle_preds_indices)
+        
+        cycle_preds_norm = tf.nn.l2_normalize(cycle_preds_flat + 1e-8, axis=-1)
+        cycle_targets_norm = tf.nn.l2_normalize(cycle_targets_flat + 1e-8, axis=-1)
+        
+        # Cycle一貫性を類似度で評価
+        cycle_similarities = tf.reduce_sum(cycle_preds_norm * cycle_targets_norm, axis=-1)
+        cycle_losses = 1.0 - cycle_similarities
+        
+        # 無効アイテムは損失0
+        cycle_losses = tf.where(is_valid_item_mask, cycle_losses, 0.0)
+        
+        return cycle_losses
+
     def test_step(self, data):
+        """検証ステップ"""
         pred_Y = self({'query_features': data['query_features']}, training=False)
         
-        current_taneg_t_gamma = self.get_current_taneg_t_gamma()
-        
         if self.use_tpaneg and 'candidate_negative_features' in data:
-            val_loss = self.tpaneg_loss(pred_Y, data['target_features'], data['target_categories'], data['candidate_negative_features'], data['candidate_negative_masks'], current_taneg_t_gamma)
+            current_taneg_t_gamma = self.get_current_taneg_t_gamma()
+            val_loss = self.tpaneg_loss(pred_Y, data['target_features'], data['target_categories'], 
+                                       data['candidate_negative_features'], data['candidate_negative_masks'], current_taneg_t_gamma)
         else:
             val_loss = self.in_batch_loss(pred_Y, data['target_features'], data['target_categories'])
         
         self.validation_loss_tracker.update_state(val_loss)
-
         self.val_topk_metric.update_state(pred_Y, data['target_features'], data['target_categories'])
-
-        results = {"loss": self.validation_loss_tracker.result()}
         
-        topk_results = self.val_topk_metric.result()
-        if isinstance(topk_results, dict):
-            for k, v in topk_results.items():
+        results = {"loss": self.validation_loss_tracker.result()}
+        val_topk_results = self.val_topk_metric.result()
+        if isinstance(val_topk_results, dict):
+            for k, v in val_topk_results.items():
                 results[f"val_{k}"] = v
         
         return results
