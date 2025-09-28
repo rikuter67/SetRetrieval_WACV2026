@@ -24,20 +24,17 @@ tf.config.optimizer.set_jit(False)
 tf.config.experimental.enable_op_determinism()
 
 class TimeHistory(tf.keras.callbacks.Callback):
-    """学習時間（エポックごと）を計測し、最後に平均を出力するコールバック"""
+    """Callback that measures learning time (per epoch) and outputs the average at the end"""
     def on_train_begin(self, logs={}):
-        # 学習開始時に時間のリストを初期化
         self.epoch_times = []
         print("⏱️  Training time measurement started.")
 
     def on_epoch_begin(self, epoch, logs={}):
-        # エポック開始時に時刻を記録
         self.epoch_start_time = time.perf_counter()
 
     def on_epoch_end(self, epoch, logs={}):
-        # エポック終了時に経過時間を計算してリストに追加
         elapsed_seconds = time.perf_counter() - self.epoch_start_time
-        # 最初の1エポックはデータ準備などで遅いことがあるため、平均計算からは除外
+        # The first epoch is excluded from the average calculation.
         if epoch > 0:
             self.epoch_times.append(elapsed_seconds)
         print(f"Epoch {epoch+1} Time: {elapsed_seconds:.2f} seconds")

@@ -83,9 +83,9 @@ def plot_training_curves(history_data, output_dir, dataset_name="Unknown"):
         # print(f"[DEBUG] Available history keys: {list(history_data.keys())}")
         
         # データの詳細をチェック
-        for key, values in history_data.items():
-            if isinstance(values, (list, np.ndarray)) and len(values) > 0:
-                print(f"[DEBUG] {key}: {len(values)} values, sample: {values[0]}, type: {type(values[0])}")
+        # for key, values in history_data.items():
+        #     if isinstance(values, (list, np.ndarray)) and len(values) > 0:
+        #         print(f"[DEBUG] {key}: {len(values)} values, sample: {values[0]}, type: {type(values[0])}")
         
         # Extract available metrics from history
         epochs = list(range(1, len(history_data.get('loss', [0])) + 1))
@@ -789,7 +789,7 @@ def generate_qualitative_examples(model, test_items, gallery, image_path_map, co
         samples = random.sample(filtered_items, num_samples)
         
         # ★ 修正：カテゴリ別ギャラリーを構築
-        print(f"[DEBUG] Building category-specific galleries...")
+        # print(f"[DEBUG] Building category-specific galleries...")
         category_galleries = {}  # カテゴリID -> {item_id: feature}
         
         for cat_id, cat_data in gallery.items():
@@ -802,9 +802,7 @@ def generate_qualitative_examples(model, test_items, gallery, image_path_map, co
                 for item_id, feature in zip(item_ids, features):
                     category_galleries[cat_id][str(item_id)] = feature
                 
-                print(f"[DEBUG] Category {cat_id}: {len(category_galleries[cat_id])} items")
-            else:
-                print(f"[DEBUG] Category {cat_id}: Invalid structure")
+                # print(f"[DEBUG] Category {cat_id}: {len(category_galleries[cat_id])} items")
         
         # print(f"[DEBUG] Built {len(category_galleries)} category galleries")
         
@@ -837,7 +835,7 @@ def generate_qualitative_examples(model, test_items, gallery, image_path_map, co
                 # Get model predictions
                 pred_vectors = model({'query_features': tf.constant(q_feats[np.newaxis, ...])}).numpy()[0]
                 
-                print(f"[DEBUG] Sample {i+1}: pred_vectors shape = {pred_vectors.shape}, targets = {valid_target_count}")
+                # print(f"[DEBUG] Sample {i+1}: pred_vectors shape = {pred_vectors.shape}, targets = {valid_target_count}")
                 
                 # Load query images
                 query_imgs = []
@@ -861,7 +859,7 @@ def generate_qualitative_examples(model, test_items, gallery, image_path_map, co
                             target_ids_for_collage.append(str(tid))
                             valid_target_cats.append(tcat)
                 
-                print(f"[DEBUG] Loaded {len(target_imgs)} target images (expected: {valid_target_count})")
+                # print(f"[DEBUG] Loaded {len(target_imgs)} target images (expected: {valid_target_count})")
                 
                 # ★ 修正：除外リストを作成
                 exclude_ids = set(str(qid) for qid in q_ids if qid != '0' and qid != 0)
@@ -871,7 +869,7 @@ def generate_qualitative_examples(model, test_items, gallery, image_path_map, co
                 retrieved_results = []
                 
                 for j, t_cat in enumerate(valid_target_cats):
-                    print(f"[DEBUG] Processing target category {t_cat} (index {j})")
+                    # print(f"[DEBUG] Processing target category {t_cat} (index {j})")
                     
                     if t_cat > 0 and t_cat <= len(pred_vectors):
                         query_vec = pred_vectors[t_cat - 1]  # Convert to 0-based index
@@ -879,17 +877,17 @@ def generate_qualitative_examples(model, test_items, gallery, image_path_map, co
                         # ★ 修正：カテゴリ固有のギャラリーを使用
                         if t_cat in category_galleries:
                             category_gallery = category_galleries[t_cat]
-                            print(f"[DEBUG] Using category {t_cat} specific gallery with {len(category_gallery)} items")
+                            # print(f"[DEBUG] Using category {t_cat} specific gallery with {len(category_gallery)} items")
                             
                             # ★ カテゴリ固有の検索を実行
                             similar_items = find_topk_similar_items(
                                 query_vec, category_gallery, k=top_k, exclude_ids=exclude_ids
                             )
                             
-                            print(f"[DEBUG] Found {len(similar_items)} similar items for category {t_cat}")
+                            # print(f"[DEBUG] Found {len(similar_items)} similar items for category {t_cat}")
                             
                         else:
-                            print(f"[WARN] Category {t_cat} not found in galleries. Available: {list(category_galleries.keys())}")
+                            # print(f"[WARN] Category {t_cat} not found in galleries. Available: {list(category_galleries.keys())}")
                             similar_items = []
                         
                         # Load retrieved images
@@ -906,13 +904,13 @@ def generate_qualitative_examples(model, test_items, gallery, image_path_map, co
                                 # print(f"[DEBUG] Created placeholder for: {item_id}")
                         
                         retrieved_results.append(retrieved_imgs)
-                        print(f"[DEBUG] Added {len(retrieved_imgs)} retrieved images for category {t_cat}")
+                        # print(f"[DEBUG] Added {len(retrieved_imgs)} retrieved images for category {t_cat}")
                         
                     else:
-                        print(f"[DEBUG] Invalid category {t_cat} (pred_vectors length: {len(pred_vectors)})")
+                        # print(f"[DEBUG] Invalid category {t_cat} (pred_vectors length: {len(pred_vectors)})")
                         retrieved_results.append([])
                 
-                print(f"[DEBUG] Total retrieved results: {len(retrieved_results)} lists")
+                # print(f"[DEBUG] Total retrieved results: {len(retrieved_results)} lists")
 
                 # ✅ 有効なカテゴリ情報を抽出
                 query_cats_for_collage = []
@@ -950,10 +948,10 @@ def generate_qualitative_examples(model, test_items, gallery, image_path_map, co
                 )
                 
                 generated_count += 1
-                print(f"[INFO] ✅ Generated example {generated_count}: {collage_path}")
+                # print(f"[INFO] ✅ Generated example {generated_count}: {collage_path}")
                 
             except Exception as e:
-                print(f"[ERROR] Failed to process qualitative example {i+1}: {e}")
+                # print(f"[ERROR] Failed to process qualitative example {i+1}: {e}")
                 import traceback
                 traceback.print_exc()
                 continue
