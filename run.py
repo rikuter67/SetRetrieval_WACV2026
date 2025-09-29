@@ -198,7 +198,7 @@ def main():
     parser.add_argument('--dropout_rate', type=float, default=0.1, help="Dropout rate for regularization")
     parser.add_argument('--seed', type=int, default=42, help="Random seed for reproducibility.")
 
-    parser.add_argument('--topk_values', type=int, nargs='+', default=[5, 10, 20], help="TopK values to track.")
+    parser.add_argument('--topk_values', type=int, nargs='+', default=[1, 5, 10, 20], help="TopK values to track.")
     parser.add_argument('--use_weighted_topk', action='store_true', help='Enable weighted TopK accuracy metrics during evaluation')
     parser.add_argument('--use_cluster_centering', action='store_true', help='Cluster center base loss')
     parser.add_argument('--use_whitening', action='store_true', help='Enable whitening transformation during evaluation')
