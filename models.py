@@ -439,16 +439,26 @@ class SetRetrieval(Transformer):
 
         self.train_topk_metric.update_state(pred_Y, data['target_features'], data['target_categories'])
         
+        for k in self.k_values:
+            metric_name = f'top{k}_accuracy'
+            if metric_name in self.topk_metrics:
+                self.topk_metrics[metric_name].update_state(
+                    pred_Y, 
+                    data['target_features'], 
+                    data['target_categories']
+                )
+
         results = {
             "loss": self.loss_tracker.result(), 
             "X->Y' Loss": self.xy_loss_tracker.result(), 
             "Y'->X' Loss": self.yx_loss_tracker.result()
         }
         
-        topk_results = self.train_topk_metric.result()
-        if isinstance(topk_results, dict):
-            results.update(topk_results)
-        
+        for k in self.k_values:
+            metric_name = f'top{k}_accuracy'
+            if metric_name in self.topk_metrics:
+                results[metric_name] = self.topk_metrics[metric_name].result()
+    
         return results
 
     @tf.function

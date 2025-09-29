@@ -115,7 +115,7 @@ def plot_training_curves(history_data, output_dir, dataset_name="Unknown"):
         elif 'loss' in history_data and len(history_data['loss']) > 0:
             train_loss_key = 'loss'
             # print("[DEBUG] Using loss for training loss (fallback)")
-        
+
         if train_loss_key:
             loss_values = history_data[train_loss_key]
             # NumPy配列に変換
@@ -207,7 +207,7 @@ def plot_training_curves(history_data, output_dir, dataset_name="Unknown"):
                     # print(f"[DEBUG] Found training metric: {key} -> train_top{k}")
                 
                 # Validation metrics - 複数のパターンをチェック
-                val_patterns = [f'val_top{k}_accuracy']
+                val_patterns = [f'val_top{k}_accuracy', f'val_val_top{k}_accuracy']
                 for pattern in val_patterns:
                     if key == pattern:
                         metric_mapping[f'val_top{k}'] = key
