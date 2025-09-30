@@ -3,7 +3,7 @@ import tensorflow as tf
 from tensorflow.keras import layers, Model
 from typing import List
 import pdb
-# tf.config.run_functions_eagerly(True)  # debug flag
+tf.config.run_functions_eagerly(True)  # debug flag
 
 class TopKAccuracy(tf.keras.metrics.Metric):
     """
@@ -243,8 +243,8 @@ class SetRetrieval(Transformer):
     @tf.function
     def train_step(self, data): # dict_keys(['query_features', 'target_features', 'query_categories', 'target_categories', 'query_item_ids', 'target_item_ids', 'candidate_negative_features', 'candidate_negative_masks', 'query_candidate_negative_features', 'query_candidate_negative_masks'])
         with tf.GradientTape() as tape:
-            pred_Y = self({'query_features': data['query_features']}, training=True) # X -> Y' pred_Y : TensorShape([64, 11, 512]) , data['query_features'] : TensorShape([64, 20, 512])
-            pred_X = self({'query_features': data['target_features']}, training=True) # Y -> X' pred_X : TensorShape([64, 11, 512]) , data['target_features'] : TensorShape([64, 20, 512])
+            pred_Y = self({'query_features': data['query_features']}, training=True) # X -> Y' pred_Y : TensorShape([64, 11, 512]) , data['query_features'] : TensorShape([64, 10, 512])
+            pred_X = self({'query_features': data['target_features']}, training=True) # Y -> X' pred_X : TensorShape([64, 11, 512]) , data['target_features'] : TensorShape([64, 10, 512])
 
             if self.use_tpaneg:
                 current_taneg_t_gamma = self.get_current_taneg_t_gamma()
@@ -283,8 +283,6 @@ class SetRetrieval(Transformer):
                     cycle_loss_X = self.in_batch_loss(reconstructed_X, data['query_features'], data['query_categories'])
                     cycle_loss_Y = self.in_batch_loss(reconstructed_Y, data['target_features'], data['target_categories'])
                     total_loss += self.cycle_lambda * (cycle_loss_X + cycle_loss_Y)
-
-                # pdb.set_trace()
 
         gradients = tape.gradient(total_loss, self.trainable_variables)
 

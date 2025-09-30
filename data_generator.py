@@ -170,7 +170,7 @@ class DataGenerator(Sequence):
 
         # パディング用の次元情報を保存
         set_sizes = [len(s['features']) for s in self.full_sets]
-        self.max_item_num = max(set_sizes) if set_sizes else 0
+        self.max_item_num = (max(set_sizes) + 1) // 2 if set_sizes else 0
         self.feature_dim = self.full_sets[0]['features'].shape[1] if self.full_sets else 0
         print(f"Data stats: max_items={self.max_item_num}, feature_dim={self.feature_dim}")
 
