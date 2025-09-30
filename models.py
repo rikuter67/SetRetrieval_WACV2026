@@ -148,7 +148,11 @@ class Transformer(Model):
                 'ffn': tf.keras.Sequential([layers.Dense(self.hidden_dim * 2, activation='gelu'), layers.Dropout(self.dropout_rate), layers.Dense(self.hidden_dim)], name=f'ffn_{i}')
             }
             self.cross_attention_layers.append(layer_dict)
-        self.output_projection = layers.Dense(self.feature_dim, activation=None, name='output_projection')
+        self.output_projection = tf.keras.Sequential([
+            layers.Dense(self.hidden_dim, activation='gelu', name='proj_fc1'),
+            layers.Dense(self.hidden_dim // 2, activation='gelu', name='proj_fc2'),
+            layers.Dense(self.feature_dim, activation=None, name='proj_fc3'),
+        ], name='output_projection')
         self.output_norm = layers.LayerNormalization(epsilon=1e-6, name='output_norm')
 
     def _build_topk_metrics(self):
@@ -187,7 +191,8 @@ class Transformer(Model):
             x = layer_dict['norm3'](x + ffn_out, training=training)
 
         predictions = self.output_projection(x)
-        predictions = self.output_norm(predictions) 
+        # predictions = self.output_norm(predictions) 
+        predictions = tf.nn.l2_normalize(predictions, axis=-1)
 
         if self.cluster_centering: # no using in basic
             cluster_centers_normalized = tf.nn.l2_normalize(self.category_centers, axis=-1)
@@ -276,7 +281,7 @@ class SetRetrieval(Transformer):
                     # Cycle loss is not part of the current debugging, so this branch is not used.
                     reconst_input_Y = self._get_predictions_for_items(pred_Y, data['target_categories']) # Y' -> X" reconstructed_X : TensorShape([64, 11, 512]) , pred_Y : TensorShape([64, 11, 512])
                     reconst_input_X = self._get_predictions_for_items(pred_X, data['query_categories']) # X' -> Y" reconstructed_Y : TensorShape([64, 11, 512]) , pred_X : TensorShape([64, 11, 512])
-                    
+
                     reconstructed_X = self({'query_features': reconst_input_Y}, training=True)
                     reconstructed_Y = self({'query_features': reconst_input_X}, training=True)
                     
@@ -285,7 +290,6 @@ class SetRetrieval(Transformer):
                     total_loss += self.cycle_lambda * (cycle_loss_X + cycle_loss_Y)
 
         gradients = tape.gradient(total_loss, self.trainable_variables)
-
 
         self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
 
@@ -332,7 +336,8 @@ class SetRetrieval(Transformer):
         
         return results
 
-    def _get_predictions_for_items(self, predictions, categories): # fix mask
+    def _get_predictions_for_items(self, predictions, categories): # (64, 11, 512)
+        # (64, 11, 512) -> (64, 10, 512)   11 : category_num -- extract the corresponding category --> 10 : max_item_num
         batch_size, set_size = tf.shape(categories)[0], tf.shape(categories)[1]
         
         valid_mask = categories > 0
@@ -346,7 +351,7 @@ class SetRetrieval(Transformer):
         valid_mask_expanded = tf.expand_dims(tf.cast(valid_mask, tf.float32), axis=-1)
         masked_predictions = item_predictions * valid_mask_expanded
         
-        return masked_predictions
+        return masked_predictions # (64, 10, 512)
     
     @tf.function
     def in_batch_loss(self, predictions, target_features, target_categories):
@@ -373,9 +378,13 @@ class SetRetrieval(Transformer):
         preds = tf.where(tf.math.is_finite(preds_for_items_flat), preds_for_items_flat, 0.0)
         targets = tf.where(tf.math.is_finite(target_feats_flat), target_feats_flat, 0.0)
         
-        preds_norm, _ = tf.linalg.normalize(preds + 1e-8, axis=-1)
-        targets_norm, _ = tf.linalg.normalize(targets + 1e-8, axis=-1)
-        
+        # preds_norm, _ = tf.linalg.normalize(preds + 1e-8, axis=-1)
+        # targets_norm, _ = tf.linalg.normalize(targets + 1e-8, axis=-1)
+
+        # No norm version
+        preds_norm = preds
+        targets_norm = targets 
+
         # 2. カテゴリ別の損失計算
         total_loss = 0.0
         total_items_contributing = 0.0 
