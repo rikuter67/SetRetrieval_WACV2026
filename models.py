@@ -3,7 +3,7 @@ import tensorflow as tf
 from tensorflow.keras import layers, Model
 from typing import List
 import pdb
-tf.config.run_functions_eagerly(True)  # debug flag
+# tf.config.run_functions_eagerly(True)  # debug flag
 
 class TopKAccuracy(tf.keras.metrics.Metric):
     """
