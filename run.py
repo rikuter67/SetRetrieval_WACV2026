@@ -348,7 +348,7 @@ def main():
             model=model, test_items=test_items, gallery=gallery,
             image_path_map=build_image_path_map(args.data_dir, args.dataset),
             config=get_dataset_config(args.dataset), output_dir=collage_dir,
-            num_examples=30, top_k=10,
+            num_examples=500, top_k=10,
             min_target_items=4 
         )
         print(f"Image collages saved to: {collage_dir}")
