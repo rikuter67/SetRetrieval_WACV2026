@@ -102,9 +102,10 @@ class TopKAccuracy(tf.keras.metrics.Metric):
 
 
 class Transformer(Model):
-    def __init__(self, feature_dim: int = 512, num_heads: int = 8, num_layers: int = 6, num_categories: int = 16, hidden_dim: int = 512, 
+    def __init__(self, feature_dim: int = 512, num_heads: int = 8, num_layers: int = 6, num_categories: int = 16, hidden_dim: int = 512,
                  temperature: float = 1.0, dropout_rate: float = 0.1, k_values: List[int] = None, use_cycle_loss: bool = False, cycle_lambda: float = 0.1, cluster_centering: bool = False,
-                 use_tpaneg: bool = False, taneg_t_gamma_init: float = 0.5,  taneg_t_gamma_final: float = 0.8,  taneg_curriculum_epochs: int = 100,  paneg_epsilon: float = 0.2, **kwargs):
+                 use_tpaneg: bool = False, taneg_t_gamma_init: float = 0.5,  taneg_t_gamma_final: float = 0.8,  taneg_curriculum_epochs: int = 100,  paneg_epsilon: float = 0.2,
+                 style_loss_weight: float = 0.0, **kwargs):
         super().__init__(**kwargs)
         
         self.feature_dim = feature_dim 
@@ -121,7 +122,9 @@ class Transformer(Model):
         self.cycle_lambda = cycle_lambda
         self.cluster_centering = cluster_centering
 
-        self.use_tpaneg = use_tpaneg 
+        self.style_loss_weight = style_loss_weight
+
+        self.use_tpaneg = use_tpaneg
         self.taneg_t_gamma_init = taneg_t_gamma_init
         self.taneg_t_gamma_final = taneg_t_gamma_final
         self.taneg_curriculum_epochs = taneg_curriculum_epochs
@@ -246,43 +249,63 @@ class SetRetrieval(Transformer):
             pred_Y = self({'query_features': data['query_features']}, training=True) # X -> Y' pred_Y : TensorShape([64, 11, 512]) , data['query_features'] : TensorShape([64, 20, 512])
             pred_X = self({'query_features': data['target_features']}, training=True) # Y -> X' pred_X : TensorShape([64, 11, 512]) , data['target_features'] : TensorShape([64, 20, 512])
 
+            style_term = tf.constant(0.0, dtype=tf.float32)
+            style_weight = tf.constant(self.style_loss_weight, dtype=tf.float32)
+            if self.style_loss_weight > 0.0:
+                forward_style = self.style_loss(pred_Y, data['target_features'], data['target_categories'])
+                backward_style = self.style_loss(pred_X, data['query_features'], data['query_categories'])
+                style_term = style_weight * (forward_style + backward_style)
+
             if self.use_tpaneg:
                 current_taneg_t_gamma = self.get_current_taneg_t_gamma()
-                
+
                 loss_X_to_Y = self.tpaneg_loss(pred_Y, data['target_features'], data['target_categories'], data['candidate_negative_features'], data['candidate_negative_masks'], current_taneg_t_gamma)
                 loss_Y_to_X = self.tpaneg_loss(pred_X, data['query_features'], data['query_categories'], data['query_candidate_negative_features'], data['query_candidate_negative_masks'], current_taneg_t_gamma)
 
-                total_loss = loss_X_to_Y + loss_Y_to_X
+                total_loss = loss_X_to_Y + loss_Y_to_X + style_term
 
                 if self.use_cycle_loss:
                     # Cycle loss is not part of the current debugging, so this branch is not used.
                     reconst_input_Y = self._get_predictions_for_items(pred_Y, data['target_categories'])
                     reconst_input_X = self._get_predictions_for_items(pred_X, data['query_categories'])
-                    
+
                     reconstructed_X = self({'query_features': reconst_input_Y}, training=True)
                     reconstructed_Y = self({'query_features': reconst_input_X}, training=True)
-                    
+
                     cycle_loss_X = self.tpaneg_loss(reconstructed_X, data['query_features'], data['query_categories'], data['query_candidate_negative_features'], data['query_candidate_negative_masks'], current_taneg_t_gamma)
                     cycle_loss_Y = self.tpaneg_loss(reconstructed_Y, data['target_features'], data['target_categories'], data['candidate_negative_features'], data['candidate_negative_masks'], current_taneg_t_gamma)
-                    total_loss += self.cycle_lambda * (cycle_loss_X + cycle_loss_Y)
 
-            else: 
+                    cycle_total = cycle_loss_X + cycle_loss_Y
+                    if self.style_loss_weight > 0.0:
+                        cycle_style_X = self.style_loss(reconstructed_X, data['query_features'], data['query_categories'])
+                        cycle_style_Y = self.style_loss(reconstructed_Y, data['target_features'], data['target_categories'])
+                        cycle_total += style_weight * (cycle_style_X + cycle_style_Y)
+
+                    total_loss += self.cycle_lambda * cycle_total
+
+            else:
                 loss_X_to_Y = self.in_batch_loss(pred_Y, data['target_features'], data['target_categories'] ) # X -> Y' <=> Y <tf.Tensor: shape=(), dtype=float32, numpy=3.118135452270508>
                 loss_Y_to_X = self.in_batch_loss(pred_X, data['query_features'], data['query_categories']) # Y -> X' <=> <tf.Tensor: shape=(), dtype=float32, numpy=3.1540865898132324>
 
-                total_loss = loss_X_to_Y + loss_Y_to_X
+                total_loss = loss_X_to_Y + loss_Y_to_X + style_term
 
                 if self.use_cycle_loss:
                     # Cycle loss is not part of the current debugging, so this branch is not used.
                     reconst_input_Y = self._get_predictions_for_items(pred_Y, data['target_categories']) # Y' -> X" reconstructed_X : TensorShape([64, 11, 512]) , pred_Y : TensorShape([64, 11, 512])
                     reconst_input_X = self._get_predictions_for_items(pred_X, data['query_categories']) # X' -> Y" reconstructed_Y : TensorShape([64, 11, 512]) , pred_X : TensorShape([64, 11, 512])
-                    
+
                     reconstructed_X = self({'query_features': reconst_input_Y}, training=True)
                     reconstructed_Y = self({'query_features': reconst_input_X}, training=True)
-                    
+
                     cycle_loss_X = self.in_batch_loss(reconstructed_X, data['query_features'], data['query_categories'])
                     cycle_loss_Y = self.in_batch_loss(reconstructed_Y, data['target_features'], data['target_categories'])
-                    total_loss += self.cycle_lambda * (cycle_loss_X + cycle_loss_Y)
+                    cycle_total = cycle_loss_X + cycle_loss_Y
+                    if self.style_loss_weight > 0.0:
+                        cycle_style_X = self.style_loss(reconstructed_X, data['query_features'], data['query_categories'])
+                        cycle_style_Y = self.style_loss(reconstructed_Y, data['target_features'], data['target_categories'])
+                        cycle_total += style_weight * (cycle_style_X + cycle_style_Y)
+
+                    total_loss += self.cycle_lambda * cycle_total
 
                 # pdb.set_trace()
 
@@ -313,26 +336,71 @@ class SetRetrieval(Transformer):
     @tf.function
     def test_step(self, data):
         pred_Y = self({'query_features': data['query_features']}, training=False)
-        
+        pred_X = None
+
         current_taneg_t_gamma = self.get_current_taneg_t_gamma()
-        
+
         if self.use_tpaneg and 'candidate_negative_features' in data:
             val_loss = self.tpaneg_loss(pred_Y, data['target_features'], data['target_categories'], data['candidate_negative_features'], data['candidate_negative_masks'], current_taneg_t_gamma)
         else:
             val_loss = self.in_batch_loss(pred_Y, data['target_features'], data['target_categories'])
-        
+
+        if self.style_loss_weight > 0.0:
+            if pred_X is None and 'target_features' in data:
+                pred_X = self({'query_features': data['target_features']}, training=False)
+
+            style_weight = tf.constant(self.style_loss_weight, dtype=tf.float32)
+            forward_style = self.style_loss(pred_Y, data['target_features'], data['target_categories'])
+            backward_style = self.style_loss(pred_X, data['query_features'], data['query_categories']) if pred_X is not None else 0.0
+            val_loss += style_weight * (forward_style + backward_style)
+
         self.validation_loss_tracker.update_state(val_loss)
 
         self.val_topk_metric.update_state(pred_Y, data['target_features'], data['target_categories'])
 
         results = {"loss": self.validation_loss_tracker.result()}
-        
+
         topk_results = self.val_topk_metric.result()
         if isinstance(topk_results, dict):
             for k, v in topk_results.items():
                 results[f"val_{k}"] = v
-        
+
         return results
+
+    @tf.function
+    def style_loss(self, predictions, reference_features, reference_categories):
+        """Permutation-invariant style loss based on Gram matrix alignment."""
+        valid_mask = tf.logical_and(reference_categories > 0,
+                                    tf.reduce_sum(tf.abs(reference_features), axis=-1) > 1e-6)
+        valid_mask_f = tf.cast(valid_mask, tf.float32)
+
+        item_predictions = self._get_predictions_for_items(predictions, reference_categories)
+        item_predictions = tf.where(tf.expand_dims(valid_mask, -1), item_predictions, 0.0)
+        reference_features = tf.where(tf.expand_dims(valid_mask, -1), reference_features, 0.0)
+
+        def compute_gram(features, mask):
+            mask_expanded = tf.expand_dims(mask, -1)
+            masked_features = features * mask_expanded
+            counts = tf.reduce_sum(mask, axis=1, keepdims=True)
+            counts_safe = tf.maximum(counts, tf.ones_like(counts))
+
+            mean = tf.math.divide_no_nan(tf.reduce_sum(masked_features, axis=1, keepdims=True),
+                                         tf.expand_dims(counts_safe, -1))
+            centered = (masked_features - mean) * mask_expanded
+            gram = tf.einsum('bsd,bse->bde', centered, centered)
+            denom = tf.maximum(counts_safe - 1.0, tf.ones_like(counts_safe))
+            gram = tf.math.divide_no_nan(gram, tf.expand_dims(denom, -1))
+            return gram
+
+        pred_gram = compute_gram(item_predictions, valid_mask_f)
+        ref_gram = compute_gram(reference_features, valid_mask_f)
+
+        diff = pred_gram - ref_gram
+        loss_per_batch = tf.reduce_mean(tf.square(diff), axis=[1, 2])
+        loss = tf.reduce_mean(loss_per_batch)
+        loss += 0.0 * tf.reduce_sum(predictions)
+
+        return loss
 
     def _get_predictions_for_items(self, predictions, categories): # fix mask
         batch_size, set_size = tf.shape(categories)[0], tf.shape(categories)[1]
