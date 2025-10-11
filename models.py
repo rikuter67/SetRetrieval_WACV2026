@@ -204,15 +204,28 @@ class Transformer(Model):
 
 
 class SetRetrieval(Transformer):
-    def __init__(self, *args, style_loss_weight: float = 0.0, style_loss_mode: str = "gram",
+    def __init__(self, *args, primary_loss: str = "inbatch", style_loss_weight: float = 0.0, style_loss_mode: str = "gram",
                  style_attention_heads: int = None, style_attention_dim: int = None, **kwargs):
         if 'use_clcatneg' in kwargs:
             kwargs['use_tpaneg'] = kwargs.pop('use_clcatneg')
+
+        self.primary_loss = primary_loss
+        self._valid_primary_losses = {"inbatch", "tpaneg", "style"}
+        if self.primary_loss not in self._valid_primary_losses:
+            raise ValueError(
+                f"Unsupported primary_loss '{self.primary_loss}'. Expected one of {sorted(self._valid_primary_losses)}"
+            )
+
         super().__init__(*args, **kwargs)
 
         self.validation_loss_tracker = tf.keras.metrics.Mean(name="loss")
         self.reconstruct_x_loss_tracker = tf.keras.metrics.Mean(name="L_RecX")
         self.reconstruct_y_loss_tracker = tf.keras.metrics.Mean(name="L_RecY")
+
+        if self.primary_loss == "tpaneg":
+            self.use_tpaneg = True
+        else:
+            self.use_tpaneg = False
 
         self.style_loss_weight = float(style_loss_weight)
         self.style_loss_mode = style_loss_mode
@@ -221,6 +234,9 @@ class SetRetrieval(Transformer):
             raise ValueError(
                 f"Unsupported style_loss_mode '{self.style_loss_mode}'. Expected one of {sorted(self._valid_style_modes)}"
             )
+
+        if self.primary_loss == "style" and self.style_loss_weight <= 0.0:
+            raise ValueError("style_loss_weight must be > 0 when primary_loss is 'style'.")
 
         self.style_loss_tracker = tf.keras.metrics.Mean(name="style_loss")
 
@@ -266,7 +282,7 @@ class SetRetrieval(Transformer):
         val_main_loss_metric = [self.validation_loss_tracker]
         reconstruction_metrics = [self.reconstruct_x_loss_tracker, self.reconstruct_y_loss_tracker]
         metrics = common_metrics + reconstruction_metrics + all_topk_metrics + val_main_loss_metric
-        if self.style_loss_weight > 0.0:
+        if self.primary_loss == "style" or self.style_loss_weight > 0.0:
             metrics = [self.style_loss_tracker] + metrics
         return metrics
 
@@ -277,54 +293,80 @@ class SetRetrieval(Transformer):
             pred_X = self({'query_features': data['target_features']}, training=True) # Y -> X' pred_X : TensorShape([64, 11, 512]) , data['target_features'] : TensorShape([64, 20, 512])
 
             style_loss_value = tf.constant(0.0, dtype=tf.float32)
+            loss_X_to_Y = tf.constant(0.0, dtype=tf.float32)
+            loss_Y_to_X = tf.constant(0.0, dtype=tf.float32)
+            cycle_loss_X = tf.constant(0.0, dtype=tf.float32)
+            cycle_loss_Y = tf.constant(0.0, dtype=tf.float32)
 
-            if self.use_tpaneg:
+            if self.primary_loss == "tpaneg":
                 current_taneg_t_gamma = self.get_current_taneg_t_gamma()
 
-                loss_X_to_Y = self.tpaneg_loss(pred_Y, data['target_features'], data['target_categories'], data['candidate_negative_features'], data['candidate_negative_masks'], current_taneg_t_gamma)
-                loss_Y_to_X = self.tpaneg_loss(pred_X, data['query_features'], data['query_categories'], data['query_candidate_negative_features'], data['query_candidate_negative_masks'], current_taneg_t_gamma)
+                loss_X_to_Y = self.tpaneg_loss(
+                    pred_Y,
+                    data['target_features'],
+                    data['target_categories'],
+                    data['candidate_negative_features'],
+                    data['candidate_negative_masks'],
+                    current_taneg_t_gamma
+                )
+                loss_Y_to_X = self.tpaneg_loss(
+                    pred_X,
+                    data['query_features'],
+                    data['query_categories'],
+                    data['query_candidate_negative_features'],
+                    data['query_candidate_negative_masks'],
+                    current_taneg_t_gamma
+                )
 
                 total_loss = loss_X_to_Y + loss_Y_to_X
 
-                if self.style_loss_weight > 0.0:
-                    style_loss_value = self._style_loss(pred_Y, data['target_features'], data['target_categories'])
-                    style_loss_value += self._style_loss(pred_X, data['query_features'], data['query_categories'])
-                    total_loss += self.style_loss_weight * style_loss_value
+            elif self.primary_loss == "inbatch":
+                loss_X_to_Y = self.in_batch_loss(pred_Y, data['target_features'], data['target_categories'])
+                loss_Y_to_X = self.in_batch_loss(pred_X, data['query_features'], data['query_categories'])
 
-                if self.use_cycle_loss:
-                    # Cycle loss is not part of the current debugging, so this branch is not used.
-                    reconst_input_Y = self._get_predictions_for_items(pred_Y, data['target_categories'])
-                    reconst_input_X = self._get_predictions_for_items(pred_X, data['query_categories'])
-                    
-                    reconstructed_X = self({'query_features': reconst_input_Y}, training=True)
-                    reconstructed_Y = self({'query_features': reconst_input_X}, training=True)
-                    
-                    cycle_loss_X = self.tpaneg_loss(reconstructed_X, data['query_features'], data['query_categories'], data['query_candidate_negative_features'], data['query_candidate_negative_masks'], current_taneg_t_gamma)
-                    cycle_loss_Y = self.tpaneg_loss(reconstructed_Y, data['target_features'], data['target_categories'], data['candidate_negative_features'], data['candidate_negative_masks'], current_taneg_t_gamma)
-                    total_loss += self.cycle_lambda * (cycle_loss_X + cycle_loss_Y)
+                total_loss = loss_X_to_Y + loss_Y_to_X
 
             else:
-                loss_X_to_Y = self.in_batch_loss(pred_Y, data['target_features'], data['target_categories'] ) # X -> Y' <=> Y <tf.Tensor: shape=(), dtype=float32, numpy=3.118135452270508>
-                loss_Y_to_X = self.in_batch_loss(pred_X, data['query_features'], data['query_categories']) # Y -> X' <=> <tf.Tensor: shape=(), dtype=float32, numpy=3.1540865898132324>
+                loss_X_to_Y = self._style_loss(pred_Y, data['target_features'], data['target_categories'])
+                loss_Y_to_X = self._style_loss(pred_X, data['query_features'], data['query_categories'])
 
-                total_loss = loss_X_to_Y + loss_Y_to_X
+                style_loss_value = 0.5 * (loss_X_to_Y + loss_Y_to_X)
+                scale = tf.constant(self.style_loss_weight, dtype=tf.float32)
+                total_loss = scale * (loss_X_to_Y + loss_Y_to_X)
 
-                if self.style_loss_weight > 0.0:
-                    style_loss_value = self._style_loss(pred_Y, data['target_features'], data['target_categories'])
-                    style_loss_value += self._style_loss(pred_X, data['query_features'], data['query_categories'])
-                    total_loss += self.style_loss_weight * style_loss_value
+            if self.use_cycle_loss:
+                reconst_input_Y = self._get_predictions_for_items(pred_Y, data['target_categories'])
+                reconst_input_X = self._get_predictions_for_items(pred_X, data['query_categories'])
 
-                if self.use_cycle_loss:
-                    # Cycle loss is not part of the current debugging, so this branch is not used.
-                    reconst_input_Y = self._get_predictions_for_items(pred_Y, data['target_categories']) # Y' -> X" reconstructed_X : TensorShape([64, 11, 512]) , pred_Y : TensorShape([64, 11, 512])
-                    reconst_input_X = self._get_predictions_for_items(pred_X, data['query_categories']) # X' -> Y" reconstructed_Y : TensorShape([64, 11, 512]) , pred_X : TensorShape([64, 11, 512])
-                    
-                    reconstructed_X = self({'query_features': reconst_input_Y}, training=True)
-                    reconstructed_Y = self({'query_features': reconst_input_X}, training=True)
-                    
+                reconstructed_X = self({'query_features': reconst_input_Y}, training=True)
+                reconstructed_Y = self({'query_features': reconst_input_X}, training=True)
+
+                if self.primary_loss == "tpaneg":
+                    current_taneg_t_gamma = self.get_current_taneg_t_gamma()
+                    cycle_loss_X = self.tpaneg_loss(
+                        reconstructed_X,
+                        data['query_features'],
+                        data['query_categories'],
+                        data['query_candidate_negative_features'],
+                        data['query_candidate_negative_masks'],
+                        current_taneg_t_gamma
+                    )
+                    cycle_loss_Y = self.tpaneg_loss(
+                        reconstructed_Y,
+                        data['target_features'],
+                        data['target_categories'],
+                        data['candidate_negative_features'],
+                        data['candidate_negative_masks'],
+                        current_taneg_t_gamma
+                    )
+                elif self.primary_loss == "inbatch":
                     cycle_loss_X = self.in_batch_loss(reconstructed_X, data['query_features'], data['query_categories'])
                     cycle_loss_Y = self.in_batch_loss(reconstructed_Y, data['target_features'], data['target_categories'])
-                    total_loss += self.cycle_lambda * (cycle_loss_X + cycle_loss_Y)
+                else:
+                    cycle_loss_X = self._style_loss(reconstructed_X, data['query_features'], data['query_categories'])
+                    cycle_loss_Y = self._style_loss(reconstructed_Y, data['target_features'], data['target_categories'])
+
+                total_loss += self.cycle_lambda * (cycle_loss_X + cycle_loss_Y)
 
                 # pdb.set_trace()
 
@@ -336,7 +378,7 @@ class SetRetrieval(Transformer):
         self.loss_tracker.update_state(total_loss)
         self.xy_loss_tracker.update_state(loss_X_to_Y)
         self.yx_loss_tracker.update_state(loss_Y_to_X)
-        if self.style_loss_weight > 0.0:
+        if self.primary_loss == "style" or self.style_loss_weight > 0.0:
             self.style_loss_tracker.update_state(style_loss_value)
         if self.use_cycle_loss:
             self.reconstruct_x_loss_tracker.update_state(cycle_loss_X)
@@ -345,7 +387,7 @@ class SetRetrieval(Transformer):
         self.train_topk_metric.update_state(pred_Y, data['target_features'], data['target_categories'])
         
         results = {"loss": self.loss_tracker.result(), "X->Y' Loss": self.xy_loss_tracker.result(), "Y'->X' Loss": self.yx_loss_tracker.result()}
-        if self.style_loss_weight > 0.0:
+        if self.primary_loss == "style" or self.style_loss_weight > 0.0:
             results["style_loss"] = self.style_loss_tracker.result()
         
         # Top-K結果を追加
@@ -360,19 +402,27 @@ class SetRetrieval(Transformer):
     def test_step(self, data):
         pred_Y = self({'query_features': data['query_features']}, training=False)
 
-        current_taneg_t_gamma = self.get_current_taneg_t_gamma()
-
         style_loss_value = tf.constant(0.0, dtype=tf.float32)
 
-        if self.use_tpaneg and 'candidate_negative_features' in data:
-            val_loss = self.tpaneg_loss(pred_Y, data['target_features'], data['target_categories'], data['candidate_negative_features'], data['candidate_negative_masks'], current_taneg_t_gamma)
-        else:
+        if self.primary_loss == "tpaneg" and 'candidate_negative_features' in data:
+            current_taneg_t_gamma = self.get_current_taneg_t_gamma()
+            val_loss = self.tpaneg_loss(
+                pred_Y,
+                data['target_features'],
+                data['target_categories'],
+                data['candidate_negative_features'],
+                data['candidate_negative_masks'],
+                current_taneg_t_gamma
+            )
+        elif self.primary_loss == "inbatch":
             val_loss = self.in_batch_loss(pred_Y, data['target_features'], data['target_categories'])
+        else:
+            val_loss = self._style_loss(pred_Y, data['target_features'], data['target_categories'])
+            style_loss_value = val_loss
 
         self.validation_loss_tracker.update_state(val_loss)
 
-        if self.style_loss_weight > 0.0:
-            style_loss_value = self._style_loss(pred_Y, data['target_features'], data['target_categories'])
+        if self.primary_loss == "style" or self.style_loss_weight > 0.0:
             self.style_loss_tracker.update_state(style_loss_value)
 
         self.val_topk_metric.update_state(pred_Y, data['target_features'], data['target_categories'])
@@ -384,7 +434,7 @@ class SetRetrieval(Transformer):
             for k, v in topk_results.items():
                 results[f"val_{k}"] = v
 
-        if self.style_loss_weight > 0.0:
+        if self.primary_loss == "style" or self.style_loss_weight > 0.0:
             results["style_loss"] = self.style_loss_tracker.result()
 
         return results
