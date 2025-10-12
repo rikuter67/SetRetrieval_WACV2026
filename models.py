@@ -460,79 +460,72 @@ class SetRetrieval(Transformer):
             return self._gram_style_loss(predictions, reference_features, reference_categories)
         return self._attention_gram_style_loss(predictions, reference_features, reference_categories)
 
-    def _prepare_style_tensors(self, predictions, reference_features, reference_categories):
+    def _prepare_style_vectors(self, predictions, reference_features, reference_categories):
         valid_mask = tf.logical_and(
             reference_categories > 0,
             tf.reduce_sum(tf.abs(reference_features), axis=-1) > 1e-6,
         )
-        mask_float = tf.cast(valid_mask, tf.float32)
 
         gathered_predictions = self._get_predictions_for_items(predictions, reference_categories)
-        masked_predictions = tf.where(tf.expand_dims(valid_mask, -1), gathered_predictions, 0.0)
-        masked_references = tf.where(tf.expand_dims(valid_mask, -1), reference_features, 0.0)
 
-        return masked_predictions, masked_references, mask_float
+        pred_items = tf.boolean_mask(gathered_predictions, valid_mask)
+        ref_items = tf.boolean_mask(reference_features, valid_mask)
+
+        return pred_items, ref_items
 
     def _gram_style_loss(self, predictions, reference_features, reference_categories):
-        pred_items, ref_items, mask = self._prepare_style_tensors(predictions, reference_features, reference_categories)
+        pred_items, ref_items = self._prepare_style_vectors(predictions, reference_features, reference_categories)
 
-        pred_gram = self._compute_feature_gram(pred_items, mask)
-        ref_gram = self._compute_feature_gram(ref_items, mask)
+        num_items = tf.shape(pred_items)[0]
 
-        diff = pred_gram - ref_gram
-        per_example = tf.reduce_mean(tf.square(diff), axis=[1, 2])
-        return tf.reduce_mean(per_example)
+        def compute_loss():
+            pred_gram = self._outer_product_gram(pred_items)
+            ref_gram = self._outer_product_gram(ref_items)
+
+            diff = pred_gram - ref_gram
+            per_item = tf.reduce_mean(tf.square(diff), axis=[1, 2])
+            return tf.reduce_mean(per_item)
+
+        return tf.cond(
+            num_items > 0,
+            compute_loss,
+            lambda: tf.constant(0.0, dtype=tf.float32),
+        )
 
     def _attention_gram_style_loss(self, predictions, reference_features, reference_categories):
         if self.style_projection_weights is None:
             return tf.constant(0.0, dtype=tf.float32)
 
-        pred_items, ref_items, mask = self._prepare_style_tensors(predictions, reference_features, reference_categories)
+        pred_items, ref_items = self._prepare_style_vectors(predictions, reference_features, reference_categories)
 
-        pred_attn = self._compute_attention_gram(pred_items, mask)
-        ref_attn = self._compute_attention_gram(ref_items, mask)
+        num_items = tf.shape(pred_items)[0]
 
-        diff = pred_attn - ref_attn
-        pair_mask = self._pair_mask(mask)
-        squared = tf.square(diff) * pair_mask
-        denom = tf.reduce_sum(pair_mask, axis=[1, 2])
-        per_example = tf.math.divide_no_nan(tf.reduce_sum(squared, axis=[1, 2]), denom)
-        return tf.reduce_mean(per_example)
+        def compute_loss():
+            pred_attn = self._attention_gram_map(pred_items)
+            ref_attn = self._attention_gram_map(ref_items)
 
-    def _compute_feature_gram(self, features, mask):
-        mask_expanded = tf.expand_dims(mask, -1)
-        masked_features = features * mask_expanded
+            diff = pred_attn - ref_attn
+            per_item = tf.reduce_mean(tf.square(diff), axis=[1, 2])
+            return tf.reduce_mean(per_item)
 
-        gram = tf.einsum('bsd,bsf->bdf', masked_features, masked_features)
-        counts = tf.reduce_sum(mask, axis=1, keepdims=True)
-        counts = tf.maximum(counts, tf.ones_like(counts))
-        gram = tf.math.divide_no_nan(gram, tf.expand_dims(counts, -1))
+        return tf.cond(
+            num_items > 0,
+            compute_loss,
+            lambda: tf.constant(0.0, dtype=tf.float32),
+        )
+
+    def _outer_product_gram(self, vectors):
+        vectors = tf.cast(vectors, tf.float32)
+        vectors = tf.expand_dims(vectors, 2)
+        gram = tf.matmul(vectors, tf.transpose(vectors, perm=[0, 2, 1]))
         return gram
 
-    def _compute_attention_gram(self, features, mask):
-        mask_expanded = tf.expand_dims(mask, -1)
-        masked_features = features * mask_expanded
-
-        projected = tf.einsum('bsd,kdn->bksn', masked_features, self.style_projection_weights)
-        projected = projected * tf.expand_dims(mask_expanded, axis=1)
-
-        batch_size = tf.shape(projected)[0]
-        set_size = tf.shape(projected)[2]
-        proj_dim = tf.shape(projected)[3]
-
-        reshaped = tf.reshape(projected, [-1, set_size, proj_dim])
-        attn = tf.matmul(reshaped, reshaped, transpose_b=True)
-        scale = tf.math.sqrt(tf.cast(proj_dim, tf.float32))
-        attn = attn / tf.maximum(scale, 1.0)
-        attn = tf.reshape(attn, [batch_size, self.style_attention_heads, set_size, set_size])
-        attn = tf.reduce_mean(attn, axis=1)
-
-        attn = attn * self._pair_mask(mask)
-        return attn
-
-    def _pair_mask(self, mask):
-        pair_mask = tf.expand_dims(mask, 1) * tf.expand_dims(mask, 2)
-        return pair_mask
+    def _attention_gram_map(self, vectors):
+        projections = tf.einsum('id,kdn->ikn', vectors, self.style_projection_weights)
+        proj_dim = tf.cast(tf.shape(projections)[-1], tf.float32)
+        attn = tf.matmul(projections, projections, transpose_b=True)
+        scale = tf.maximum(tf.math.sqrt(proj_dim), 1.0)
+        return attn / scale
 
     @tf.function
     def in_batch_loss(self, predictions, target_features, target_categories):
