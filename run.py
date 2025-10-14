@@ -80,6 +80,8 @@ def create_output_dir(args: argparse.Namespace) -> str:
         f"LR{args.learning_rate}"
     ]
     
+    components.append(f"primary{args.primary_loss}")
+
     if args.use_whitening:
         components.append("use_whitening")
     if args.use_tpaneg:
@@ -87,7 +89,11 @@ def create_output_dir(args: argparse.Namespace) -> str:
     if args.use_cycle_loss:
         components.append("use_cycle_loss")
         components.append(f"lambda{args.cycle_lambda}")
-    
+
+    if args.style_loss_weight > 0:
+        components.append(f"styleW{args.style_loss_weight:g}")
+        components.append(f"styleMode{args.style_loss_mode}")
+
     if args.use_tpaneg:
         components.append(f"TaNegInit{args.taneg_t_gamma_init}")
         components.append(f"TaNegFinal{args.taneg_t_gamma_final}")
@@ -205,7 +211,14 @@ def main():
 
     parser.add_argument('--use_cycle_loss', action='store_true', help='Include cycle consistency loss')
     parser.add_argument('--cycle_lambda', type=float, default=0.2, help='Weight for cycle consistency loss')
-    
+
+    parser.add_argument('--style_loss_weight', type=float, default=0.0,
+                        help='Weight for the style loss (set to 0 to disable).')
+    parser.add_argument('--style_loss_mode', choices=['gram', 'attention_gram'], default='gram',
+                        help='Style loss pattern: gram (図1) or attention_gram (図2).')
+    parser.add_argument('--primary_loss', choices=['inbatch', 'tpaneg', 'style'], default=None,
+                        help='Primary training loss to optimize. Supports inbatch, tpaneg, or style (図1/図2).')
+
     parser.add_argument('--use_tpaneg', action='store_true', help='Enable TPaNeg dynamic hard negative learning')
     parser.add_argument('--candidate_neg_num', type=int, default=50, help='Number of candidate negatives for TPaNeg')
     parser.add_argument('--taneg_t_gamma_init', type=float, default=0.2, help='Initial T_gamma (TaNeg similarity threshold). Used for precomputing and as start of curriculum.')
@@ -214,6 +227,19 @@ def main():
     parser.add_argument('--paneg_epsilon', type=float, default=0.2, help='Epsilon (ε) margin for Prediction-Aware Negative selection (PaNeg). Fixed during training.')
     
     args = parser.parse_args()
+
+    if args.primary_loss is None:
+        args.primary_loss = 'tpaneg' if args.use_tpaneg else 'inbatch'
+
+    if args.primary_loss == 'tpaneg':
+        args.use_tpaneg = True
+    else:
+        if args.use_tpaneg:
+            print(f"[INFO] Disabling --use_tpaneg because primary_loss='{args.primary_loss}'.")
+        args.use_tpaneg = False
+
+    if args.primary_loss == 'style' and args.style_loss_weight <= 0.0:
+        parser.error("--style_loss_weight must be > 0 when primary_loss is 'style'.")
 
     model_path_for_testing = args.model_path
 
@@ -246,10 +272,10 @@ def main():
                 save_whitening_params(whitening_params, whitening_params_path)
                 print(f"✅ Input whitening parameters computed and saved to: {whitening_params_path}")
 
-    if args.use_tpaneg:
+    if args.primary_loss == 'tpaneg':
         cache_path = os.path.join(args.dataset_dir, args.dataset, 'hard_negative_cache.pkl')
         print("Checking for TPaNeg negative cache...")
-        
+
         if not os.path.exists(cache_path):
             print(f"❌ Cache not found. Generating new cache at: {cache_path}")
             # TaNegのT_gamma初期値でハードネガティブを事前計算
@@ -263,9 +289,10 @@ def main():
             print(f"✅ Found existing cache: {cache_path}")
 
     model = SetRetrieval(
-        feature_dim=args.feature_dim, num_heads=args.num_heads, num_layers=args.num_layers, num_categories=num_categories,  hidden_dim=args.hidden_dim, 
-        temperature=args.temperature, dropout_rate=args.dropout_rate, k_values=args.topk_values, use_cycle_loss=args.use_cycle_loss, cycle_lambda=args.cycle_lambda, cluster_centering=args.use_cluster_centering, 
-        use_tpaneg=args.use_tpaneg,taneg_t_gamma_init=args.taneg_t_gamma_init, taneg_t_gamma_final=args.taneg_t_gamma_final, taneg_curriculum_epochs=args.taneg_curriculum_epochs, paneg_epsilon=args.paneg_epsilon 
+        feature_dim=args.feature_dim, num_heads=args.num_heads, num_layers=args.num_layers, num_categories=num_categories,  hidden_dim=args.hidden_dim,
+        temperature=args.temperature, dropout_rate=args.dropout_rate, k_values=args.topk_values, use_cycle_loss=args.use_cycle_loss, cycle_lambda=args.cycle_lambda, cluster_centering=args.use_cluster_centering,
+        primary_loss=args.primary_loss, style_loss_weight=args.style_loss_weight, style_loss_mode=args.style_loss_mode,
+        use_tpaneg=args.use_tpaneg,taneg_t_gamma_init=args.taneg_t_gamma_init, taneg_t_gamma_final=args.taneg_t_gamma_final, taneg_curriculum_epochs=args.taneg_curriculum_epochs, paneg_epsilon=args.paneg_epsilon
     )
 
     centers_path = os.path.join(dataset_path, 'category_centers.pkl.gz')
@@ -285,12 +312,12 @@ def main():
     train_data, val_data, test_data, train_gen, val_gen, steps_per_epoch, validation_steps = create_data_generators(
         dataset_path,
         args.batch_size, 
-        use_negatives=args.use_tpaneg,
+        use_negatives=(args.primary_loss == 'tpaneg'),
         candidate_neg_num=args.candidate_neg_num,
         seed=args.seed,
         random_split=True,
         whitening_params=whitening_params,
-        negative_cache_path=cache_path if args.use_tpaneg else None # minerの代わりにcache_pathを渡す
+        negative_cache_path=cache_path if args.primary_loss == 'tpaneg' else None # minerの代わりにcache_pathを渡す
     )
 
     if args.mode == 'train':
