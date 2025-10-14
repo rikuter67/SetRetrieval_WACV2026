@@ -1,0 +1,44 @@
+run_name: default
+seed: 42
+
+paths:
+  input_dir: data/raw
+  processed_dir: data/processed
+  models_dir: models
+  submissions_dir: submissions
+  logs_dir: logs
+
+files:
+  train: train.csv
+  test: test.csv
+  sample_submission: sample_submission.csv
+
+target:
+  column: forward_returns
+  prediction_column: forward_returns
+
+cv:
+  strategy: time_series
+  n_splits: 5
+  time_column: date
+  group_column: security_id
+
+features:
+  drop_columns:
+    - row_id
+    - date
+    - security_id
+  imputation_strategy: median
+  scale: true
+  rolling_windows: [3, 5, 10]
+  enable_interactions: false
+
+model:
+  type: ridge
+  params:
+    alpha: 1.0
+  fit_intercept: true
+
+inference:
+  average_folds: true
+  output_filename: default_submission.csv
