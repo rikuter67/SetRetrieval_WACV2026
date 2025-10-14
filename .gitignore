@@ -9,6 +9,7 @@ __pycache__/
 
 # Data, Datasets, and Experiments
 data/
+!htmp/data/
 datasets/
 experiments/
 
