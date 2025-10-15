@@ -5,6 +5,7 @@ __pycache__/
 # Environments
 *.yml
 *.yaml
+!htmp/configs/*.yaml
 .env
 
 # Data, Datasets, and Experiments
