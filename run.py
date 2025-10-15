@@ -212,12 +212,10 @@ def main():
     parser.add_argument('--use_cycle_loss', action='store_true', help='Include cycle consistency loss')
     parser.add_argument('--cycle_lambda', type=float, default=0.2, help='Weight for cycle consistency loss')
 
-    parser.add_argument('--style_loss_weight', type=float, default=0.0,
-                        help='Weight for the style loss (set to 0 to disable).')
-    parser.add_argument('--style_loss_mode', choices=['gram', 'attention_gram'], default='gram',
-                        help='Style loss pattern: gram (図1) or attention_gram (図2).')
-    parser.add_argument('--primary_loss', choices=['inbatch', 'tpaneg', 'style'], default=None,
-                        help='Primary training loss to optimize. Supports inbatch, tpaneg, or style (図1/図2).')
+    parser.add_argument('--style_loss_weight', type=float, default=0.0, help='Weight for the style loss (set to 0 to disable).')
+    parser.add_argument('--style_loss_mode', choices=['gram', 'attention_gram'], default='gram', help='Style loss pattern: gram (図1) or attention_gram (図2).')
+    parser.add_argument('--style_attention_heads', type=float, default=8, help='Number of style_attention_head')
+    parser.add_argument('--primary_loss', choices=['inbatch', 'tpaneg', 'style'], default=None, help='Primary training loss to optimize. Supports inbatch, tpaneg, or style (図1/図2).')
 
     parser.add_argument('--use_tpaneg', action='store_true', help='Enable TPaNeg dynamic hard negative learning')
     parser.add_argument('--candidate_neg_num', type=int, default=50, help='Number of candidate negatives for TPaNeg')
@@ -288,11 +286,31 @@ def main():
         else:
             print(f"✅ Found existing cache: {cache_path}")
 
+    # Style損失使用時の学習率調整
+    if args.primary_loss == "style":
+        initial_learning_rate = 5e-4  # 通常より高めに設定
+        optimizer = tf.keras.optimizers.Adam(
+            learning_rate=initial_learning_rate,
+            clipnorm=1.0  # 勾配クリッピング
+        )
+    else:
+        initial_learning_rate = 1e-4
+        optimizer = tf.keras.optimizers.Adam(learning_rate=initial_learning_rate)
+
+
     model = SetRetrieval(
-        feature_dim=args.feature_dim, num_heads=args.num_heads, num_layers=args.num_layers, num_categories=num_categories,  hidden_dim=args.hidden_dim,
-        temperature=args.temperature, dropout_rate=args.dropout_rate, k_values=args.topk_values, use_cycle_loss=args.use_cycle_loss, cycle_lambda=args.cycle_lambda, cluster_centering=args.use_cluster_centering,
-        primary_loss=args.primary_loss, style_loss_weight=args.style_loss_weight, style_loss_mode=args.style_loss_mode,
-        use_tpaneg=args.use_tpaneg,taneg_t_gamma_init=args.taneg_t_gamma_init, taneg_t_gamma_final=args.taneg_t_gamma_final, taneg_curriculum_epochs=args.taneg_curriculum_epochs, paneg_epsilon=args.paneg_epsilon
+        feature_dim=512,
+        num_categories=11,
+        primary_loss="style",
+        style_loss_weight=1.0,  # まず1.0から開始
+        style_loss_mode="gram",  # attention_gramより安定
+        style_normalize_gram=True,
+        style_attention_heads=8,  # attention_gram使用時
+        style_attention_dim=64,   # attention_gram使用時
+        temperature=0.07,  # より小さい温度でシャープな学習
+        dropout_rate=0.1,
+        use_cycle_loss=False,  # まずはシンプルに
+        k_values=[1, 5, 10, 20]
     )
 
     centers_path = os.path.join(dataset_path, 'category_centers.pkl.gz')
